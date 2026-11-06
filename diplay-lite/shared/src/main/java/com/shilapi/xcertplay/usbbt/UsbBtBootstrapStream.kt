@@ -40,6 +40,9 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
         /** vc246：已配对时补踢回连的最小间隔。 */
         private const val KICK_RETRY_MILLIS = 2_000L
 
+        /** vc248（VC248-04）：iAP2 握手总超时（已定 20s，远小于外层 90s / 120s）。 */
+        private const val HANDSHAKE_TIMEOUT_MILLIS = 20_000L
+
         /** vc184：等系统 USB 授权弹窗的最长窗口（车机屏幕上用户读题+点允许要留足时间）。 */
         private const val PERMISSION_WAIT_MILLIS = 90_000L
 
@@ -77,9 +80,14 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 //   (b) 等待期按 1s 切片，每 2s 补踢一次（去掉「只踢一次」的单发语义）。
                 // 结果是「未交出链路」窗口不再出现，而不是被拉长。
                 UsbBtHost.controllerWaitingForLink = true
+                val startedAt = System.currentTimeMillis()
                 try {
-                    val paired = UsbBtHost.pairStateSnapshot == PairState.PAIRED
-                    val deadline = System.currentTimeMillis() + UsbBtStandby.HANDOFF_WAIT_MILLIS
+                    // vc247（V14）：bonded ≠ 本轮认证通过 —— 只对「本轮未被拒」的地址主动 page。
+                    val paired = UsbBtHost.hasActiveReconnectCandidate()
+                    if (!paired && UsbBtHost.pairStateSnapshot == PairState.PAIRED) {
+                        diagSink("usbbt: 已配对但 key 本轮被拒，不主动 page（等 iPhone 回连或重新配对）")
+                    }
+                    val deadline = startedAt + HANDSHAKE_TIMEOUT_MILLIS
                     var nextKickAt = 0L
                     var kickLogState: String? = null
                     while (true) {
@@ -103,8 +111,13 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                         if (!UsbBtStandby.isRunning) {
                             return fail("常驻广播已停止，未交出 iPhone 链路（${UsbBtStandby.describe()}）")
                         }
+                        // vc248（VC248-04）：明确认证失败（status 5/6 落地为「本轮 key 被拒」）立即返回，不等超时。
+                        if (handshakeRejected()) {
+                            diagSink("usbbt: 本轮认证被拒，握手立即结束")
+                            return fail("iAP2 握手失败：${handshakeReason(startedAt)}")
+                        }
                         if (System.currentTimeMillis() >= deadline) {
-                            return fail("常驻广播未在 ${UsbBtStandby.HANDOFF_WAIT_MILLIS / 1000}s 内交出 iPhone 链路（${UsbBtStandby.describe()}）")
+                            return fail("iAP2 握手超时（${HANDSHAKE_TIMEOUT_MILLIS / 1000}s）：${handshakeReason(startedAt)}（${UsbBtStandby.describe()}）")
                         }
                     }
                 } finally {
@@ -357,6 +370,21 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                         " next=forbid-open detail=$source ${elapsed}ms",
                 )
             }
+        }
+
+        /** vc248（VC248-04）：明确认证失败 = 已配对态且本轮 key 全部被拒（status 5/6）。 */
+        private fun handshakeRejected(): Boolean =
+            UsbBtHost.pairStateSnapshot == PairState.PAIRED &&
+                !UsbBtHost.hasActiveReconnectCandidate()
+
+        /** vc248（VC248-04）：三档失败原因——无应答 / 已拒 / 已连但 iAP2 无响应。 */
+        private fun handshakeReason(startedAt: Long): String = when {
+            handshakeRejected() ->
+                "iPhone 拒绝配对：请在 iPhone 蓝牙设置中忽略本机后重新配对"
+            UsbBtHost.lastLinkReadyAtMs >= startedAt ->
+                "蓝牙已连上但 CarPlay 未响应：请在 iPhone 上打开 CarPlay 后重试"
+            else ->
+                "未收到 iPhone 响应：请确认手机蓝牙已开启，并在蓝牙列表中点选本机"
         }
 
         private fun fail(reason: String): Nothing {

@@ -52,7 +52,21 @@ import com.shilapi.xcertplay.usbbt.UsbBtStandby
 object ExternalBtPairingDialog {
     private const val REFRESH_MILLIS = 1_000L
 
-    /** 展示配对窗；入口会先确保常驻广播已启动（「开机自动初始化」关也能用）。 */
+    /** vc247（V12）：当前打开的配对页（宿主切后台/销毁时兜底关窗）。 */
+    @Volatile
+    private var activeUi: DialogUi? = null
+
+    /** vc247（V12）：宿主切后台 —— 配对页若开着就关窗（不能只靠 dismiss 回调）。 */
+    fun onHostBackgrounded() {
+        activeUi?.stop("切后台")
+    }
+
+    /** vc247（V12）：Activity 销毁 —— 兜底关窗。 */
+    fun onHostDestroyed() {
+        activeUi?.stop("销毁")
+    }
+
+    /** 展示配对窗；入口会先确保常驻广播已启动（未启动时也能用）。 */
     fun show(activity: MainActivity) {
         activity.ensureUsbBtStandby()
         // vc210：方向判定改用窗口实际宽高比。K60 实测：App 请求竖屏（req=PORTRAIT）时
@@ -70,7 +84,7 @@ object ExternalBtPairingDialog {
             .setView(ui.root)
             .setNegativeButton("取消", null)
             .setPositiveButton("完成", null)
-            .setOnDismissListener { ui.stop() }
+            .setOnDismissListener { ui.stop("关页") }
             .create()
         if (landscape) {
             dialog.maxHeightFraction = 0.9f
@@ -244,14 +258,38 @@ object ExternalBtPairingDialog {
 
         fun start() {
             running = true
+            activeUi = this
+            // vc247（V12）：进页统一开窗（已配对也开，支持换机重配）；
+            // 走 requestPairingMode 落 discoveryWindowUntil（与 status 6 自愈同一个时间源）。
+            openWindow(if (UsbBtStandby.pairState == PairState.PAIRED) "换机重配" else "进页")
             refresh()
             handler.postDelayed(tick, REFRESH_MILLIS)
         }
 
-        fun stop() {
+        /**
+         * vc247（V12）：关页出口（dismiss / 切后台 / 销毁统一走这里，幂等）。
+         * 必须 `cancelPairingMode()` 清掉 `discoveryWindowUntil`，避免「关页后窗口仍在」。
+         */
+        fun stop(source: String) {
+            if (!running) return
             running = false
             handler.removeCallbacks(tick)
+            UsbBtStandby.exitPairingMode()
+            LiteLog.log("anchor", AnchorLog.mark("pair-window-close") + " src=$source")
+            if (activeUi === this) activeUi = null
             dialog = null
+        }
+
+        /** vc247（V12）：开窗 + 锚点（source 区分 进页 / 换机重配 / 续窗）。 */
+        private fun openWindow(source: String) {
+            UsbBtStandby.enterPairingMode()
+            LiteLog.log("anchor", AnchorLog.mark("pair-window-open") + " src=$source")
+        }
+
+        /** vc247（V12）：页面保持期间窗口到期就续期（10 分钟一续，不另起计时器）。 */
+        private fun renewWindowIfNeeded() {
+            if (!running) return
+            if (UsbBtStandby.pairingRemainingMillis() <= 0) openWindow("续窗（配对页保持）")
         }
 
         // ---------- 状态读取与渲染 ----------
@@ -260,19 +298,8 @@ object ExternalBtPairingDialog {
 
         private fun refresh(force: Boolean) {
             val state = UsbBtStandby.pairState
-            // vc238：可被发现开关 UI 已删，底层行为不变 —— 未配对时自动保持 10 分钟配对窗口
-            // （等效旧开关「开」）；配对成功后不再续期（等效旧开关随配对成功自动关，
-            // 此时 host 因 sharedLinkKeys 非空仍写 scan=3，可发现状态不回退）。
-            // 总闸（保持常驻广播）关闭时不再续窗口：关闭 = 设备不可被搜索。
-            if (
-                LiteConfig.usbBtKeepStandbyOf(activity) &&
-                state == PairState.UNPAIRED && UsbBtStandby.pairingRemainingMillis() <= 0
-            ) {
-                // vc239（LOG-238-02）：配对窗打开锚点也落 LiteLog（shared 侧 companion 只能落 logcat）。
-                UsbBtStandby.enterPairingMode()
-                LiteLog.log("anchor", AnchorLog.mark("pair-window-open"))
-                LiteLog.log("ui", "外置蓝牙：未配对，自动保持配对窗口（可被发现）")
-            }
+            // vc247（V12）：页面开着就保窗口（进页已开；到期续期，已配对同样续，支持换机重配）。
+            renewWindowIfNeeded()
             val paired = UsbBtStandby.pairedDevices()
             val discovered = UsbBtStandby.discoveredDevices()
             val address = UsbBtStandby.dongleAddress()
@@ -288,7 +315,7 @@ object ExternalBtPairingDialog {
                 append('|').append(pairTarget)
                 append('|').append(dongleName)
                 append('|').append(settingsExpanded)
-                append('|').append(LiteConfig.usbBtAutoInitOf(activity))
+                append('|').append(UsbBtStandby.isRunning)
                 append(LiteConfig.usbBtKeepStandbyOf(activity))
             }
             if (!force && signature == lastSignature) return
@@ -320,16 +347,9 @@ object ExternalBtPairingDialog {
             column.addView(sectionTitle("外置蓝牙设置", null))
             column.addView(chipInfoBlock(address, info))
             // vc240：dongle 日志独立入口已删除（统一到设置页运行日志上传）。
-            column.addView(settingRow(
-                "开机自动初始化", "上电即初始化，缩短首次等待；老车机可能拖慢启动。",
-                recommendOn = false,
-                checked = LiteConfig.usbBtAutoInitOf(activity),
-            ) { v ->
-                LiteConfig.setUsbBtAutoInit(activity, v)
-                true
-            })
-            // vc241：「优先用外置蓝牙广播」设置项已删除，固定走外置 dongle 广播。
-            column.addView(keepStandbyRow())
+            // vc247（V4）：开机自动初始化 UI 开关已删除，判据固化进 syncUsbBtStandby。
+            // vc248（VC248-03）：原「停止外置蓝牙」与「保持常驻广播」两行合并为一个三态档位控件。
+            column.addView(powerModeRow())
         }
 
         private fun buildRightColumn(
@@ -376,7 +396,8 @@ object ExternalBtPairingDialog {
                 })
                 // 行2：副标题独占整宽
                 addView(TextView(activity).apply {
-                    text = "USB 蓝牙适配器 · 点击本框，可自定义蓝牙名称"
+                    // vc247（V11）：单台语义 —— 同一时间只服务一台，配对新手机会顶替旧设备。
+                    text = "USB 蓝牙适配器 · 同一时间只服务一台设备 · 点击本框可改名"
                     setTextColor(Ui.SUB)
                     textSize = 11f
                     setPadding(0, dp(4), 0, 0)
@@ -442,6 +463,8 @@ object ExternalBtPairingDialog {
 
         private fun pairedRow(dev: PairedDevice): View {
             val displayName = dev.name ?: "未知设备"
+            // vc248（VC248-06）：关闭档不得再显示「可连接」。
+            val poweredOff = LiteConfig.usbBtPowerModeOf(activity) == LiteConfig.USB_BT_MODE_OFF
             return LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -470,8 +493,12 @@ object ExternalBtPairingDialog {
                             maxLines = 1
                         })
                         addView(TextView(activity).apply {
-                            text = "已配对 · 可连接　${dev.address}"
-                            setTextColor(0xFF8FF0AE.toInt())
+                            text = if (poweredOff) {
+                                "已配对 · 不可连接（外置蓝牙已关闭）"
+                            } else {
+                                "已配对 · 可连接　${dev.address}"
+                            }
+                            setTextColor(if (poweredOff) Ui.SUB else 0xFF8FF0AE.toInt())
                             textSize = 11f
                             setPadding(0, dp(2), 0, 0)
                         })
@@ -508,15 +535,26 @@ object ExternalBtPairingDialog {
             pairedKeys: Set<String>,
             pairTarget: String?,
         ) {
-            column.addView(sectionTitle("已发现设备（点击配对）", "${devices.size} 台"))
+            // vc248（VC248-06）：档位非「可被发现」时（含关闭）列表停扫，标题如实标注。
+            val scanning = UsbBtStandby.isRunning &&
+                (LiteConfig.usbBtPowerModeOf(activity) == LiteConfig.USB_BT_MODE_DISCOVERABLE ||
+                    devices.isNotEmpty())
+            column.addView(
+                sectionTitle(
+                    if (scanning) "已发现设备（点击配对）" else "已发现设备（已停止扫描）",
+                    "${devices.size} 台",
+                ),
+            )
             if (devices.isEmpty()) {
-                // vc238：总闸关闭时给出「不可被搜索」的真实原因，不再误导用户去开 iPhone 蓝牙。
                 column.addView(
                     emptyBox(
-                        if (!LiteConfig.usbBtKeepStandbyOf(activity)) {
-                            "已关闭常驻广播，设备当前不可被搜索"
-                        } else {
-                            "未发现附近设备，请开启 iPhone 蓝牙并配对"
+                        when {
+                            LiteConfig.usbBtPowerModeOf(activity) == LiteConfig.USB_BT_MODE_OFF ->
+                                "外置蓝牙已关闭，开启后可配对"
+                            !scanning ->
+                                "当前档位不可被发现，已停止扫描；需要时切到「可被发现」"
+                            else ->
+                                "未发现附近设备，请开启 iPhone 蓝牙并配对"
                         },
                     ),
                 )
@@ -608,56 +646,114 @@ object ExternalBtPairingDialog {
             if (collapsible && !settingsExpanded) return
             column.addView(chipInfoBlock(address, info))
             // vc240：dongle 日志独立入口已删除（统一到设置页运行日志上传）。
-            column.addView(settingRow(
-                "开机自动初始化", "上电即初始化，缩短首次等待；老车机可能拖慢启动。",
-                recommendOn = false,
-                checked = LiteConfig.usbBtAutoInitOf(activity),
-            ) { v ->
-                LiteConfig.setUsbBtAutoInit(activity, v)
-                true
-            })
-            // vc241：「优先用外置蓝牙广播」设置项已删除，固定走外置 dongle 广播。
-            column.addView(keepStandbyRow())
+            // vc247（V4）：开机自动初始化 UI 开关已删除，判据固化进 syncUsbBtStandby。
+            // vc248（VC248-03）：原「停止外置蓝牙」与「保持常驻广播」两行合并为一个三态档位控件。
+            column.addView(powerModeRow())
         }
 
         /**
-         * vc238：「保持常驻广播」= 外置蓝牙总闸（横竖屏共用，文案/行为只有这一份）。
-         * 关闭 = 只关 inquiry scan（iPhone 搜不到）+ 保留 page scan（已配对 iPhone 仍可主动连上）；
-         * 控制器占用中（活动链路/配对中/page 在飞）一律拒绝并让开关弹回，不抢流。
+         * vc248（VC248-03）：外置蓝牙三态——关闭 / 仅可连接 / 可被发现。
+         * 优先级「关闭 > 页面临时升档 > 用户档位」；关闭档不因打开本页被拉起。
          */
-        private fun keepStandbyRow(): View = settingRow(
-            "保持常驻广播（关闭后设备不可被搜索）",
-            "关闭只关「可被发现」：iPhone 搜索列表看不到本机，已配对设备仍可从手机蓝牙设置里主动连上。",
-            recommendOn = true,
-            checked = LiteConfig.usbBtKeepStandbyOf(activity),
-        ) { want ->
-            if (!UsbBtStandby.setDiscoverable(want)) {
-                toast(if (want) "当前连接使用中，断开后再开启" else "当前连接使用中，断开后再关闭")
-                false
-            } else {
-                // vc239（LOG-238-02 / BT-238-01）：总闸开关锚点 + 关闭时的实际可发现状态，
-                // 供日志侧证实「关掉后不可被搜索、但已配对设备仍可主动连上」。
-                LiteLog.log("anchor", AnchorLog.mark(if (want) "gate-on" else "gate-off"))
-                LiteLog.log(
-                    "usbbt",
-                    if (want) {
-                        "gate-on 实际状态：Write_Scan_Enable=0x03（inquiry scan 开 / page scan 开，可被搜索）"
-                    } else {
-                        "gate-off 实际状态：Write_Scan_Enable=0x02（inquiry scan 关 / page scan 开，不可被搜索但可回连）"
-                    },
-                )
-                LiteConfig.setUsbBtKeepStandby(activity, want)
-                if (want) {
-                    // 重新开播：未配对先续配对窗口，配对窗「已发现设备」随即恢复搜索。
+        private fun powerModeRow(): View {
+            val mode = LiteConfig.usbBtPowerModeOf(activity)
+            val modes = intArrayOf(
+                LiteConfig.USB_BT_MODE_DISCOVERABLE,
+                LiteConfig.USB_BT_MODE_CONNECTABLE,
+                LiteConfig.USB_BT_MODE_OFF,
+            )
+            val labels = arrayOf("可被发现", "仅可连接", "关闭")
+            return LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(9), 0, dp(2))
+                addView(TextView(activity).apply {
+                    text = "外置蓝牙档位"
+                    setTextColor(Ui.TEXT)
+                    textSize = 13f
+                })
+                addView(LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(0, dp(7), 0, 0)
+                    for (index in modes.indices) {
+                        val target = modes[index]
+                        addView(TextView(activity).apply {
+                            text = labels[index]
+                            textSize = 13f
+                            gravity = Gravity.CENTER
+                            setTextColor(if (mode == target) Ui.TEXT else Ui.SUB)
+                            setPadding(dp(14), dp(7), dp(14), dp(7))
+                            layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply {
+                                rightMargin = if (index == modes.lastIndex) 0 else dp(6)
+                            }
+                            background = GradientDrawable().apply {
+                                cornerRadius = dp(6).toFloat()
+                                setStroke(dp(1), if (mode == target) Ui.TEXT else Ui.SUB)
+                                if (mode == target) setColor(0x2252C86C)
+                            }
+                            setOnClickListener { switchPowerMode(target) }
+                        })
+                    }
+                })
+                addView(TextView(activity).apply {
+                    text = when (mode) {
+                        LiteConfig.USB_BT_MODE_DISCOVERABLE ->
+                            "iPhone 蓝牙搜索列表可见，可被发现并配对。"
+                        LiteConfig.USB_BT_MODE_CONNECTABLE ->
+                            "不可被搜索；已配对 iPhone 仍可从手机蓝牙设置里主动连上。"
+                        else ->
+                            "已释放 dongle，不广播也不回连；需要时再选上面的档位。"
+                    }
+                    setTextColor(Ui.SUB)
+                    textSize = 11f
+                    setLineSpacing(0f, 1.4f)
+                    setPadding(0, dp(3), 0, 0)
+                })
+            }
+        }
+
+        private fun switchPowerMode(target: Int) {
+            if (LiteConfig.usbBtPowerModeOf(activity) == target) return
+            when (target) {
+                LiteConfig.USB_BT_MODE_OFF -> {
+                    LiteConfig.setUsbBtPowerMode(activity, LiteConfig.USB_BT_MODE_OFF)
+                    activity.stopExternalBt()
+                    LiteLog.log("anchor", AnchorLog.mark("gate-off"))
+                    toast("已关闭外置蓝牙")
+                }
+                LiteConfig.USB_BT_MODE_CONNECTABLE -> {
+                    if (UsbBtStandby.isRunning && !UsbBtStandby.setDiscoverable(false)) {
+                        toast("当前连接使用中，断开后再关闭可被发现")
+                        return
+                    }
+                    LiteConfig.setUsbBtPowerMode(activity, LiteConfig.USB_BT_MODE_CONNECTABLE)
+                    LiteLog.log("anchor", AnchorLog.mark("gate-off"))
+                    LiteLog.log(
+                        "usbbt",
+                        "gate-off 实际状态：Write_Scan_Enable=0x02（inquiry scan 关 / page scan 开，不可被搜索但可回连）",
+                    )
+                }
+                LiteConfig.USB_BT_MODE_DISCOVERABLE -> {
+                    if (UsbBtStandby.isRunning && !UsbBtStandby.setDiscoverable(true)) {
+                        toast("当前连接使用中，断开后再开启可被发现")
+                        return
+                    }
+                    LiteConfig.setUsbBtPowerMode(activity, LiteConfig.USB_BT_MODE_DISCOVERABLE)
+                    LiteLog.log("anchor", AnchorLog.mark("gate-on"))
+                    LiteLog.log(
+                        "usbbt",
+                        "gate-on 实际状态：Write_Scan_Enable=0x03（inquiry scan 开 / page scan 开，可被搜索）",
+                    )
+                    if (!UsbBtStandby.isRunning) {
+                        activity.ensureUsbBtStandby()
+                    }
                     if (UsbBtStandby.pairState == PairState.UNPAIRED) {
                         UsbBtStandby.enterPairingMode()
-                        // vc239（LOG-238-02）：配对窗打开锚点（LiteLog 侧）。
                         LiteLog.log("anchor", AnchorLog.mark("pair-window-open"))
                     }
-                    activity.ensureUsbBtStandby()
                 }
-                true
             }
+            LiteLog.log("ui", "外置蓝牙档位 → $target")
+            refresh(force = true)
         }
 
         /** 芯片/固件信息：ReadLocalVersion 实读 + BD_ADDR（mono）。 */

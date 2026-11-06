@@ -174,15 +174,17 @@ object RuntimeLogUploader {
         val rollingEntries = windowEntries.filter { it.tod != null && it.tod < tailStart }
         val rollingFit = fitRolling(rollingEntries, rollingBudget, nowTod, traceDropped, noise)
 
-        val text = buildString {
-            append(headerText)
-            append(SKELETON_SEP).append('\n')
-            append(skeletonFit.first).append('\n')
-            append(ROLLING_SEP).append('\n')
-            append(rollingFit.first).append('\n')
-            append(TAIL_SEP).append('\n')
-            append(tailFit.first)
-        }
+        val text = LogRedactor.redact(
+            buildString {
+                append(headerText)
+                append(SKELETON_SEP).append('\n')
+                append(skeletonFit.first).append('\n')
+                append(ROLLING_SEP).append('\n')
+                append(rollingFit.first).append('\n')
+                append(TAIL_SEP).append('\n')
+                append(tailFit.first)
+            },
+        )
         val bytes = text.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_BYTES) {
             LiteLog.log("log", "运行日志上传件超出 768KB（${bytes.size} 字节），已拒绝落盘")
@@ -698,8 +700,9 @@ object RuntimeLogUploader {
                 postGiteeContents(token, attemptName, stamp, encoded, remaining, timedOut)
             } catch (error: Exception) {
                 if (timedOut.get()) return Result(false, null, timeoutText())
-                LiteLog.log("log", "运行日志上传异常：${error.javaClass.simpleName} ${error.message.orEmpty()}")
-                return Result(false, null, "网络不通：${error.message.orEmpty()}")
+                val detail = UploadFailure.scrub(error.message.orEmpty(), token)
+                LiteLog.log("log", "运行日志上传异常：${error.javaClass.simpleName} $detail")
+                return Result(false, null, "网络不通：$detail")
             }
             if (timedOut.get()) {
                 LiteLog.log("log", "运行日志上传超时（60s）")
@@ -714,9 +717,7 @@ object RuntimeLogUploader {
                 LiteLog.log("log", "运行日志上传成功：$remote")
                 return Result(true, remote, null)
             }
-            val sanitized = body.replace(token, "***")
-                .let { if (it.length > 300) it.substring(0, 300) + "…" else it }
-            lastError = "HTTP $code $sanitized"
+            lastError = UploadFailure.describe(code, body, token)
             LiteLog.log("log", "运行日志上传失败：$lastError")
             if ((code == 409 || body.contains("already exists", ignoreCase = true)) && attempt == 0) {
                 attemptName = prepared.fileName.removeSuffix(".txt") + "-1.txt"

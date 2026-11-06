@@ -221,12 +221,12 @@ data class LiteConfig(
                 .commit()
         }
 
-        /** vc207：配对窗「外置蓝牙设置」三开关 —— 开机自动初始化（默认关）。 */
+        /**
+         * vc207：开机自动初始化（默认关）。vc247（V4）：UI 开关已删除，判据固化为
+         * 「本键 || 启动后自动连接」，键值保留只做老用户迁移读取。
+         */
         fun usbBtAutoInitOf(context: Context): Boolean =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("usb_bt_auto_init", false)
-
-        fun setUsbBtAutoInit(context: Context, v: Boolean) =
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_auto_init", v).apply()
 
         // vc241：删除「优先用外置蓝牙广播」配置项——固定走外置 dongle 广播，旧键
         // usb_bt_prefer_external 不再读取，残留值自然失效。
@@ -237,6 +237,27 @@ data class LiteConfig(
 
         fun setUsbBtKeepStandby(context: Context, v: Boolean) =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("usb_bt_keep_standby", v).apply()
+
+        /** vc248（VC248-03）：外置蓝牙三态——关闭 / 仅可连接 / 可被发现。 */
+        const val USB_BT_MODE_OFF = 0
+        const val USB_BT_MODE_CONNECTABLE = 2
+        const val USB_BT_MODE_DISCOVERABLE = 3
+
+        /** 未写过新键时按旧「保持常驻广播」键推导：开=可被发现、关=仅可连接。 */
+        fun usbBtPowerModeOf(context: Context): Int {
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (prefs.contains("usb_bt_power_mode")) {
+                return prefs.getInt("usb_bt_power_mode", USB_BT_MODE_CONNECTABLE)
+            }
+            return if (usbBtKeepStandbyOf(context)) USB_BT_MODE_DISCOVERABLE else USB_BT_MODE_CONNECTABLE
+        }
+
+        /** 写三态时同步旧键，保证仍读 `usb_bt_keep_standby` 的路径口径一致。 */
+        fun setUsbBtPowerMode(context: Context, mode: Int) =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putInt("usb_bt_power_mode", mode)
+                .putBoolean("usb_bt_keep_standby", mode == USB_BT_MODE_DISCOVERABLE)
+                .apply()
 
         /** vc207：配对窗改名落盘（轻量单键写；重启 standby 后生效于广播名）。 */
         fun setUsbBtDongleName(context: Context, name: String) =

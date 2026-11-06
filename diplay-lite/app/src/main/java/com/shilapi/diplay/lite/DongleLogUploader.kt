@@ -68,6 +68,8 @@ object DongleLogUploader {
         if (old.isFile) collectLines(old, lines)
         collectLines(current, lines)
         if (lines.isEmpty()) return null
+        // vc248（VC248-02）：在截断/拼接之前逐行打码，保证 -old.txt 与裁剪段同样覆盖。
+        LogRedactor.redactLines(lines)
 
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val fileName = buildFileName(context, stamp)
@@ -213,7 +215,8 @@ object DongleLogUploader {
                 postGiteeContents(token, attemptName, stamp, encoded, remaining, timedOut)
             } catch (error: Exception) {
                 if (timedOut.get()) return Result(false, null, timeoutText())
-                return Result(false, null, "网络不通：${error.message.orEmpty()}")
+                val detail = UploadFailure.scrub(error.message.orEmpty(), token)
+                return Result(false, null, "网络不通：$detail")
             }
             if (timedOut.get()) return Result(false, null, timeoutText())
             val (code, body) = outcome
@@ -225,9 +228,8 @@ object DongleLogUploader {
                 LiteLog.log("log", "dongle 日志上传成功：$remote")
                 return Result(true, remote, null)
             }
-            val sanitized = body.replace(token, "***")
-                .let { if (it.length > 300) it.substring(0, 300) + "…" else it }
-            lastError = "HTTP $code $sanitized"
+            val sanitized = UploadFailure.describe(code, body, token)
+            lastError = sanitized
             LiteLog.log("log", "dongle 日志上传失败：$lastError")
             if ((code == 409 || body.contains("already exists", ignoreCase = true)) && attempt == 0) {
                 attemptName = prepared.fileName.removeSuffix(".txt") + "-1.txt"

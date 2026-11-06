@@ -42,6 +42,9 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <!-- M6k-UI：开机自启 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- vc248（FEAT-247-01）：App 内检查更新，下载完成后拉起系统安装器（仅 API26+ 生效）。
+         不做静默安装；导出 APK 供安装器读取的 provider 见 application 内的 ApkContentProvider。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- U4 USB 有线：USB 主机特性声明为可选（无 USB Host 能力的设备仍可安装，无线模式不受影响） -->
     <uses-feature
@@ -121,5 +124,13 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- vc248（FEAT-247-01 §7.2）：API24+ 安装更新包时以 content:// 交给系统安装器。
+             零 AndroidX 约束下自实现，仅开放 update 目录的直接子文件；exported=false。 -->
+        <provider
+            android:name=".update.ApkContentProvider"
+            android:authorities="${applicationId}.update"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

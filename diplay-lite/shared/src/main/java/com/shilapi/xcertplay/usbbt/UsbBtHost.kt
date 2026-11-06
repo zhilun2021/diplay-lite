@@ -28,9 +28,17 @@ class DiscoveredDevice(
  */
 internal interface UsbBtPairingStore {
     fun loadAll(): Map<String, Pair<ByteArray, String?>>
-    fun save(addrKey: String, linkKey: ByteArray, name: String?)
     fun saveName(addrKey: String, name: String)
     fun clear()
+
+    /** vc247（V5）：按地址精确删除（内存与持久化同一写入口的第一步落地）。 */
+    fun remove(addrKey: String)
+
+    /**
+     * vc247（V5）：单台原子写 —— 同一 editor 一次 `apply()`：清旧表 + 写这一台 + 记 `sole_addr`。
+     * 顶替/自愈共用它，避免各自 `clear()+save` 造成"落盘覆盖"竞态。
+     */
+    fun saveExclusive(addrKey: String, linkKey: ByteArray, name: String?)
 }
 
 /**
@@ -88,6 +96,15 @@ internal class UsbBtHost(
 
         /** vc209：inquiry 轮间纯监听窗（iPhone 的 inquiry 只在此时隙内才打得中我们）。 */
         private const val INQUIRY_LISTEN_GAP_MILLIS = 6000L
+
+        /** vc247（V10）：status 6 自愈窗 60s；同址/全局各 60s 一次；5 分钟内 3 次熔断。 */
+        private const val STATUS6_HEAL_WINDOW_MILLIS = 60_000L
+        private const val STATUS6_HEAL_MIN_GAP_MILLIS = 60_000L
+        private const val STATUS6_HEAL_FUSE_WINDOW_MILLIS = 5 * 60_000L
+        private const val STATUS6_HEAL_FUSE_MAX = 3
+
+        /** vc247（V13）：链路/断链后的可发现缓冲（定案 B：手动为上限、自动只收紧）。 */
+        private const val RECONNECT_BUFFER_MILLIS = 60_000L
 
         private const val PSM_SDP = 1
         private const val PSM_RFCOMM = 3
@@ -148,6 +165,59 @@ internal class UsbBtHost(
         @Volatile
         internal var pairingStore: UsbBtPairingStore? = null
 
+        /**
+         * vc247（V14）：本轮 key 被对端拒（status 5 Authentication Failure）的地址。
+         * 区分「已 bond 有 key」与「本轮认证通过」：bonded 只代表本地存了 key，
+         * 不代表对端仍认这把 key。被拒地址不再作为主动回连（page）候选，
+         * 改为等对端回连或提示重新配对；status 0（认证通过）时移除。
+         * 进程级（跨 standby 代际保留；重启后清空，重新走一次认证再判定）。
+         */
+        private val rejectedKeyAddrs: MutableSet<String> =
+            Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+        /** vc247（V14）：是否存在可主动回连的地址（有 key 且本轮未被拒）。 */
+        internal fun hasActiveReconnectCandidate(): Boolean =
+            pairStateSnapshot == PairState.PAIRED && sharedLinkKeys.keys.any { it !in rejectedKeyAddrs }
+
+        /**
+         * vc248（VC248-04）：进程级 ACL 链路就绪时刻（wall clock；0=本进程尚未连过）。
+         * standby 每轮换 host 实例，握手等待方拿不到当前实例，故另设进程级快照。
+         */
+        @Volatile
+        var lastLinkReadyAtMs = 0L
+            private set
+
+        /** vc247（V13）：最近一次 ACL 链路就绪时刻（wall clock；0=本实例尚未连过）。 */
+        @Volatile
+        private var linkReadyAtMs = 0L
+
+        /** vc247（V13）：最近一次链路断开时刻（wall clock；0=本进程尚未断过）。 */
+        @Volatile
+        private var lastLinkLostAtMs = 0L
+
+        /**
+         * vc247（V13）：扫描档位**唯一谓词**（定案 B：手动为上限，自动只收紧）。
+         *
+         * 顺序求值：
+         * 1. 配对页开着（`discoveryWindowUntil` 未到期，含 V12 进页窗与 status 6 自愈窗）→ 3
+         * 2. 常驻广播手动关（`discoverableEnabled == false`）→ 2
+         * 3. 有配对：`since = maxOf(linkReadyAtMs, lastLinkLostAtMs)`，60s 内 → 3，否则 → 2
+         * 4. 无配对且常驻广播开 → 3
+         *
+         * // vc247 TEST：待 K60 真机验证（① 已配对列表仍可见 ② 点按能连上 ③ 连上能出画面），
+         * // 验证不过就整体回退 scan=3 —— 只需改本函数内的 2 分支，档位不散落在别处。
+         */
+        internal fun evaluateScanMode(): Int {
+            val now = System.currentTimeMillis()
+            if (now < discoveryWindowUntil) return 3
+            if (!discoverableEnabled) return 2
+            if (sharedLinkKeys.isNotEmpty()) {
+                val since = maxOf(linkReadyAtMs, lastLinkLostAtMs)
+                return if (now - since < RECONNECT_BUFFER_MILLIS) 3 else 2
+            }
+            return 3
+        }
+
         /** vc206：已配对对端名称（RemoteNameRequestComplete 记录；UI 已配对列表展示用）。 */
         private val pairedNames = ConcurrentHashMap<String, String>()
 
@@ -157,12 +227,13 @@ internal class UsbBtHost(
             private set
 
         /**
-         * vc206：配对模式（可发现）窗口截止时刻（uptime 无关，wall clock）；0=关闭。
-         * 默认关闭可发现（init 末步 WriteScanEnable(2)=仅 page scan，已配对设备可回连但不可被发现）；
-         * 进入配对模式拉到 3（inquiry+page scan），配对成功/手动取消/超时即回 2。
+         * vc247（V10/V13）：可发现窗的唯一时间源（wall clock；0=关闭）。
+         * 配对模式、status 6 自愈窗（本轮）、V13 计划的「断开后 60s 缓冲」共用这一个字段，
+         * **不另起第二个计时器**。默认关闭可发现（init 末步 WriteScanEnable(2)=仅 page scan，
+         * 已配对设备可回连但不可被发现）；窗口内 scan=3（inquiry+page scan）。
          */
         @Volatile
-        private var pairingModeUntil = 0L
+        private var discoveryWindowUntil = 0L
 
         /** vc206：已配对设备只读快照（不暴露可变 map；UI 列表数据源）。 */
         fun pairedDevicesSnapshot(): List<PairedDevice> = sharedLinkKeys.keys.sorted().map { key ->
@@ -204,7 +275,8 @@ internal class UsbBtHost(
             pairedRemoteSnapshot = lastAddr?.redacted()
             Log.i(
                 UsbBtSession.TAG,
-                "host: pair restore: 使用已保存 link key addr=${lastAddr?.redacted() ?: "-"} count=${sharedLinkKeys.size}",
+                "host: pair restore: bonded（尚未本轮认证，secured 为空）" +
+                    " addr=${lastAddr?.redacted() ?: "-"} count=${sharedLinkKeys.size}",
             )
             // vc227：恢复成功即安排一次主动回连（"配对成功就保持连接"的落地；
             // 失败由 onTick 按 PAGE_RETRY_MAX 退避，iPhone 不应答时不会无限打）
@@ -218,20 +290,29 @@ internal class UsbBtHost(
          * vc213：持久化记录一并删除（下轮不再 restore、不自动连）。
          */
         fun clearPairing() {
-            sharedLinkKeys.clear()
-            pairedNames.clear()
+            clearPairingMemory()
             try {
                 pairingStore?.clear()
             } catch (_: Throwable) {
             }
+            Log.i(UsbBtSession.TAG, "host: pair state=UNPAIRED remote=-（清除配对，含持久化）")
+        }
+
+        /**
+         * vc247（V6）：只清内存配对态（linkKeys / 名称表 / 快照），**不碰持久化**。
+         * 供升级后首次启动的存量清空使用：持久化已由 `cleanupLegacyMultiDevice` 清掉并落了标记，
+         * 这里若再走 [clearPairing] 会把 `pair_cleanup_vc` 标记一并抹掉，标记就失去防重复作用。
+         */
+        internal fun clearPairingMemory() {
+            sharedLinkKeys.clear()
+            pairedNames.clear()
             pairStateSnapshot = PairState.UNPAIRED
             pairedRemoteSnapshot = null
-            Log.i(UsbBtSession.TAG, "host: pair state=UNPAIRED remote=-（清除配对，含持久化）")
         }
 
         /** vc206：进入配对模式（可发现开 [windowMillis]，对齐 UsbBtStandby.LINK_WINDOW_MILLIS=10min）。 */
         fun requestPairingMode(windowMillis: Long) {
-            pairingModeUntil = System.currentTimeMillis() + windowMillis
+            discoveryWindowUntil = System.currentTimeMillis() + windowMillis
             // vc239（LOG-238-02）：配对窗打开锚点（带 session/gen）。
             // companion 无实例日志出口，落 logcat；App 侧同步补一条 LiteLog（见配对弹窗）。
             Log.i(UsbBtSession.TAG, AnchorLog.mark("pair-window-open"))
@@ -240,12 +321,12 @@ internal class UsbBtHost(
         /** vc206：退出配对模式（可发现立即关闭）。 */
         fun cancelPairingMode() {
             // vc239（LOG-238-02）：只有窗口原本开着才落关闭锚点，避免重复空打。
-            if (pairingModeUntil != 0L) Log.i(UsbBtSession.TAG, AnchorLog.mark("pair-window-close"))
-            pairingModeUntil = 0L
+            if (discoveryWindowUntil != 0L) Log.i(UsbBtSession.TAG, AnchorLog.mark("pair-window-close"))
+            discoveryWindowUntil = 0L
         }
 
         /** vc206：配对模式剩余毫秒（<=0 表示未开启/已结束；UI 倒计时读它）。 */
-        fun pairingRemainingMillis(): Long = pairingModeUntil - System.currentTimeMillis()
+        fun pairingRemainingMillis(): Long = discoveryWindowUntil - System.currentTimeMillis()
 
         /** vc207：inquiry 发现的附近设备（进程级快照，standby 换轮重建 host 不丢；key=addr.key()）。 */
         private val discoveredDevices = ConcurrentHashMap<String, DiscoveredDevice>()
@@ -311,7 +392,14 @@ internal class UsbBtHost(
                 Log.i(UsbBtSession.TAG, "host: page 已在飞，不重复发起（角色=主叫方）")
                 return true
             }
-            val key = sharedLinkKeys.keys.firstOrNull() ?: return false
+            // vc247（V14）：排除本轮被拒（status 5）的地址 —— bonded ≠ 本轮认证通过。
+            val key = sharedLinkKeys.keys.firstOrNull { it !in rejectedKeyAddrs }
+            if (key == null) {
+                if (sharedLinkKeys.isNotEmpty()) {
+                    Log.i(UsbBtSession.TAG, "host: 已存 key 本轮均被拒，不再主动 page（等对端回连或重新配对）")
+                }
+                return false
+            }
             val addr = try {
                 BdAddr(key.toLong(16))
             } catch (_: Throwable) {
@@ -403,13 +491,17 @@ internal class UsbBtHost(
      */
     private fun updatePairState(state: PairState, remote: BdAddr?) {
         val remoteText = remote?.redacted()
-        if (pairStateSnapshot == state && pairedRemoteSnapshot == remoteText) return
+        val previous = pairStateSnapshot
+        if (previous == state && pairedRemoteSnapshot == remoteText) return
         pairStateSnapshot = state
         pairedRemoteSnapshot = remoteText
         log("pair state=$state remote=${remoteText ?: "-"}")
         if (state == PairState.PAIRED) {
             // 日志头段锚点：配对完成（固定文案，可 grep）。vc239：带 session/gen。
             log(AnchorLog.mark("pair-done"))
+            // vc248（VC248-03）：仅「本轮配对窗内配对成功」触发降档回调，
+            // 启动时 restorePairing 的 UNPAIRED→PAIRED 不触发。
+            if (previous == PairState.PAIRING) UsbBtPairingBus.onPairSuccess?.invoke()
         }
     }
 
@@ -490,6 +582,13 @@ internal class UsbBtHost(
     private var pageRetryLeft = 0
     @Volatile
     private var pageRetryAt = 0L
+
+    /** vc247（V10）：status 6 自愈限频状态（同址 60s / 全局 60s / 5 分钟内 3 次熔断）。 */
+    private var healLastAddrKey: String? = null
+    private var healLastAddrAt = 0L
+    private var healLastGlobalAt = 0L
+    private var healFuseStartAt = 0L
+    private var healFuseCount = 0
 
     /** vc226：iAP2 建链重试状态（-1 = 无待办）。 */
     @Volatile
@@ -917,17 +1016,11 @@ internal class UsbBtHost(
     /**
      * vc238：立刻按总闸状态重发 Write_Scan_Enable（开=3 可发现 / 关=2 仅 page scan）。
      * 只走命令队列，不触碰链路；调用方（standby）已确认控制器未被占用。
+     * vc247（V13）// vc247 TEST：档位同样只读 [evaluateScanMode]（与 onTick 同一谓词）。
      */
     internal fun pushScanModeNow(): Boolean {
         if (phase != Phase.DISCOVERABLE || currentScanMode < 0) return false
-        val now = System.currentTimeMillis()
-        val want = if (!discoverableEnabled) {
-            2
-        } else if (now < pairingModeUntil || sharedLinkKeys.isNotEmpty()) {
-            3
-        } else {
-            2
-        }
+        val want = evaluateScanMode()
         if (want == currentScanMode) return false
         currentScanMode = want
         enqueueCommand(HciCommands.WRITE_SCAN_ENABLE, byteArrayOf(want.toByte()))
@@ -1001,16 +1094,35 @@ internal class UsbBtHost(
             }
             is HciEvent.LinkKeyNotification -> {
                 if (event.key.size == 16) {
-                    linkKeys[event.addr.key()] = event.key
-                    // vc213：落盘持久化（下次启动 restore 免重配对；名字可能后到，由 NameComplete 补写）
+                    val newKey = event.addr.key()
+                    // vc247（V9）：顶替旧台 —— 先清其他所有 key（内存），再经 saveExclusive
+                    // 全量原子写只留新台（持久化侧由 saveExclusive 一次性 clear+写，无覆盖竞态）。
+                    val replaced = linkKeys.keys.filter { it != newKey }
+                    if (replaced.isNotEmpty()) {
+                        replaced.forEach { linkKeys.remove(it) }
+                        val keepName = pairedNames[newKey]
+                        pairedNames.clear()
+                        if (keepName != null) pairedNames[newKey] = keepName
+                        pageRetryAddr = null
+                        pageRetryLeft = 0
+                        pageRetryAt = 0
+                        if (pairTarget != null && pairTarget != newKey) pairTarget = null
+                        log(
+                            AnchorLog.mark("pair-single") +
+                                ": 顶替旧台 old=${replaced.joinToString(",")} new=$newKey（内存与持久化已清旧）",
+                        )
+                    }
+                    linkKeys[newKey] = event.key
+                    // vc213/vc247（V7）：唯一写入口 saveExclusive（下次启动 restore 免重配对；
+                    // 名字可能后到，由 NameComplete 补写）。
                     try {
-                        pairingStore?.save(event.addr.key(), event.key, pairedNames[event.addr.key()])
+                        pairingStore?.saveExclusive(newKey, event.key, pairedNames[newKey])
                     } catch (_: Throwable) {
                     }
                     // vc239（LOG-238-02）：配对成功即关窗，先落关闭锚点再清零。
-                    if (pairingModeUntil != 0L) log(AnchorLog.mark("pair-window-close"))
-                    pairingModeUntil = 0L // vc206：配对成功即关可发现窗口（下个 tick 回落 scan=2）
-                    if (event.addr.key() == pairTarget) pairTarget = null // vc207：主动配对目标达成
+                    if (discoveryWindowUntil != 0L) log(AnchorLog.mark("pair-window-close"))
+                    discoveryWindowUntil = 0L // vc206：配对成功即关可发现窗口（下个 tick 回落 scan=2）
+                    if (newKey == pairTarget) pairTarget = null // vc207：主动配对目标达成
                     updatePairState(PairState.PAIRED, event.addr)
                     log("link key stored for ${event.addr.redacted()} (type ${event.keyType})")
                 }
@@ -1117,6 +1229,9 @@ internal class UsbBtHost(
             return
         }
         connections[event.handle] = event.addr
+        // vc247（V13）// vc247 TEST：链路就绪时刻 —— 60s 可发现缓冲的起点之一。
+        linkReadyAtMs = System.currentTimeMillis()
+        lastLinkReadyAtMs = linkReadyAtMs
         // vc239（BT-238-01）：关闭期仍建链成功 → 直接证伪「关掉后配对设备也连不上」，
         // 并把当时的实际 scan 状态一并落盘（只加打点）。
         if (!discoverableEnabled) {
@@ -1156,6 +1271,22 @@ internal class UsbBtHost(
             )
             return
         }
+        // vc247（V8）：单台门禁 —— 只拒「已有唯一一台、来的不是它」。
+        // 无 key 时一律不拒：否则「对端有 key / 我方丢 key」的连接走不到 LinkKeyRequest，
+        // 下方 LINK_KEY_REQUEST_NEGATIVE_REPLY 的自愈分支就成了死代码。
+        val soleKey = sharedLinkKeys.keys.firstOrNull()
+        val windowOpen = System.currentTimeMillis() < discoveryWindowUntil
+        if (!windowOpen && soleKey != null && event.addr.key() != soleKey) {
+            driver.hciSend(
+                HciCommands.REJECT_CONNECTION_REQUEST,
+                event.addr.toLittleEndian() + byteArrayOf(0x0E),
+            )
+            log(
+                AnchorLog.mark("pair-gate-reject") +
+                    ": addr=${event.addr.redacted()} sole=${soleKey.chunked(2).joinToString(":")} window=closed",
+            )
+            return
+        }
         // vc239（BT-238-01）：总闸关闭期间把 iPhone 主动寻呼事件与「可发现关闭」的实际
         // 状态各打一行（只加打点，不改接受/拒绝逻辑）——用于证实「搜不到但仍可被已配对设备连上」。
         if (!discoverableEnabled) {
@@ -1186,6 +1317,8 @@ internal class UsbBtHost(
     }
 
     private fun onDisconnectionComplete(event: HciEvent.DisconnectionComplete) {
+        // vc247（V13）// vc247 TEST：断链时刻 —— 60s 可发现缓冲的起点之一。
+        lastLinkLostAtMs = System.currentTimeMillis()
         val addr = connections.remove(event.handle)
         outgoing.remove(event.handle)
         // vc212：链路断了，在飞的弹码请求一并作废（UI 侧 dismiss 回调走 answerPairConfirm 幂等空过）
@@ -1212,6 +1345,10 @@ internal class UsbBtHost(
         when {
             event.status == 0 -> {
                 authRetries.remove(event.handle)
+                // vc247（V14）：本轮认证通过 —— 解除「key 被拒」标记（bonded → 可用）。
+                if (rejectedKeyAddrs.remove(addr.key())) {
+                    log(AnchorLog.mark("pair-key-accepted") + ": key=${addr.redacted()}（本轮认证通过，恢复可直连）")
+                }
                 // 不分方向主动请求加密：incoming 链路到此也已认证，加密成功会回
                 // EncryptionChange → startIap2；已加密则控制器立即回报，无副作用。
                 // vc212：SET_CONNECTION_ENCRYPTION 异步（CommandStatus + EncryptionChange，
@@ -1221,20 +1358,95 @@ internal class UsbBtHost(
                     HciCommands.le16(event.handle and 0xfff) + byteArrayOf(1),
                 )
             }
-            event.status == 6 -> { // PIN 或 Key Missing：清 key 重配对
-                linkKeys.remove(addr.key())
-                updatePairState(PairState.UNPAIRED, addr)
-                if (securing.contains(event.handle)) {
-                    enqueueCommand(HciCommands.DISCONNECT, HciCommands.le16(event.handle and 0xfff) + byteArrayOf(0x13))
-                }
+            event.status == 6 -> { // PIN 或 Key Missing：删旧 key + 自愈
+                healAfterStatus6(addr, event.handle)
             }
             else -> {
+                // vc247（V14）：status 5（Authentication Failure）= 对端不接受这把 key。
+                // 标记后不再作为主动回连候选（请求侧 requestActiveConnect / 启动侧 bootstrap 都会跳过），
+                // 改为等对端回连或重新配对；退避重试保留，认证恢复后 status 0 会解除标记。
+                if (event.status == 5) {
+                    rejectedKeyAddrs.add(addr.key())
+                    log(
+                        AnchorLog.mark("pair-key-rejected") +
+                            ": key=${addr.redacted()} status=5（bonded 但本轮认证被拒，不再当可直连）",
+                    )
+                }
                 val attempts = (authRetries[event.handle]?.attempts ?: 0) + 1
                 val delay = minOf(AUTH_RETRY_BASE_MILLIS shl (attempts - 1), AUTH_RETRY_MAX_MILLIS)
                 authRetries[event.handle] = AuthRetry(attempts, System.currentTimeMillis() + delay)
                 log("auth failed on 0x%03x (status ${event.status}); retry in ${delay}ms".format(event.handle))
             }
         }
+    }
+
+    /**
+     * vc247（V10）：status 6（PIN 或 Link Key Missing）自愈。
+     *
+     * 前置两条（否则开出来的窗是空的）：
+     * 1. **无条件断旧 ACL** —— 不能只在 `securing` 里才发 DISCONNECT，否则旧链路还在时
+     *    门禁会把新机直接拒掉；
+     * 2. **内存 + 持久化双删** —— 必须 `store.remove(key)`，否则重启后僵尸 key 回归。
+     *
+     * 开窗条件：仅「原本有 key」且「除失败地址外没有其他 key」；其他情况只删不开
+     * （消解迟到事件：B 顶替成功后 A 的 status 6 迟到，不会开多余窗放第三台进来）。
+     * 限频：同址 60s 一次 + 全局 60s 一次；5 分钟内 3 次熔断。
+     */
+    private fun healAfterStatus6(addr: BdAddr, handle: Int) {
+        val key = addr.key()
+        val hadKey = linkKeys.remove(key) != null
+        rejectedKeyAddrs.remove(key) // vc247（V14）：key 已删，拒绝标记一并清理
+        runCatching { pairingStore?.remove(key) }
+        enqueueCommand(HciCommands.DISCONNECT, HciCommands.le16(handle and 0xfff) + byteArrayOf(0x13))
+
+        val remaining = linkKeys.keys.toList()
+        if (remaining.isNotEmpty()) {
+            val keep = runCatching { BdAddr(remaining.first().toLong(16)) }.getOrNull()
+            updatePairState(PairState.PAIRED, keep)
+            log(
+                AnchorLog.mark("pair-status6-heal") +
+                    ": 只删不开 key=$key hadKey=$hadKey 其余=${remaining.size} 台（不开窗）",
+            )
+            return
+        }
+        updatePairState(PairState.UNPAIRED, addr)
+        if (!hadKey) {
+            log(AnchorLog.mark("pair-status6-heal") + ": 只删不开 key=$key（原本无 key，不开窗）")
+            return
+        }
+        val (opened, reason) = openStatus6Window(key)
+        log(
+            AnchorLog.mark("pair-status6-heal") +
+                ": key=$key hadKey=true ${if (opened) "开窗 60s" else "未开窗"} —— $reason",
+        )
+    }
+
+    /**
+     * vc247（V10）：status 6 自愈窗限频。返回 (是否开窗, 判定说明) —— 说明用于日志锚点。
+     * 共用 [discoveryWindowUntil]（与配对窗/V13 缓冲同一时间源，不另起计时器）。
+     */
+    private fun openStatus6Window(addrKey: String): Pair<Boolean, String> {
+        val now = System.currentTimeMillis()
+        if (healFuseStartAt != 0L && now - healFuseStartAt > STATUS6_HEAL_FUSE_WINDOW_MILLIS) {
+            healFuseStartAt = 0L
+            healFuseCount = 0
+        }
+        if (healFuseCount >= STATUS6_HEAL_FUSE_MAX) {
+            return false to "熔断（5min 内已开 $healFuseCount 次）"
+        }
+        if (healLastAddrKey == addrKey && now - healLastAddrAt < STATUS6_HEAL_MIN_GAP_MILLIS) {
+            return false to "同址限频 60s（上次 ${now - healLastAddrAt}ms 前）"
+        }
+        if (healLastGlobalAt != 0L && now - healLastGlobalAt < STATUS6_HEAL_MIN_GAP_MILLIS) {
+            return false to "全局限频 60s（上次 ${now - healLastGlobalAt}ms 前）"
+        }
+        healLastAddrKey = addrKey
+        healLastAddrAt = now
+        healLastGlobalAt = now
+        if (healFuseStartAt == 0L) healFuseStartAt = now
+        healFuseCount += 1
+        discoveryWindowUntil = maxOf(discoveryWindowUntil, now + STATUS6_HEAL_WINDOW_MILLIS)
+        return true to "同址/全局均未限频，未熔断"
     }
 
     private fun onNumberOfCompletedPackets(params: ByteArray) {
@@ -1271,34 +1483,28 @@ internal class UsbBtHost(
         val now = System.currentTimeMillis()
         // vc206：配对模式窗口收敛 —— 窗口内 WriteScanEnable(3) 可发现，窗外回 2（仅可连接）。
         // 配对成功（LinkKeyNotification）时窗口已清零，下一个 tick 自动回落。
-        // vc217：已配对（有 link key）时常驻可发现（对齐 legacy 0.3.1 常驻广播）——实测 iPhone
-        // 不应答我方 page（status 4 连满 4 轮），自动回连只能靠 iPhone 后台 inquiry 发现我们后
-        // 主动发起；scan=2（不可发现）时 iPhone 永远看不到「DiPlay CarPlay」，回连无从谈起。
+        // vc217：已配对（有 link key）时的可发现性由 vc247（V13）定案 B 接管 ——
+        // 链路就绪/断链后 60s 内保持 scan=3，之后收敛到 2（仅 page scan），
+        // 避免长时间常驻可发现；回连仍可由 iPhone 主动 page 发起。
         if (phase == Phase.DISCOVERABLE && currentScanMode >= 0) {
-            // vc238：总闸关闭 → 强制 scan=2：inquiry scan 关（iPhone 搜不到）、page scan 保留
-            // （已配对 iPhone 仍可主动 page 过来走 CarPlay）。开且配对窗口/已配对 → 3。
-            val want = if (!discoverableEnabled) {
-                2
-            } else if (now < pairingModeUntil || sharedLinkKeys.isNotEmpty()) {
-                3
-            } else {
-                2
-            }
+            // vc247（V13）// vc247 TEST：档位统一读 evaluateScanMode()（不在此硬编码）。
+            val want = evaluateScanMode()
             if (want != currentScanMode) {
                 currentScanMode = want
                 enqueueCommand(HciCommands.WRITE_SCAN_ENABLE, byteArrayOf(want.toByte()))
                 log(
                     "scan mode -> $want（" + when {
+                        now < discoveryWindowUntil -> "配对窗口·可发现"
                         !discoverableEnabled -> "总闸关闭·不可被搜索（仅 page scan 可回连）"
-                        now < pairingModeUntil -> "配对模式·可发现"
-                        sharedLinkKeys.isNotEmpty() -> "已配对·常驻可发现（等 iPhone 回连）"
-                        else -> "可连接·不可发现"
+                        sharedLinkKeys.isEmpty() -> "无配对·常驻可发现"
+                        want == 3 -> "已配对·60s 重连缓冲内可发现"
+                        else -> "已配对·缓冲超时（仅 page scan 可回连）"
                     } + "）",
                 )
             }
             // vc239（LOG-238-02）：配对窗自然到期 → 落关闭锚点（清零后本 tick 不再重复）。
-            if (pairingModeUntil != 0L && now >= pairingModeUntil) {
-                pairingModeUntil = 0L
+            if (discoveryWindowUntil != 0L && now >= discoveryWindowUntil) {
+                discoveryWindowUntil = 0L
                 log(AnchorLog.mark("pair-window-close"))
             }
         }
@@ -1308,7 +1514,7 @@ internal class UsbBtHost(
         // 抢射频，挤占寻呼时隙。pageForPairing 侧已先发 INQUIRY_CANCEL 停当轮。
         if (phase == Phase.DISCOVERABLE) {
             // vc238：总闸关闭时不再 inquiry（关闭后设备不可被搜索）；开着才按配对窗口探。
-            val wantInquiry = discoverableEnabled && now < pairingModeUntil
+            val wantInquiry = discoverableEnabled && now < discoveryWindowUntil
             // vc215：主动回连重试窗口内同样压住 inquiry（射频让给寻呼）
             val pairingBusy = paging.get() != null || pairTarget != null || pageRetryAddr != null
             if (wantInquiry && !inquiryRunning && !pairingBusy && now - lastInquiryCompleteAt >= INQUIRY_LISTEN_GAP_MILLIS) {
@@ -1495,4 +1701,10 @@ internal class UsbBtHost(
     override fun onTransportFailure(reason: String) {
         failWith(reason)
     }
+}
+
+/** vc248（VC248-03）：配对窗内配对成功回调（进程级，App 侧注册后用于降回「仅可连接」）。 */
+object UsbBtPairingBus {
+    @Volatile
+    var onPairSuccess: (() -> Unit)? = null
 }

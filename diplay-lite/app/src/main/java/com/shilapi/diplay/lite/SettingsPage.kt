@@ -32,6 +32,8 @@ import java.io.File
 import com.shilapi.xcertplay.transport.PcapTap
 import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
 import com.shilapi.xcertplay.usbbt.UsbBtStandby
+import com.shilapi.diplay.lite.update.UpdateDownloader
+import com.shilapi.diplay.lite.update.UpdateUi
 
 /**
  * 横竖屏模式落到窗口上：land/portrait 强制。
@@ -148,6 +150,8 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var tvVoiceProbeStatus: TextView
     private lateinit var cbVoiceProbeWrite: CheckBox
     private lateinit var tvVersion: TextView
+    // vc248（FEAT-247-01）：检查更新入口（手动触发，一次点击=一次请求）。
+    private lateinit var updateButton: Button
 
     // loadIntoForm 期间静默：setChecked 会触发监听，避免半加载状态写盘
     private var isLoading = false
@@ -157,6 +161,8 @@ class SettingsPage(private val activity: MainActivity) {
         runCatching { persistFromForm() }
         AudioChannelPreview.close()
         AudioChannelPreview.currentActivity = null
+        // vc248（FEAT-247-01 §8）：下载线程随页面生命周期结束（不留下后台下载状态）。
+        UpdateDownloader.cancel()
     }
 
     /** 进入设置页：构建根视图（含悬浮球）并完成表单回显。由 MainActivity.render() 调用。 */
@@ -705,7 +711,20 @@ class SettingsPage(private val activity: MainActivity) {
             setTextColor(Ui.SUB)
             textSize = 13f
         }
-        column.addView(tvVersion, block())
+        updateButton = smallOutlineButton("检查更新") { }
+        updateButton.setOnClickListener { UpdateUi.check(activity, updateButton) }
+        column.addView(
+            LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(
+                    tvVersion,
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+                )
+                addView(updateButton, sideMargin())
+            },
+            block(),
+        )
         // 1.1.3（GPLv3 合规）：开源声明入口——上游署名 + 许可证 + 源码地址 + 商标免责。
         column.addView(
             TextView(activity).apply {
@@ -1543,10 +1562,11 @@ class SettingsPage(private val activity: MainActivity) {
                 if (result.ok) {
                     toast("上传成功：${result.remoteName ?: prepared.fileName}")
                 } else {
-                    // 失败路径留痕：日志侧由 RuntimeLogUploader 记录，界面给出可被用户取用的真实路径。
+                    // 界面只给通用话术（不含仓名/token/URL）；状态码与响应摘要由
+                    // RuntimeLogUploader 落到本地日志，用户导出即可见。
                     toast(
-                        "上传失败（${result.error.orEmpty()}）\n" +
-                            "已生成「${prepared.fileName}」，本地文件：${prepared.file.absolutePath}",
+                        "仓库无法连接，可能版本过旧或凭证过期；" +
+                            "日志已导出到 ${prepared.file.absolutePath}，请自行提取分析",
                     )
                 }
             }

@@ -42,6 +42,9 @@ object UsbBtStandby {
     /** 失败重试间隔（dongle 重枚举/授权未完成等瞬时故障）。 */
     private const val RETRY_DELAY_MILLIS = 2_000L
 
+    /** vc247（V6）：存量多台一次性清空的版本标记（只在升级后首次启动执行）。 */
+    private const val PAIR_CLEANUP_VC = 247
+
     /** vc232：交接后轮询「控制器是否已 close」的间隔（close 时会 notifyAll 立即唤醒）。 */
     private const val HANDOFF_POLL_MILLIS = 1_000L
 
@@ -120,6 +123,13 @@ object UsbBtStandby {
     private var handedOff: HandoffStream? = null
 
     /**
+     * vc248（VC248-03）：配对窗内配对成功回调（App 侧注册，用于降回「仅可连接」）。
+     * 只在 PAIRING → PAIRED 的跃迁触发；启动时 restorePairing 不触发。
+     */
+    @Volatile
+    var onPairSuccess: (() -> Unit)? = null
+
+    /**
      * 启动常驻广播（幂等）。仅在设置里选中「外置蓝牙」时调用。
      * [onDiagnostic] 会拿到全过程逐级状态（进 LiteLog 上云）；
      * [onLinkReady] 在 iPhone 已回连但无人取流时回调（用于自动发起无线连接）。
@@ -131,12 +141,30 @@ object UsbBtStandby {
         onLinkReady: (() -> Unit)? = null,
         keepAlive: Boolean = true,
     ) {
+        UsbBtPairingBus.onPairSuccess = { onPairSuccess?.invoke() }
         linkName = name.ifBlank { "DiPlay 车机" }
         this.onLinkReady = onLinkReady
         this.keepAliveBroadcast = keepAlive // vc207：配对窗「保持常驻广播」开关（关=空闲一轮后停广播）
         // vc213：注入配对持久化（SharedPreferences）并恢复已保存 link key —— 已配对则直接
         // PAIRED/isUsable=true，不再重新配对；清除配对走 clearPairing（含持久化删除）。
-        UsbBtHost.pairingStore = SharedPrefsPairingStore(context.applicationContext)
+        // vc247（V6）：升级后首次启动清空存量多台配对。硬约束：只清外置 dongle 配对表
+        // （SharedPrefsPairingStore 的 key_*/name_*/sole_addr + 内存 linkKeys/pairedNames/
+        // pairedRemoteSnapshot），一律不动系统蓝牙配对（不读 BluetoothAdapter.getBondedDevices）。
+        // 必须落在 restorePairing 之前；失败不阻断启动（异常吞掉，标记未写成功下次重试）。
+        val store = SharedPrefsPairingStore(context.applicationContext)
+        UsbBtHost.pairingStore = store
+        runCatching {
+            val cleared = store.cleanupLegacyMultiDevice(PAIR_CLEANUP_VC)
+            if (cleared != null && cleared > 1) {
+                UsbBtHost.clearPairingMemory()
+                diag(
+                    onDiagnostic,
+                    "pair-cleanup vc247：仅清外置 dongle 配对表，clearCount=$cleared，未触碰系统蓝牙",
+                )
+            }
+        }.onFailure {
+            Log.w(TAG, "pair-cleanup vc247: 失败（不阻断启动）${it.message}")
+        }
         UsbBtHost.restorePairing()
         val myGeneration: Int
         synchronized(lock) {
@@ -632,6 +660,14 @@ object UsbBtStandby {
 private class SharedPrefsPairingStore(context: Context) : UsbBtPairingStore {
     private val prefs = context.getSharedPreferences("usbbt_pairing", Context.MODE_PRIVATE)
 
+    private companion object {
+        /** vc247（V5/V6）：当前唯一配对地址（单台原子写落盘位）。 */
+        const val KEY_SOLE_ADDR = "sole_addr"
+
+        /** vc247（V6）：存量多台清理标记（值 = 已执行到的 versionCode）。 */
+        const val KEY_CLEANUP_VC = "pair_cleanup_vc"
+    }
+
     override fun loadAll(): Map<String, Pair<ByteArray, String?>> {
         val out = LinkedHashMap<String, Pair<ByteArray, String?>>()
         for ((k, v) in prefs.all) {
@@ -644,18 +680,53 @@ private class SharedPrefsPairingStore(context: Context) : UsbBtPairingStore {
         return out
     }
 
-    override fun save(addrKey: String, linkKey: ByteArray, name: String?) {
-        val e = prefs.edit().putString("key_$addrKey", toHex(linkKey))
-        if (name != null) e.putString("name_$addrKey", name)
-        e.apply()
-    }
-
     override fun saveName(addrKey: String, name: String) {
         prefs.edit().putString("name_$addrKey", name).apply()
     }
 
     override fun clear() {
-        prefs.edit().clear().apply()
+        // vc248（VC248-05）：按前缀精确删，保留 `pair_cleanup_vc`（一次性标记不随清配对丢失）。
+        // 必须遍历 allKeys：loadAll() 会过滤掉非 16 字节/hex 非法的 key_*，走它会漏删。
+        val e = prefs.edit()
+        for (key in prefs.all.keys) {
+            if (key.startsWith("key_") || key.startsWith("name_") || key == KEY_SOLE_ADDR) {
+                e.remove(key)
+            }
+        }
+        e.apply()
+    }
+
+    override fun remove(addrKey: String) {
+        val e = prefs.edit().remove("key_$addrKey").remove("name_$addrKey")
+        if (prefs.getString(KEY_SOLE_ADDR, null) == addrKey) e.remove(KEY_SOLE_ADDR)
+        e.apply()
+    }
+
+    override fun saveExclusive(addrKey: String, linkKey: ByteArray, name: String?) {
+        // 同一 editor 一次 apply：清旧表 + 写这一台 + 记 sole_addr（单台原子写）。
+        // V6 的 pair_cleanup_vc 标记随 clear 一起被抹掉会导致下次启动重复清空，单独搬回来。
+        val cleanupVc = prefs.getInt(KEY_CLEANUP_VC, 0)
+        val e = prefs.edit().clear()
+        e.putString("key_$addrKey", toHex(linkKey))
+        if (name != null) e.putString("name_$addrKey", name)
+        e.putString(KEY_SOLE_ADDR, addrKey)
+        if (cleanupVc > 0) e.putInt(KEY_CLEANUP_VC, cleanupVc)
+        e.apply()
+    }
+
+    /**
+     * vc247（V6）：存量多台一次性清空（只清外置 dongle 配对表，绝不读/动系统蓝牙 bonded）。
+     * 返回本次清理前的台数；`null` = 标记已是本版本或写入失败（下次启动重试）。
+     * 判据只数 `key_*` 条数：0/1 台不动数据，仅落标记；>1 才 clear。
+     */
+    fun cleanupLegacyMultiDevice(vc: Int): Int? {
+        if (prefs.getInt(KEY_CLEANUP_VC, 0) >= vc) return null
+        val count = loadAll().size
+        val e = prefs.edit()
+        if (count > 1) e.clear()
+        e.putInt(KEY_CLEANUP_VC, vc)
+        if (!e.commit()) return null
+        return count
     }
 
     private fun toHex(data: ByteArray): String =

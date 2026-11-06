@@ -10,22 +10,22 @@ import com.shilapi.xcertplay.usbbt.UsbBtStandby
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * 外置 USB 蓝牙（dongle）兜底：有界自检 / 掉线感知 / root 软复位。
+ * 外置 USB 蓝牙（dongle）兜底：有界自检 / 掉线感知。
  *
  * vc245 背景（T3 2026-11-05 现场）：dongle 掉线后重新拔插无反应。旧代码有两处盲区：
  * ① MainActivity 的 DETACHED 接收器只处理 Apple 设备（0x05ac），dongle（0x0a12）被忽略；
  * ② openDevice 没有超时，system_server 一旦 D 态卡在 usbdev_open，App 会无限等、也无日志。
  *
- * 本类只做三件可交付的事：
+ * 本类只做两件可交付的事：
  * 1. 有界自检：openDevice 放独立线程 + 3s 看门狗，超时判 OPEN_TIMEOUT，不再无限等；
- * 2. 三态可区分：设备不在 / 未授权 / 打开超时 / 打开失败，各落一行可判别日志；
- * 3. 软复位（仅 root、仅手动入口触发）：对 dongle 自己的 sysfs 节点写 authorized 0→1。
+ * 2. 三态可区分：设备不在 / 未授权 / 打开超时 / 打开失败，各落一行可判别日志。
  *
  * 天花板（实测结论，别宣称已解决）：若 system_server 线程已经 D 态卡在 usbdev_open，
- * openDevice 与 authorized 写都会跟着卡住，App 层无解，只能重启 system_server 或整机。
+ * openDevice 与任何 sysfs 写都会跟着卡住，App 层无解，只能重启 system_server 或整机。
  */
 object UsbDongleGuard {
     const val VENDOR_ID = 0x0a12
@@ -43,13 +43,22 @@ object UsbDongleGuard {
     /** vc246：等常驻广播 host 初始化完成的上限（实测 dongle 冷启 3–10s）。 */
     private const val STANDBY_READY_WAIT_MS = 15_000L
 
-    /** vc246：等 su 软复位的最长时间（超时 destroy，避免 waitFor 永久阻塞）。 */
-    private const val SOFT_RESET_WAIT_MS = 8_000L
-
     // vc246（USB-246-03）：自检成功判据升级——新增「控制器不应答 HCI」。
-    enum class Status { OK, ABSENT, NO_PERMISSION, OPEN_TIMEOUT, OPEN_FAILED, HCI_NO_RESPONSE }
+    // vc247（V2）：SKIPPED = 代际交接期跳过，不增不减失败计数、不上 UI。
+    enum class Status { OK, ABSENT, NO_PERMISSION, OPEN_TIMEOUT, OPEN_FAILED, HCI_NO_RESPONSE, SKIPPED }
 
-    data class Report(val status: Status, val detail: String)
+    /** [alert] 供 UI 判断是否上屏：仅连续真失败达到阈值且尚未报过时为 true。 */
+    data class Report(val status: Status, val detail: String, val alert: Boolean = false)
+
+    /** vc247（V2）：连续真失败阈值（单次失败只进日志，达到才上 UI）。 */
+    private const val ALERT_THRESHOLD = 2
+
+    /** vc247（V2）：进程级计数，**不以代际编号作键**（交接会重置计数）。进程重启才清零。 */
+    @Volatile private var consecutiveFailures = 0
+    @Volatile private var alertShown = false
+
+    /** vc247（V2）：单飞，防 Activity 重建/多处调用重复计数与并跑。 */
+    private val checkRunning = AtomicBoolean(false)
 
     /** vc246（USB-246-04）：sysfs 旁证是否仍能看到 0a12（只读、不走 binder，D 态下仍可读）。 */
     val sysfsPresent: Boolean
@@ -77,33 +86,84 @@ object UsbDongleGuard {
         timeoutMs: Long = CHECK_TIMEOUT_MS,
         expectStandby: Boolean = false,
     ): Report {
-        val latch = CountDownLatch(1)
-        val result = AtomicReference<Report?>(null)
-        val abandoned = AtomicReference(false)
-        val worker = Thread {
-            val report = try {
-                boundedOpen(context.applicationContext, abandoned, expectStandby)
-            } catch (error: Throwable) {
-                Report(Status.OPEN_FAILED, "自检异常 ${error.javaClass.simpleName}: ${error.message}")
+        // vc247（V2）：单飞 —— 已有自检在跑时直接跳过，不重复计数。
+        if (!checkRunning.compareAndSet(false, true)) {
+            val skipped = Report(Status.SKIPPED, "自检已跳过（已有自检在跑）")
+            log(tag, skipped)
+            return skipped
+        }
+        try {
+            val generationAtStart = UsbBtStandby.generationSnapshot
+            val latch = CountDownLatch(1)
+            val result = AtomicReference<Report?>(null)
+            val abandoned = AtomicReference(false)
+            val worker = Thread {
+                val report = try {
+                    boundedOpen(context.applicationContext, abandoned, expectStandby)
+                } catch (error: Throwable) {
+                    Report(Status.OPEN_FAILED, "自检异常 ${error.javaClass.simpleName}: ${error.message}")
+                }
+                result.set(report)
+                latch.countDown()
             }
-            result.set(report)
-            latch.countDown()
+            worker.isDaemon = true
+            worker.start()
+            val finished = runCatching { latch.await(timeoutMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            if (!finished) {
+                abandoned.set(true)
+                val report = Report(
+                    Status.OPEN_TIMEOUT,
+                    "自检 ${timeoutMs}ms 未返回：可能内核态 usbdev_open 卡住，App 层无解，需重启车机",
+                )
+                return finish(tag, report, generationAtStart, expectStandby)
+            }
+            val report = result.get() ?: Report(Status.OPEN_FAILED, "自检未产出结果")
+            return finish(tag, report, generationAtStart, expectStandby)
+        } finally {
+            checkRunning.set(false)
         }
-        worker.isDaemon = true
-        worker.start()
-        val finished = runCatching { latch.await(timeoutMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
-        if (!finished) {
-            abandoned.set(true)
-            val report = Report(
-                Status.OPEN_TIMEOUT,
-                "自检 ${timeoutMs}ms 未返回：可能内核态 usbdev_open 卡住，App 层无解，需重启车机",
-            )
-            log(tag, report)
-            return report
+    }
+
+    /**
+     * vc247（V2）：交接期判定 + 计数 + 日志的统一出口。
+     * 只有「非 OK、检查期间代际变了、结束时 standby 仍在跑」才降级为 SKIPPED —— 这是
+     * 交接还没完成导致的中间态，既不是失败也不是成功，不参与计数。
+     */
+    private fun finish(tag: String, report: Report, generationAtStart: Int, tracked: Boolean): Report {
+        val generationNow = UsbBtStandby.generationSnapshot
+        val effective = if (
+            report.status != Status.OK &&
+            generationNow != generationAtStart &&
+            UsbBtStandby.isRunning
+        ) {
+            Report(Status.SKIPPED, "自检已跳过（代际交接中）gen=$generationAtStart->$generationNow")
+        } else {
+            report
         }
-        val report = result.get() ?: Report(Status.OPEN_FAILED, "自检未产出结果")
-        log(tag, report)
-        return report
+        val out = if (tracked) track(effective) else effective
+        log(tag, out)
+        return out
+    }
+
+    /** vc247（V2）：OK 清零、真失败 +1、SKIPPED 不增不减；达到阈值只上屏一次。 */
+    private fun track(report: Report): Report {
+        when (report.status) {
+            Status.OK -> {
+                consecutiveFailures = 0
+                alertShown = false
+                return report
+            }
+            Status.SKIPPED -> return report
+            else -> Unit
+        }
+        consecutiveFailures += 1
+        val alert = consecutiveFailures >= ALERT_THRESHOLD && !alertShown
+        if (alert) alertShown = true
+        LiteLog.log(
+            "usbdongle",
+            "self-check fail streak=$consecutiveFailures threshold=$ALERT_THRESHOLD alert=$alert",
+        )
+        return report.copy(alert = alert)
     }
 
     private fun boundedOpen(
@@ -186,50 +246,6 @@ object UsbDongleGuard {
         return null
     }
 
-    /**
-     * root 软复位：只动 dongle 自己节点的 authorized（0 → 1，等价软拔插）。
-     * 仅手动入口触发，调用前后各落一行日志；执行后 1.5s 重枚举再复检。
-     * 若 system_server 已 D 态卡住，本调用也会卡住——不做额外超时（su 进程由调用方线程承担）。
-     */
-    fun softReset(context: Context): Report {
-        val node = sysfsNode()
-        if (node == null) {
-            val report = Report(Status.ABSENT, "/sys 未找到 dongle 节点，无法软复位")
-            log("软复位", report)
-            return report
-        }
-        val authorized = File(node, "authorized")
-        log("软复位", Report(Status.OK, "节点 ${node.name} authorized=${readText(authorized)} → 写 0 再写 1"))
-        val exit = runCatching {
-            val process = Runtime.getRuntime().exec(
-                arrayOf(
-                    "su", "-c",
-                    "echo 0 > ${authorized.absolutePath}; sleep 1; echo 1 > ${authorized.absolutePath}",
-                ),
-            )
-            // vc246：Process.waitFor(timeout) 是 API26+，KK 不可用；用看门狗 destroy 兜底。
-            val guard = Thread {
-                try {
-                    Thread.sleep(SOFT_RESET_WAIT_MS)
-                } catch (_: InterruptedException) {
-                    return@Thread
-                }
-                runCatching { process.destroy() }
-            }
-            guard.isDaemon = true
-            guard.start()
-            val code = process.waitFor()
-            guard.interrupt()
-            if (code != 0) {
-                LiteLog.log("usbdongle", "软复位：su 退出码 $code（可能超时被 destroy）")
-            }
-            code
-        }.getOrDefault(-1)
-        log("软复位", Report(if (exit == 0) Status.OK else Status.OPEN_FAILED, "su 退出码 $exit"))
-        runCatching { Thread.sleep(1500) }
-        return check(context, "软复位后复检")
-    }
-
     private fun log(tag: String, report: Report) {
         val line = "usbdongle [$tag] ${report.status} ${report.detail}"
         LiteLog.log("usbdongle", line)
@@ -239,6 +255,4 @@ object UsbDongleGuard {
     private fun readHex(file: File): Int? = runCatching {
         file.readText().trim().toInt(16)
     }.getOrNull()
-
-    private fun readText(file: File): String = runCatching { file.readText().trim() }.getOrDefault("?")
 }

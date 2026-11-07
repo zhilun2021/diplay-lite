@@ -26,8 +26,8 @@ import javax.net.ssl.SSLContext
  * 最新段，不带 old 会丢配对证据——vc206 实测踩过）。
  *
  * 命名（截图字段为准）：
- * `dongle-<yyyyMMdd>-<HHmmss>-Android<ver>-api<SDK>-v<version>_<vc>-<model>.txt`
- * 例：dongle-20261101-115212-Android14-api34-v1.3.0_vc207-23013RK75C.txt
+ * `dongle-<yyyyMMdd>-<HHmmss>-<设备码>-Android<ver>-api<SDK>-v<version>_<vc>-<model>.txt`
+ * 例：dongle-20261101-115212-22:22:37:4D:5C:0D-Android14-api34-v1.3.0_vc207-23013RK75C.txt
  */
 object DongleLogUploader {
     private const val MAX_BYTES = 512 * 1024
@@ -72,10 +72,13 @@ object DongleLogUploader {
         LogRedactor.redactLines(lines)
 
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val fileName = buildFileName(context, stamp)
+        val deviceCode = DeviceCode.of()
+        val fileName = buildFileName(context, stamp, deviceCode)
         val header = buildString {
             append("dongle 连接日志（外置 USB 蓝牙）\n\n")
             append("设备：").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n")
+            // 设备码是明文蓝牙 MAC（用户拍板），多台同型号车机靠它归机，便于与蓝牙清单对账。
+            append("设备码：").append(deviceCode).append("\n")
             append("系统版本：Android").append(Build.VERSION.RELEASE)
                 .append("（api ").append(Build.VERSION.SDK_INT).append("）\n")
             append("软件版本：").append(versionName(context)).append("\n")
@@ -268,12 +271,12 @@ object DongleLogUploader {
     }
 
     /** 1.3.0-vc207-debug → 1.3.0_vc207（去 -debug 尾巴、-vc → _vc，对齐截图命名）。 */
-    private fun buildFileName(context: Context, stamp: String): String {
+    private fun buildFileName(context: Context, stamp: String, deviceCode: String): String {
         val version = versionName(context)
             .removeSuffix("-debug")
             .replace("-vc", "_vc")
         val safeModel = Build.MODEL.trim().replace(Regex("[^0-9A-Za-z._-]"), "-")
-        return "dongle-$stamp-Android${Build.VERSION.RELEASE}-api${Build.VERSION.SDK_INT}" +
+        return "dongle-$stamp-$deviceCode-Android${Build.VERSION.RELEASE}-api${Build.VERSION.SDK_INT}" +
             "-v$version-$safeModel.txt".replace(Regex("[\\s]+"), "")
     }
 

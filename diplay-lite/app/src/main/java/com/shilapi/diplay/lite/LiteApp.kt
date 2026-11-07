@@ -29,6 +29,9 @@ class LiteApp : Application() {
             previous?.uncaughtException(thread, throwable)
         }
         LiteLog.log("app", "DiPlay Lite 进程启动 versionName=${packageManager.getPackageInfo(packageName, 0).versionName}")
+        // 本地日志也带归机码：用户直接拷日志时同样能分辨来自哪台机器。
+        // 设备码是明文蓝牙 MAC（用户拍板）；describe 在取不到 MAC 时写明 unknown 的具体原因。
+        LiteLog.log("app", "设备码 ${DeviceCode.describe()}")
     }
 
     /** targetSdk 19：外部存储写权限安装即授予，无需运行时申请。 */

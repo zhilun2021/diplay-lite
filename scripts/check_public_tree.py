@@ -2,7 +2,7 @@
 """Public-tree credential guard.
 
 Rejects credential containers, private keys, ability-signed binaries and local
-evidence archives before they are published to the public repository.
+evidence archives in the tree that is actually published.
 
 Why this exists: the MFi accessory identity (``identity.pk8`` / ``certificate.p7b``)
 used to be tracked in Git and reached the public branch history. Committing a key
@@ -10,22 +10,32 @@ does not make it usable later and cannot be undone by deleting it afterwards --
 any clone still carries the object. This guard is the barrier that should have
 existed in the first place.
 
-Semantics:
-  * Only files tracked by Git are inspected (``git ls-files``). Untracked local
-    files are irrelevant to what gets published.
+Semantics (2026-11-06 revised):
+  * Counts and scans the **public tree of a ref** (``git archive <ref>``), NOT the
+    private worktree. ``git ls-files`` on the private branch answers a different
+    question and must never be quoted as "the public payload".
   * Both path patterns and file content are checked, because a key can be a raw
     PEM block dropped anywhere in the tree.
-  * Exits non-zero with a readable report when anything is rejected, so CI fails
-    loudly instead of shipping the problem.
+  * "Count" and "rejected" are reported separately: the count is the size of the
+    public payload, rejection is the verdict on it.
 
-Usage:  python3 scripts/check_public_tree.py
+Ref selection:
+  * ``--ref`` wins when given.
+  * Otherwise the first existing ref of ``public/main`` then ``github-main`` is
+    used. Both point at the public branch locally; ``public/main`` is the remote
+    tracking ref of the Gitee public repo, so it is preferred as the ground truth.
+
+Usage:  python3 scripts/check_public_tree.py [--ref REF]
+Exits 0 when nothing is rejected, 1 when something is.
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
+import tarfile
 
 # Path patterns that must never enter the public tree.
 REJECTED_SUFFIXES = (
@@ -81,73 +91,128 @@ CONTENT_PATTERNS = (
 MAX_CONTENT_SCAN_BYTES = 2 * 1024 * 1024
 TEXT_SAMPLE_BYTES = 8192
 
+PREFERRED_REFS = ("public/main", "github-main")
 
-def tracked_files() -> list[str]:
-    out = subprocess.run(
-        ["git", "ls-files", "-z"],
-        check=True, capture_output=True,
-    ).stdout
-    return [p.decode("utf-8", "replace")
-            for p in out.split(b"\0") if p]
+
+def rev_exists(ref: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def resolve_ref(explicit: str | None) -> str:
+    if explicit:
+        if rev_exists(explicit):
+            return explicit
+        raise SystemExit(
+            "check_public_tree: ref '%s' does not resolve to a commit. "
+            "Pass --ref with a public ref (e.g. --ref public/main)." % explicit
+        )
+    for candidate in PREFERRED_REFS:
+        if rev_exists(candidate):
+            return candidate
+    raise SystemExit(
+        "check_public_tree: no public ref found (tried %s). "
+        "Run: git fetch public, or pass --ref explicitly." % ", ".join(PREFERRED_REFS)
+    )
+
+
+def short_sha(ref: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--short", ref + "^{commit}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def scan_tree(ref: str):
+    """Stream the public tree once: return (paths, rejected_path, rejected_content)."""
+    proc = subprocess.Popen(["git", "archive", "--format=tar", ref],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    paths: list[str] = []
+    by_path: list[tuple[str, str]] = []
+    by_content: list[tuple[str, str]] = []
+    rejected = set()
+
+    with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
+        for member in archive:
+            if not member.isfile():
+                continue
+            path = member.name
+            paths.append(path)
+            lowered = path.lower()
+
+            if lowered.endswith(REJECTED_SUFFIXES):
+                by_path.append((path, "credential container or build artifact"))
+                rejected.add(path)
+                continue
+            if lowered.startswith(REJECTED_PREFIXES):
+                by_path.append((path, "local-only directory"))
+                rejected.add(path)
+                continue
+            if lowered.split("/")[-1] in REJECTED_BASENAMES:
+                by_path.append((path, "local secrets file"))
+                rejected.add(path)
+                continue
+
+            handle = archive.extractfile(member)
+            if handle is None:
+                continue
+            blob = handle.read(MAX_CONTENT_SCAN_BYTES)
+            if b"\0" in blob[:TEXT_SAMPLE_BYTES]:
+                continue  # binary attachments that passed the suffix check are fine
+            for label, pattern in CONTENT_PATTERNS:
+                if pattern.search(blob):
+                    by_content.append((path, label))
+                    rejected.add(path)
+                    break
+
+    err = proc.stderr.read().decode("utf-8", "replace").strip()
+    if proc.wait() != 0:
+        raise SystemExit("check_public_tree: git archive failed: %s" % err)
+
+    return paths, by_path, by_content, rejected
 
 
 def main() -> int:
-    files = tracked_files()
-    if not files:
-        print("check_public_tree: nothing tracked, nothing to check")
+    parser = argparse.ArgumentParser(description="Public-tree credential guard")
+    parser.add_argument(
+        "--ref",
+        default=None,
+        help="Public ref to inspect. Default: first of %s that exists."
+             % ", ".join(PREFERRED_REFS),
+    )
+    args = parser.parse_args()
+
+    ref = resolve_ref(args.ref)
+    paths, by_path, by_content, rejected = scan_tree(ref)
+
+    print("check_public_tree: public tree @ %s (%s): %d tracked files"
+          % (ref, short_sha(ref), len(paths)))
+
+    if not rejected:
+        print("check_public_tree: OK - 0 of %d rejected by path rules, "
+              "0 of %d rejected by content rules"
+              % (len(paths), len(paths)))
         return 0
 
-    by_path: list[tuple[str, str]] = []
-    for path in files:
-        lowered = path.lower()
-        if lowered.endswith(REJECTED_SUFFIXES):
-            by_path.append((path, "credential container or build artifact"))
-            continue
-        if lowered.startswith(REJECTED_PREFIXES):
-            by_path.append((path, "local-only directory"))
-            continue
-        if lowered.split("/")[-1] in REJECTED_BASENAMES:
-            by_path.append((path, "local secrets file"))
-
-    by_content: list[tuple[str, str]] = []
-    for path in files:
-        if any(path == bad for bad, _ in by_path):
-            continue
-        try:
-            with open(path, "rb") as handle:
-                blob = handle.read(MAX_CONTENT_SCAN_BYTES)
-        except OSError:
-            continue
-        if b"\0" in blob[:TEXT_SAMPLE_BYTES]:
-            continue  # binary attachments that passed the suffix check are fine
-        for label, pattern in CONTENT_PATTERNS:
-            if pattern.search(blob):
-                by_content.append((path, label))
-                break
-
-    if not by_path and not by_content:
-        print(f"check_public_tree: OK - {len(files)} tracked files, nothing rejected")
-        return 0
-
-    print("check_public_tree: FAILED - refusing to publish these tracked paths",
-          file=sys.stderr)
+    print("check_public_tree: FAILED - %d of %d public-tree files rejected"
+          % (len(rejected), len(paths)), file=sys.stderr)
     print("", file=sys.stderr)
     if by_path:
-        print("-- rejected by path --", file=sys.stderr)
+        print("-- rejected by path (%d) --" % len(by_path), file=sys.stderr)
         for path, reason in by_path:
-            print(f"  {path}  ({reason})", file=sys.stderr)
+            print("  %s  (%s)" % (path, reason), file=sys.stderr)
         print("", file=sys.stderr)
     if by_content:
-        print("-- rejected by content --", file=sys.stderr)
+        print("-- rejected by content (%d) --" % len(by_content), file=sys.stderr)
         for path, label in by_content:
-            print(f"  {path}  ({label})", file=sys.stderr)
+            print("  %s  (%s)" % (path, label), file=sys.stderr)
         print("", file=sys.stderr)
-    print("Remove them from tracking (git rm --cached) and add the pattern to",
-          file=sys.stderr)
-    print(".gitignore. Note: deleting a file does not remove it from Git",
-          file=sys.stderr)
-    print("history -- rewriting the history is required in that case.",
-          file=sys.stderr)
+    print("Remove them from the public tree and add the pattern to the sync"
+          " whitelist. Note: deleting a file does not remove it from Git history"
+          " -- rewriting the history is required in that case.", file=sys.stderr)
     return 1
 
 

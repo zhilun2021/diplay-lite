@@ -193,6 +193,39 @@ Java_com_shilapi_xcertplay_transport_LegacyUsbHostNative_setConfiguration(
 #endif
 }
 
+JNIEXPORT jint JNICALL
+Java_com_shilapi_xcertplay_transport_LegacyUsbHostNative_restoreKernelDriver(
+        JNIEnv *env, jobject self, jint file_descriptor, jint interface_number) {
+    (void) env;
+    (void) self;
+
+    if (file_descriptor < 0 || interface_number < 0) return EINVAL;
+
+#ifndef USBDEVFS_CONNECT
+#define USBDEVFS_CONNECT _IOW('U', 23, unsigned int)
+#endif
+
+    /* USBDEVFS_CONNECT 的参数是接口号本身（不是指针）。 */
+    if (ioctl(file_descriptor, USBDEVFS_CONNECT, (unsigned long) interface_number) == 0) {
+        return 0;
+    }
+    int direct_errno = errno;
+
+    /* 老内核（如 sunxi KK）可能只认 USBDEVFS_IOCTL 包装形式。 */
+#ifdef USBDEVFS_IOCTL
+    struct usbdevfs_ioctl connect;
+    memset(&connect, 0, sizeof(connect));
+    connect.ifno = interface_number;
+    connect.ioctl_code = USBDEVFS_CONNECT;
+    connect.data = NULL;
+    if (ioctl(file_descriptor, USBDEVFS_IOCTL, &connect) == 0) {
+        return 0;
+    }
+#endif
+
+    return direct_errno != 0 ? direct_errno : EIO;
+}
+
 /* controlTransferErrno: vc189（T3）——直接走 USBDEVFS_CONTROL ioctl 下发 CarPlay
  * 厂商配置请求（0x52），失败时原样返回内核 errno。Android 框架 controlTransfer()
  * 把 errno 吞成不透明 -1，无法区分 ENODEV(陈旧实例)/EPIPE(设备拒绝)/ETIMEDOUT(线缆)/EBUSY(claim)。

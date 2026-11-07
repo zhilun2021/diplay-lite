@@ -509,6 +509,9 @@ class LiteSessionService : Service() {
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
                     // 1.1.6(vc76)：TS7 无 root 裁决实验——本包关闭有线 cdc_ncm 解绑守护。
                     wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,
+                    // 2026-11-07：有线实验 —— 内核 cdc_ncm 数据面（设置页勾选，默认关）。
+                    // 只改 WIRED 分支行为：不建 TUN/VPN、不抢 NCM 接口；失败即结束会话不回落。
+                    wiredKernelNcmExperiment = config.wiredKernelNcmExperiment,
                     // vc167（外置 USB 蓝牙 dongle 第 2 步）：开关透传到控制器建链处。
                     usbBtDongle = config.usbBtDongle,
                     // vc184：外置蓝牙自定义名称透传（写进 dongle HCI 本地名称）。

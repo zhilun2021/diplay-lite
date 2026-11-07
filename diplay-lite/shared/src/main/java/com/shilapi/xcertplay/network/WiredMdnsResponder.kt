@@ -28,10 +28,16 @@ class WiredMdnsResponder(
     private val airPlayConfig: AirPlayConfig,
     private val identity: AirPlayIdentity,
     private val onDiagnostic: (String) -> Unit = {},
+    // 2026-11-07：内核 NCM 实验。strictBind=true 时只允许绑 kernel 网卡地址，
+    // 绝不回退 0.0.0.0；失败原因写进 lastFailure，由控制器当场结束会话（不静默降级）。
+    private val strictBind: Boolean = false,
+    private val kernelInterfaceName: String? = null,
 ) {
     private val running = AtomicBoolean(false)
     private var socket: MulticastSocket? = null
     private var thread: Thread? = null
+    @Volatile var lastFailure: String? = null
+        private set
     @Volatile private var scopeId = 0
     @Volatile private var currentTxt: Map<String, String>? = null
     private var inlineSeen = 0
@@ -227,7 +233,12 @@ class WiredMdnsResponder(
     fun start(): Boolean {
         check(running.compareAndSet(false, true)) { "wired mdns responder already started" }
         return try {
-            val netIf = findInterface() ?: throw IllegalStateException("no iface for $bindAddress")
+            val netIf = if (strictBind && kernelInterfaceName != null) {
+                NetworkInterface.getByName(kernelInterfaceName)
+                    ?: throw IllegalStateException("kernel interface $kernelInterfaceName not found")
+            } else {
+                findInterface()
+            } ?: throw IllegalStateException("no iface for $bindAddress")
             // API16：`NetworkInterface#getIndex()` 是 **API 19+**，低版本抛 `NoSuchMethodError`。
             // 🔴 该异常是 **Error**，下面的 `catch (error: Exception)` 兜不住，会直接把调用线程
             // 打崩（有线 AirPlay 在 API16~18 上整体不可用）。API<19 没有接口索引，
@@ -239,14 +250,19 @@ class WiredMdnsResponder(
             val sock = MulticastSocket(null as java.net.SocketAddress?)
             sock.reuseAddress = true
             var bound = false
-            val bindCandidates = listOf(
-                // vc124（KK 实测）：:: 通配（getByName 与原始字节构造均）被 KK
-                // InetSocketAddress 误判 "link-local without scope id"，fallback 0.0.0.0
-                // 得到 AF_INET socket 收不到 v6 组播。绑 ULA tun 地址本身（fd00::2，
-                // 全局 scope 不触发 link-local 检查）即得 AF_INET6 socket。
-                bindAddress,
-                InetAddress.getByName("0.0.0.0"),
-            )
+            val bindCandidates = if (strictBind) {
+                // 内核模式：只允许绑内核 NCM 网卡地址；做不到就明确失败，不回退通配。
+                listOf(bindAddress)
+            } else {
+                listOf(
+                    // vc124（KK 实测）：:: 通配（getByName 与原始字节构造均）被 KK
+                    // InetSocketAddress 误判 "link-local without scope id"，fallback 0.0.0.0
+                    // 得到 AF_INET socket 收不到 v6 组播。绑 ULA tun 地址本身（fd00::2，
+                    // 全局 scope 不触发 link-local 检查）即得 AF_INET6 socket。
+                    bindAddress,
+                    InetAddress.getByName("0.0.0.0"),
+                )
+            }
             for (candidate in bindCandidates) {
                 if (candidate == null) continue
                 try {
@@ -283,8 +299,10 @@ class WiredMdnsResponder(
             )
             true
         } catch (error: Exception) {
-            onDiagnostic("wired mdns responder start failed: " +
-                "${error.javaClass.simpleName}: ${error.message}")
+            val message = "wired mdns responder start failed: " +
+                "${error.javaClass.simpleName}: ${error.message}"
+            lastFailure = message
+            onDiagnostic(message)
             runCatching { socket?.close() }
             socket = null
             running.set(false)

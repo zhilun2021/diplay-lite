@@ -15,6 +15,11 @@ gradle.properties
 .cxx/
 .externalNativeBuild/
 captures/
+# NDK 手动构建中间产物（ndk-build 生成，含 .o / 中间态，绝不入库）
+# 本仓沿用「提交预编译 jniLibs/*.so + 手动 ndk-build 替换」模式（build.gradle 不接 NDK）。
+# ndk-build 会在 jni/ 下产出 obj/，亦可能在 src/main/ 下产出 obj/，二者皆排除。
+diplay-lite/app/src/main/jni/obj/
+diplay-lite/app/src/main/obj/
 
 # Local agent working notes
 /agent_docs/
@@ -35,16 +40,40 @@ Thumbs.db
 release-signing.properties
 
 # Never commit credential containers or installable distribution artifacts.
-# 注：*.pk8 / *.p7b 已放开以在仓库留存 CarPlay 认证（user 要求）
+# 2026-10-21 整顿：此前的「*.pk8 / *.p7b 放开例外」已撤销。
+# 该例外使 MFi 身份私钥（identity.pk8 / certificate.p7b）随源码入仓，并最终进入公开仓
+# 的历史提交，任何 clone 者都能提取到与现役完全相同的那把 Key。身份资产现改为构建期
+# 从外部目录注入，详见 diplay-lite/app/build.gradle.kts 的 injectRuntimeIdentity 任务。
 *.p12
 *.pfx
 *.pem
 *.key
+*.pk8
+*.p7b
 *.apk
 *.aab
+*.idsig
+*.p8
+*.der
+*.cer
 
-# Allow archived release APKs (keep only the last 3)
-!apks/*.apk
+# 构建/打包产物一律不入库。
+# 旧例外 `!apks/*.apk` 已移除：它曾使 96 个 APK 进入对象库（约 218MB），且这些 APK
+# 内部打包着同样的身份私钥。archive 由 ciRelease 落地本地 apks/ 即可，不进版本控制。
+apks/
+
+# CarPlay 运行时身份资产的本地存放点（构建时被复制到 assets，源文件永不入库）
+/auth/
+
+# 外置 USB 蓝牙固件（Realtek 等 blob，linux-firmware 再分发许可）：构建期从 /auth/usbbt_fw
+# 注入，源码仓（含公开 GitHub）绝不入库。源文件在 /auth/usbbt_fw（已被 /auth/ 排除），
+# 此处排除注入目标目录，避免本地注入产物被跟踪。
+# 注意路径相对仓库根：app 模块在 diplay-lite/ 下。
+diplay-lite/app/src/main/assets/usbbt_fw/
+
+# vc193：root PCM 直采二进制（diplay-pcmcap）：构建期从 /auth/tinycap/bin 注入，
+# 源码与产物均不入库（源在 /auth/ 已被排除）。同排除注入目标目录。
+diplay-lite/app/src/main/assets/tinycap/
 
 # 车主隐私与取证产物、反编译工作区、外部引用仓（仅本地留存，永不入仓）
 # 20261019 起统一归档至 local-archive/（旧根路径保留一段时间防回加）
@@ -62,8 +91,31 @@ backup/
 hardware-stage/
 *.pcap
 
-# 本地流程文档（不入任何仓）
-GITHUB-提交操作规范.md
+# ── 会话记忆（agent 本地状态，非项目源码）──────────────────────
+# IDE/agent 的会话与记忆产物，随机器而变，不应进任何仓库。
+.workbuddy/
 
-# 开源仓剔除项补充（本地文档归档）
-docs-local/
+# ── 工程知识层（区分对待，勿一刀切）────────────────────────────
+# 以下目录**必须进 gitee 私有仓做全量备份**，因此不得 ignore。
+# 它们之所以不会泄到 GitHub，靠的是「同步白名单」只提取源码路径，
+# 详见 工程文档/10-同步规范.md —— 隔离由白名单保证，不靠 gitignore。
+# 工程文档/
+# 每日记忆/
+# 当前状态.md
+#
+# 反例教训：此前 `docs-local/` 与 `GITHUB-提交操作规范.md` 被写进这里，
+# 结果**连私有仓都没备份**，与「私有仓全量」的意图背道而驰，且该文件
+# 本身是唯一记载同步规范的文档。已于 2026-10-21 纠正。
+
+# ── 测试取证与日志（2026-11-05 定则）────────────────────────────
+# 日志/采集产物只存「日志仓库」和本地分析目录（tests/artifacts 原位、tmp-analysis/），
+# 不进代码仓库。这里只拦数据产物：脚本（*.ps1 / *.py）与说明（*.md）仍正常入库，
+# 以免把工具一起挡掉。
+tests/**/*.txt
+tests/**/*.log
+tests/**/logcat*
+tests/**/*.xml
+tests/**/*.png
+tests/**/*.jpg
+tests/**/*.jpeg
+*.mp4

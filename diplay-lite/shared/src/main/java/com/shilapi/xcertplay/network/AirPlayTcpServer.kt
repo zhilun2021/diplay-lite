@@ -22,8 +22,10 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * AirPlay TCP 监听器（Lite：自 minapi21 分支 CarPlayVpnService.attachWireless 抽出）。
  *
- * 无线路径不需要 Android VPN 接口——仅在热点地址上绑定 ServerSocket 并为每个入站连接
- * 创建 [AirPlaySession]。原 Service + Binder + VPN/NCM 有线逻辑全部裁剪。
+ * 无线与有线（WIRED）共用：无线绑车机热点地址；有线默认绑 VpnService TUN 地址
+ * （fd00::2，配合 Ipv6NcmBridge 走用户态 NCM），实验模式下绑内核 cdc_ncm 网卡的
+ * 链路本地地址（带 scope，无 TUN/VPN）。本类只负责在给定地址上建监听并为每个
+ * 入站连接创建 [AirPlaySession]；原 Service 内的编排/VPN 逻辑已裁剪。
  */
 class AirPlayTcpServer {
 

@@ -70,6 +70,9 @@ import com.shilapi.xcertplay.transport.IphoneCarPlayConfiguration
 import com.shilapi.xcertplay.transport.IphoneUsbException
 import com.shilapi.xcertplay.transport.IphoneUsbHost
 import com.shilapi.xcertplay.transport.IphoneUsbMatcher
+import com.shilapi.xcertplay.transport.KernelNcmException
+import com.shilapi.xcertplay.transport.KernelNcmInterface
+import com.shilapi.xcertplay.transport.KernelNcmProbe
 import com.shilapi.xcertplay.transport.LockdownCarKitClient
 import com.shilapi.xcertplay.transport.LockdownPairingClient
 import com.shilapi.xcertplay.transport.LockdownPairRecord
@@ -394,6 +397,8 @@ class CarPlayController(
     @Volatile private var wiredUsbSession: Iap2UsbSession? = null
     @Volatile private var wiredCsm: Iap2Session? = null
     @Volatile private var wiredBridge: Ipv6NcmBridge? = null
+    // 2026-11-07：有线实验（内核 NCM）探测到的网卡快照；实验关闭时恒 null。
+    @Volatile private var wiredKernelNcm: KernelNcmInterface? = null
     /** vc180：最近一次有线 attach 失败的可诊断原因（供 [wiredAttachFailureMessage] 生成用户文案）。 */
     @Volatile private var lastWiredAttachFailure: String? = null
     // vc68：有线 mDNS 应答器（iOS16.x 在 NCM 链路上 mDNS 发现 _airplay，无应答拒绝起会话）
@@ -3132,7 +3137,10 @@ class CarPlayController(
                 when (result) {
                     is IphoneUsbHost.Iap2SessionResult.Connected -> {
                         try {
-                            val ncm = openNcm(target, result.session)
+                            // 2026-11-07：内核 NCM 实验不打开用户态 NcmUsbBridge（它会
+                            // forceClaim control/data，把内核 cdc_ncm 网卡踢掉），只保留
+                            // usbmux 控制面；NCM 由内核驱动独占。
+                            val ncm = if (config.wiredKernelNcmExperiment) null else openNcm(target, result.session)
                             runWiredStack(result.session, ncm)
                         } catch (error: Throwable) {
                             result.session.close()
@@ -3329,7 +3337,7 @@ class CarPlayController(
         }, WIRED_ESTABLISH_WATCHDOG_MILLIS)
     }
 
-    private fun runWiredStack(usbSession: Iap2UsbSession, ncm: NcmUsbBridge) {
+    private fun runWiredStack(usbSession: Iap2UsbSession, ncm: NcmUsbBridge?) {
         phase = Phase.CONTROL
         // vc142（TS7 实测 14:14-14:19）：USBMUX version 卡死时 begin 阻塞可达 60s，用户断开
         // 后旧 bring-up 协程仍存活，超时退出后 finally 的 ncm.close() 会关掉已被下一次连接
@@ -3386,10 +3394,24 @@ class CarPlayController(
                 throw IOException("USB bootstrap control ended before iPhone joined WiFi")
             }
 
-            val ncmHostMac = ncm.hostMac ?: config.hostMac
+            val ncmHostMac: ByteArray
+            val bridge: Ipv6NcmBridge?
+            if (config.wiredKernelNcmExperiment) {
+                // 2026-11-07：内核 NCM 路径——不建 TUN/VPN、不建 Ipv6NcmBridge、不建 NCM 守护。
+                // 失败直接抛出，由下面的 catch 结束本次会话（不回退 TUN、不自动重试）。
+                val kernelNcm = attachKernelNcmNetwork(usbSession)
+                    ?: throw IphoneUsbException.DeviceUnavailable(wiredAttachFailureMessage())
+                wiredKernelNcm = kernelNcm
+                ncmHostMac = kernelNcm.macBytes
+                bridge = null
+            } else {
+                val activeNcm = ncm
+                    ?: throw IphoneUsbException.DeviceUnavailable("NCM bridge is required outside the kernel-NCM experiment")
+                ncmHostMac = activeNcm.hostMac ?: config.hostMac
+                bridge = attachWiredNetwork(activeNcm, ncmHostMac)
+                    ?: throw IphoneUsbException.DeviceUnavailable(wiredAttachFailureMessage())
+            }
             debugLog("ncm using hostMac=${ncmHostMac.macString()}")
-            val bridge = attachWiredNetwork(ncm, ncmHostMac)
-                ?: throw IphoneUsbException.DeviceUnavailable(wiredAttachFailureMessage())
             wiredBridge = bridge
             ncmOwnedLocally = false
             debugLog("wired NCM/AirPlay transport attached")
@@ -3397,8 +3419,13 @@ class CarPlayController(
 
             val mfi = mfiSession?.client
                 ?: throw IphoneUsbException.DeviceUnavailable("MFi coprocessor client is unavailable")
+            // 2026-11-07：内核模式用内核网卡地址下发 0x4301；去掉 %scope（iPhone 侧按
+            // 自己链路解析）。TUN/用户态 NCM 路径仍用 fd00::2。
+            val endpointAddresses = wiredKernelNcm
+                ?.let { listOf(it.addressWithoutScope) }
+                ?: listOf(config.linkLocal)
             val endpoint = Iap2WiredCarPlayEndpoint(
-                ipv6Addresses = listOf(config.linkLocal),
+                ipv6Addresses = endpointAddresses,
                 airPlayPort = airPlayConfig.port,
                 publicKey = identity.publicKeyHex,
                 sourceVersion = airPlayConfig.sourceVersion,
@@ -3429,6 +3456,19 @@ class CarPlayController(
             debugLog("wired control ended terminal=${result.terminal} stage=${result.stage}")
             // 1.0.16（方案四①）：只有终态（用户已断开/controller 已关）才做网络恢复；自动重试路径不动 Wi-Fi。
             closeWiredStack(restoreNetwork = closed, reason = "control-ended terminal=${result.terminal} closed=$closed")
+            // 2026-11-07：内核 NCM 实验不做自动重试（重试会掩盖「实验到底行不行」）。
+            // 控制环提前结束 = iAP2 没起来，当场报明确原因并结束本次有线会话。
+            if (config.wiredKernelNcmExperiment) {
+                debugLog("wired kernel-ncm failed reason=control-ended terminal=${result.terminal} stage=${result.stage}")
+                fail(
+                    IphoneUsbException.DeviceUnavailable(
+                        kernelNcmFailureMessage(
+                            "iAP2 控制环在 stage=${result.stage} 提前结束（terminal=${result.terminal}）",
+                        ),
+                    ),
+                )
+                return
+            }
             // 1.0.10：控制环结束 ≠ 一定是用户断开。controller 未关闭（用户没点断开、服务没停）
             // 即 iPhone 侧主动断链（FE-6 实测：iPhone 停发视频后 connection closed，App 躺平 3 分半
             // 等手动）。此时走自动重试：4s×attempt 封顶 15s，额度 5 次；第 3 次起提示用户干预。
@@ -3483,6 +3523,21 @@ class CarPlayController(
                 return
             }
             debugLog("wired bring-up failed", error)
+            // 2026-11-07：内核 NCM 实验——失败即终态，不回落 TUN、不自动重试掩盖。
+            // probe / 等待超时 / bind / mDNS / iAP2 任一失败都在这里当场结束本次有线会话。
+            if (config.wiredKernelNcmExperiment) {
+                val detail = error.message ?: error.javaClass.simpleName
+                debugLog("wired kernel-ncm failed reason=$detail")
+                closeWiredStack(reason = "kernel-ncm failed: $detail")
+                fail(
+                    if (detail.contains("有线实验（内核 NCM）")) {
+                        error
+                    } else {
+                        IphoneUsbException.DeviceUnavailable(kernelNcmFailureMessage(detail))
+                    },
+                )
+                return
+            }
             // vc142：USBMUX version reply 超时 = iPhone 侧 CarPlay 会话僵死（13:39/14:14 两次
             // 实证，拔插线才恢复）。归入自动重试并置全量复位——重试时 0x52+setConfiguration
             // 强制 iPhone 重新枚举，等价于用户拔插线，不再傻等 60s 后终态失败。
@@ -3562,7 +3617,7 @@ class CarPlayController(
             // 1.0.29：无论正常返回还是异常退出，控制权都已交还，取消未触发的看门狗。
             wiredControlReturned = true
             if (ncmOwnedLocally) {
-                closeBestEffort("wired NCM") { ncm.close() }
+                closeBestEffort("wired NCM") { ncm?.close() }
             }
         }
     }
@@ -3728,6 +3783,9 @@ class CarPlayController(
      */
     private fun wiredAttachFailureMessage(): String {
         val detail = lastWiredAttachFailure
+        if (detail != null && detail.startsWith("kernel-ncm: ")) {
+            return kernelNcmFailureMessage(detail.removePrefix("kernel-ncm: "))
+        }
         return when {
             detail == null -> "Could not attach the NCM/AirPlay transport"
             detail.contains("no TUN device node") ||
@@ -3737,6 +3795,42 @@ class CarPlayController(
                     "有线模式不可用；请改用无线连接（车机热点/中继）"
             else -> "Could not attach the NCM/AirPlay transport ($detail)"
         }
+    }
+
+    /**
+     * 2026-11-07：内核 NCM 实验失败的统一界面文案。
+     * 明确说明「不是普通连不上，而是内核 NCM 不可用」，并说明退出路径（取消勾选后重连），
+     * 强调本次会话已结束且**没有回退 TUN、没有自动重试**。
+     */
+    private fun kernelNcmFailureMessage(detail: String): String {
+        // detail 形如 `class=build <技术原因>`；两类 DRIVER 失败要给出不同的人话提示：
+        // build = 包里的 native 库有问题（换正确 APK 可救）；machine = 本车内核没这能力（换包无解）。
+        val marker = "class="
+        val failureClass: String
+        val reason: String
+        if (detail.startsWith(marker)) {
+            val space = detail.indexOf(' ')
+            failureClass = if (space > 0) detail.substring(marker.length, space) else detail.removePrefix(marker)
+            reason = if (space > 0) detail.substring(space + 1) else "-"
+        } else {
+            failureClass = "runtime"
+            reason = detail
+        }
+        val head = when (failureClass) {
+            "build" -> "构建问题（native 库缺失或符号不匹配，需确认装的是含新库的 APK）"
+            "machine" -> "机器限制（本车内核没有可用的 cdc_ncm，换版本也无法启用）"
+            else -> "运行期问题"
+        }
+        return "有线实验（内核 NCM）不可用：$head｜$reason；" +
+            "已结束本次有线会话（不回退 TUN、不自动重试）。" +
+            "取消勾选「有线实验：内核 NCM」后重连可回到原路径"
+    }
+
+    private fun failKernelNcmAttach(detail: String, failureClass: String = "runtime") {
+        lastWiredAttachFailure = "kernel-ncm: class=$failureClass $detail"
+        // class 供日志分诊：build=构建问题（换包可救）/ machine=机器限制（内核能力不足）/
+        // runtime=其它运行期原因。两类 DRIVER 失败因此不再混同一个锚点。
+        debugLog("wired kernel-ncm failed class=$failureClass reason=$detail")
     }
 
     /**
@@ -3900,6 +3994,102 @@ class CarPlayController(
         return bridge
     }
 
+    /**
+     * 2026-11-07：有线实验「内核 NCM」数据面。**无兜底**：
+     * - 不检查 `tunDevicePresent()`、不 requestWiredTun、不建 Ipv6NcmBridge、不启动 WiredNcmGuard；
+     * - 不打开 NcmUsbBridge（避免 forceClaim 把内核 cdc_ncm 网卡踢掉）；
+     * - restore 内核驱动 → 等网卡 up → 读带 scope 的链路本地 IPv6/MAC → AirPlay 直接 bind 内核地址；
+     * - 任一步失败返回 null 并留下 `kernel-ncm: <reason>`，调用方立刻结束本次会话（不回落 TUN）。
+     */
+    private fun attachKernelNcmNetwork(usbSession: Iap2UsbSession): KernelNcmInterface? {
+        onStatus(CarPlayStatus.AttachingNetwork)
+        debugLog("wired kernel-ncm: no tun/vpn, no NCM claim, no guard; kernel owns the data interface")
+        val device = currentAppleDevice()
+        if (device == null) {
+            failKernelNcmAttach("iPhone disappeared before the kernel NCM probe")
+            return null
+        }
+        val connection = usbSession.sharedConnection()
+        val configuration = IphoneCarPlayConfiguration.find(device)
+        // 内核实验**绝不**调用 forceCarplayConfiguration：SETCONFIGURATION 会解绑内核驱动。
+        val function = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            NcmFunctionDiscovery.findKernelAligned(device, runCatching { connection.rawDescriptors }.getOrNull())
+                ?: NcmFunctionDiscovery.find(device, null, ncmAvoidControlId)
+        } else {
+            NcmFunctionDiscovery.find(device, configuration, ncmAvoidControlId)
+        }
+        if (function == null) {
+            failKernelNcmAttach("iPhone configuration does not expose an NCM function")
+            return null
+        }
+        debugLog("wired kernel-ncm probe control-iface=${function.control.id} data-iface=${function.data.id}")
+        val kernel = try {
+            KernelNcmProbe.restoreAndAwait(
+                connection = connection,
+                controlInterfaceId = function.control.id,
+                onDiagnostic = ::debugLog,
+                isCancelled = { closed },
+            )
+        } catch (error: KernelNcmException) {
+            // 日志锚点带 class=：build（符号/库不匹配）与 machine（内核无 cdc_ncm）一眼可分。
+            failKernelNcmAttach(error.reasonText, error.failure.failureClass)
+            return null
+        } catch (error: Throwable) {
+            failKernelNcmAttach("${error.javaClass.simpleName}: ${error.message ?: "-"}")
+            return null
+        }
+        debugLog("wired kernel-ncm probe iface=${kernel.name}")
+        debugLog("wired kernel-ncm addr=${kernel.addressWithScope}")
+
+        val server = AirPlayTcpServer()
+        var boundPort = 0
+        when (val result = server.attach(
+            bindAddress = kernel.address,
+            config = airPlayConfig,
+            identity = identity,
+            pairings = pairings,
+            mfi = mfiSession?.client,
+            listener = wiredSessionListener(),
+            media = media,
+        )) {
+            is AirPlayTcpServer.AttachResult.Started -> {
+                airPlayServer = server
+                boundPort = result.port
+            }
+            AirPlayTcpServer.AttachResult.AlreadyStarted -> {
+                failKernelNcmAttach("wired AirPlay transport is already attached")
+                return null
+            }
+            is AirPlayTcpServer.AttachResult.Failed -> {
+                failKernelNcmAttach("AirPlay bind on ${kernel.name} failed: ${result.message}")
+                return null
+            }
+        }
+
+        // 内核模式下 mDNS 必须真实绑到内核网卡：做不到就明确失败，不静默关掉。
+        val responder = WiredMdnsResponder(
+            bindAddress = kernel.address,
+            airPlayConfig = airPlayConfig,
+            identity = identity,
+            onDiagnostic = ::debugLog,
+            strictBind = true,
+            kernelInterfaceName = kernel.name,
+        )
+        if (!responder.start()) {
+            val reason = responder.lastFailure ?: "wired mDNS responder failed"
+            server.detach()
+            airPlayServer = null
+            failKernelNcmAttach("mDNS on ${kernel.name} failed: $reason")
+            return null
+        }
+        wiredMdns = responder
+        debugLog(
+            "wired kernel-ncm ready (no tun/vpn) iface=${kernel.name} " +
+                "addr=${kernel.addressWithScope} port=$boundPort mac=${kernel.mac}",
+        )
+        return kernel
+    }
+
     private fun pairNewRecord(client: LockdownPairingClient): LockdownPairRecord =
         client.pair(
             label = config.label,
@@ -3955,6 +4145,8 @@ class CarPlayController(
         val activeBridge = wiredBridge
         wiredBridge = null
         timedStep("WiredNcmBridge") { activeBridge?.close() }
+        // 2026-11-07：内核 NCM 实验没有 bridge，只有一份探测快照；teardown 时清掉。
+        wiredKernelNcm = null
 
         // bridge 未建立而中途失败的残留兜底（幂等）。
         timedStep("WiredVpnTun") { WiredVpnService.shutdownTun() }

@@ -33,6 +33,10 @@ internal object LegacyUsbHostNative {
      *  KK proc_setconfig 在有 usbfs claim 时拒绝切配置（EBUSY=16 实测）。 */
     external fun releaseInterface(fileDescriptor: Int, interfaceNumber: Int): Int
 
+    /** 2026-11-07（有线实验）：USBDEVFS_CONNECT 把接口交还内核驱动（cdc_ncm），
+     *  让内核创建 USB 网卡；返回 0 成功、16=已绑定，其余为 errno。 */
+    external fun restoreKernelDriver(fileDescriptor: Int, interfaceNumber: Int): Int
+
     /** vc189（T3）：直接走 USBDEVFS_CONTROL ioctl 下发 CarPlay 厂商配置请求（0x52），
      *  失败时原样返回内核 errno（Android 框架 controlTransfer 把它吞成不透明 -1）。
      *  约定：返回 >=0 = 实际传输字节数；返回 <0 = -(errno)。 */

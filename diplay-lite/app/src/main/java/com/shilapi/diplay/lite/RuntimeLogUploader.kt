@@ -156,7 +156,16 @@ object RuntimeLogUploader {
         val skeletonFit = fitSkeleton(skeletonEntries, SKELETON_CAP_BYTES)
 
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val headerText = buildHeader(context, current, old.isFile, stamp, rollingStart, nowTod)
+        val deviceCode = DeviceCode.of()
+        val headerText = buildHeader(
+            context,
+            current,
+            old.isFile,
+            stamp,
+            rollingStart,
+            nowTod,
+            deviceCode,
+        )
         val headerBytes = headerText.toByteArray(Charsets.UTF_8).size
         val skeletonBytes = sectionBytes(skeletonFit.first)
 
@@ -191,7 +200,7 @@ object RuntimeLogUploader {
             return null
         }
         val totalLines = text.count { it == '\n' }
-        val fileName = buildFileName(context, stamp)
+        val fileName = buildFileName(context, stamp, deviceCode)
         val target = File(directory, fileName)
         target.outputStream().use { it.write(bytes) }
         LiteLog.log(
@@ -561,9 +570,13 @@ object RuntimeLogUploader {
         stamp: String,
         rollingStart: Long,
         nowTod: Long,
+        deviceCode: String,
     ): String = buildString {
         append("运行日志（含 dongle 链路）\n\n")
         append("设备：").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
+        // 设备码是明文蓝牙 MAC（DeviceCode，用户拍板）：保留型号行之外，多台同型号车机靠它归机。
+        // 上传脱敏只放行这一处「设备码」行（见 LogUploadPrivacy.DEVICE_CODE_MARK）。
+        append("设备码：").append(deviceCode).append('\n')
         val metrics = Resources.getSystem().displayMetrics
         append("分辨率：").append(metrics.widthPixels).append('x').append(metrics.heightPixels)
             .append(" density=").append(metrics.density).append('\n')
@@ -588,10 +601,11 @@ object RuntimeLogUploader {
         append("总上限：768KB；bulk read fail 仅首尾取样+计数\n")
     }
 
-    private fun buildFileName(context: Context, stamp: String): String {
+    private fun buildFileName(context: Context, stamp: String, deviceCode: String): String {
         val systemVersion = "Android${Build.VERSION.RELEASE}-api${Build.VERSION.SDK_INT}"
         val safeModel = Build.MODEL.trim().replace(Regex("[^0-9A-Za-z._-]"), "-")
-        return "diplay-$stamp-$systemVersion-v${versionName(context)}-$safeModel.txt"
+        // 设备码紧跟时间戳：仓库里同一秒上传的多台机器也能一眼区分归属。
+        return "diplay-$stamp-$deviceCode-$systemVersion-v${versionName(context)}-$safeModel.txt"
             .replace(Regex("[\\s]+"), "")
     }
 

@@ -17,6 +17,26 @@ internal object LogRedactor {
             "|\\s*$)",
     )
     private val DEVICE_ID_FIELD = Regex("(?i)(deviceId=)([^\\s,;&\"']+)")
+    /**
+     * 设备码落点（2026-11-07 用户拍板：设备码改为**明文蓝牙 MAC**）。
+     *
+     * 只放行「设备码」这一处：日志头 `设备码：22:22:37:4D:5C:0D`、启动日志
+     * `设备码 22:22:37:4D:5C:0D（bt=ok）`。做法是先把这处 MAC 换成不可命中的占位符，
+     * 跑完其余脱敏规则后还原——这样**只有设备码保留原文**，同一份日志里其它位置的 MAC
+     * （`btMac=`、`address=`、任何裸 MAC）仍按原规则打码，不会因为这次放开而整份外露。
+     *
+     * 为什么开这个白名单：用户明确选择明文 MAC 以便与蓝牙清单/路由器记录直接对账；
+     * 代价是上传件（日志头 + 日志文件名）含明文 MAC。`deviceId=` 是安装身份（重装即变），
+     * 不在放行范围，照常打码。
+     */
+    private val DEVICE_CODE_MARK = Regex(
+        "(?m)(设备码[：:]?\\s*)((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})" +
+            // 必须到行尾（允许末尾带「（bt=ok）」这类来源标注）才算设备码落点；
+            // 句中顺势写出「设备码 MAC 其他内容」不豁免，避免这条白名单被当成通用漏口。
+            "(?=\\s*(?:（[^）]*）)?\\s*$)",
+    )
+    private const val GUARD_OPEN = "\u0001dc"
+    private const val GUARD_CLOSE = "\u0001"
     private val SSID_FIELD = Regex("(?i)(ssid=)([^\\s,;&\"']+)")
     private val PASSPHRASE_FIELD = Regex("(?i)(passphrase=)([^\\s,;&\"']+)")
     private val BT_FIELD = Regex(
@@ -27,7 +47,12 @@ internal object LogRedactor {
 
     /** 整体脱敏：对上传件正文调用一次即可。 */
     fun redact(text: String): String {
-        var out = text
+        // 先给「设备码」落点的 MAC 打上占位符，全量脱敏后再还原（原因见 DEVICE_CODE_MARK 注释）。
+        val deviceCodes = ArrayList<String>()
+        var out = DEVICE_CODE_MARK.replace(text) { match ->
+            deviceCodes.add(match.groupValues[2])
+            match.groupValues[1] + GUARD_OPEN + (deviceCodes.size - 1) + GUARD_CLOSE
+        }
         out = replaceValues(BT_FIELD, out) { it }
         out = replaceValues(DEVICE_ID_FIELD, out) { value ->
             if (value.contains("#")) value else "dev#" + tag(value)
@@ -47,6 +72,10 @@ internal object LogRedactor {
                 parts.take(3).joinToString(sep) + sep + "**" + sep + "**" + sep + "**#" +
                     tag(mac.replace("-", ":").lowercase(Locale.US))
             }
+        }
+        // 还原设备码落点的 MAC 原文：整份日志里只有这一处豁免。
+        for (index in deviceCodes.indices) {
+            out = out.replace(GUARD_OPEN + index + GUARD_CLOSE, deviceCodes[index])
         }
         return out
     }

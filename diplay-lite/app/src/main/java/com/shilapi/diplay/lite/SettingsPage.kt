@@ -2,6 +2,9 @@ package com.shilapi.diplay.lite
 
 import android.app.Activity
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.Typeface
@@ -136,6 +139,8 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbPrebuffer: CheckBox
     // vc237（A1）：视频待渲帧不合并（按 VSYNC 逐帧上屏）。vc238 起默认开，移至体验优化区。
     private lateinit var cbNoCoalesce: CheckBox
+    // 2026-11-07：有线实验 —— 内核 cdc_ncm 数据面（默认关）。
+    private lateinit var cbWiredKernelNcm: CheckBox
     // vc238：麦克风收音增益（0=关闭，1~10 dB）。行内显示当前值，点按弹层用滑块调整。
     private lateinit var micGainValueText: TextView
     private var micGainValue = LiteConfig.DEFAULT_MIC_GAIN_DB
@@ -497,6 +502,11 @@ class SettingsPage(private val activity: MainActivity) {
         // 仍保留开关便于回退；重新连接后生效。
         cbNoCoalesce = checkbox("视频帧不合并（实验，重连生效）")
         column.addView(cbNoCoalesce, block(bottom = dip(4)))
+        // 2026-11-07：有线实验 —— 内核 cdc_ncm 数据面。只对老车机（无 /dev/tun 或 TUN 路径不稳）
+        // 有意义：勾选后有线路由内核 NCM 承载，本机不再建 TUN/VPN、不抢 NCM 接口。
+        // 不做兜底：probe/bind/iAP2 任一失败即结束本次有线会话并明确报错，不回落 TUN。
+        cbWiredKernelNcm = checkbox("有线实验：内核 NCM（老车机专用，失败直接报错，重连生效）")
+        column.addView(cbWiredKernelNcm, block(bottom = dip(4)))
         cbBoot = checkbox("开机自启Diplay Lite")
         // 1.0.11：开机自动开启蓝牙/热点/Wi-Fi（独立于"开机自启"，任一勾选 BootReceiver 即工作；
         // 1.0.29 Wi-Fi 与热点互斥——勾了热点则 Wi-Fi 自启跳过，STA/AP 不能同开）
@@ -725,6 +735,22 @@ class SettingsPage(private val activity: MainActivity) {
             },
             block(),
         )
+        // 设备码：明文蓝牙 MAC（DeviceCode），供用户报障时报号，可直接与蓝牙清单对账。
+        // 点按/长按都复制，避免老车机触摸屏长按判定不稳（不能只做长按）。
+        val deviceCode = DeviceCode.of()
+        column.addView(
+            TextView(activity).apply {
+                text = "设备码：$deviceCode（点按复制）"
+                setTextColor(Ui.SUB)
+                textSize = 13f
+                setOnClickListener { copyDeviceCode(deviceCode) }
+                setOnLongClickListener {
+                    copyDeviceCode(deviceCode)
+                    true
+                }
+            },
+            block(top = dip(4)),
+        )
         // 1.1.3（GPLv3 合规）：开源声明入口——上游署名 + 许可证 + 源码地址 + 商标免责。
         column.addView(
             TextView(activity).apply {
@@ -768,6 +794,25 @@ class SettingsPage(private val activity: MainActivity) {
             },
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
         )
+    }
+
+    /**
+     * 复制设备码到系统剪贴板（不新增权限）。老车机剪贴板服务可能缺失，
+     * 因此失败时用 Toast 兜底提示，码本身仍显示在页面上，可手抄。
+     */
+    private fun copyDeviceCode(code: String) {
+        try {
+            val clipboard =
+                activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText("设备码", code))
+                Toast.makeText(activity, "设备码已复制：$code", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(activity, "当前系统不支持复制：$code", Toast.LENGTH_SHORT).show()
+            }
+        } catch (_: Exception) {
+            Toast.makeText(activity, "复制失败：$code", Toast.LENGTH_SHORT).show()
+        }
     }
 
     /**
@@ -1253,6 +1298,8 @@ class SettingsPage(private val activity: MainActivity) {
         cbPrebuffer.isChecked = config.audioPrebuffer
         // vc238：A1 —— 视频待渲帧不合并（默认开，旧键已由 LiteConfig 迁移重置）。
         cbNoCoalesce.isChecked = config.videoNoCoalesce
+        // 2026-11-07：有线实验 —— 内核 NCM（默认关）。
+        cbWiredKernelNcm.isChecked = config.wiredKernelNcmExperiment
         // vc238：麦克风收音增益行当前值回显。
         micGainValue = config.micGainDb
         micGainValueText.text = micGainLabel(micGainValue)
@@ -1331,6 +1378,8 @@ class SettingsPage(private val activity: MainActivity) {
                 audioPrebuffer = cbPrebuffer.isChecked,
                 // vc238：A1 —— 视频待渲帧不合并（重连生效）。
                 videoNoCoalesce = cbNoCoalesce.isChecked,
+                // 2026-11-07：有线实验 —— 内核 NCM 数据面（断开重连后生效）。
+                wiredKernelNcmExperiment = cbWiredKernelNcm.isChecked,
                 // vc238：麦克风收音增益（0=关闭，1~10 dB，即时生效）。
                 micGainDb = micGainValue,
                 usbBtDongle = rbBtUsb.isChecked,
@@ -1348,6 +1397,14 @@ class SettingsPage(private val activity: MainActivity) {
                 autoConnect = cbAutoConnect.isChecked,
             ),
         )
+        // 2026-11-07：该实验为连接级开关，不做热切换；明确提示必须断开重连。
+        if (cbWiredKernelNcm.isChecked != current.wiredKernelNcmExperiment) {
+            Toast.makeText(
+                activity,
+                "内核 NCM 实验已${if (cbWiredKernelNcm.isChecked) "开启" else "关闭"}，断开重连后生效",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     }
 
     private fun currentOrientationMode(): String = when {

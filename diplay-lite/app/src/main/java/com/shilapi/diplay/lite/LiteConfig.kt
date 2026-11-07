@@ -62,6 +62,11 @@ data class LiteConfig(
     // vc184：外置 USB 蓝牙 dongle 自定义蓝牙名称（写进 HCI 本地名称，iPhone 蓝牙列表显示）。
     // 空串/超 HCI 名上限(248 字节)回落默认 "DiPlay CarPlay"。
     val usbBtDongleName: String = "DiPlay CarPlay",
+    // 2026-11-07：有线实验 —— 内核 NCM 数据面（老车机专用，默认关）。
+    // 开：有线会话只走内核 cdc_ncm，不建 TUN/VPN、不让用户态 NCM 抢接口；
+    // 失败即结束本次会话并明确报错，不回落 TUN。关：维持现有用户态 NCM + TUN 路径。
+    // 与 `videoNoCoalesce` 一样“断开重连后生效”，不做连接中热切换。
+    val wiredKernelNcmExperiment: Boolean = false,
 
     /** vc109：底部触摸失灵区占比‰（0=关闭）。仅影响视频视图高度与触摸映射。 */
     val touchTrimBottomPermille: Int = 0,
@@ -304,6 +309,8 @@ data class LiteConfig(
                 usbBtDongleName = prefs.getString("usb_bt_dongle_name", "DiPlay CarPlay")
                     .orEmpty().ifBlank { "DiPlay CarPlay" }
                     .let { if (it.toByteArray(Charsets.UTF_8).size > MAX_USB_BT_NAME_BYTES) "DiPlay CarPlay" else it },
+                // 2026-11-07：有线实验 —— 内核 NCM 数据面（默认关）。
+                wiredKernelNcmExperiment = prefs.getBoolean("wired_kernel_ncm_experiment", false),
                 // vc109（T3 触摸屏下沿物理失灵）：0=关闭；>0=底部失灵区占比‰（154≈1/6.5）。
                 // 视频视图缩进顶部有效区，触摸映射基于视图尺寸自动重映射，死区天然丢弃。
                 touchTrimBottomPermille = prefs.getInt("touch_trim_bottom_permille", 0),
@@ -359,6 +366,8 @@ data class LiteConfig(
                 .putInt("mic_gain_db", config.micGainDb)
                 .putBoolean("usb_bt_dongle", config.usbBtDongle)
                 .putString("usb_bt_dongle_name", config.usbBtDongleName)
+                // 2026-11-07：有线实验 —— 内核 NCM 数据面（默认关）。
+                .putBoolean("wired_kernel_ncm_experiment", config.wiredKernelNcmExperiment)
                 .putInt("touch_trim_bottom_permille", config.touchTrimBottomPermille)
                 // vc59 修复（8815 实测）：分辨率设定三键漏写——load 读 video_resolution_mode/
                 // manual_resolution_w/h，但 save 从未写入，导致「手动设定分辨率」确认重启后

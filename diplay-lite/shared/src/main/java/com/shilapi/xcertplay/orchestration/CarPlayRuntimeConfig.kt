@@ -48,8 +48,10 @@ enum class ManualHotspotSecurity {
 }
 
 /**
- * Deployment-owned constants for one head unit (Lite: 仅无线 + MANUAL 热点 + 本地软件 MFi)。
- * 原 USB/CH341/I2C/REMOTE MFi 与 P2P/LocalOnly 热点字段已随有线路径一并裁剪。
+ * Deployment-owned constants for one head unit (Lite: 无线 + MANUAL 热点 + 本地软件 MFi + USB 有线)。
+ * USB 有线（[CarPlayTransport.WIRED]）确实存在：USBMUX/lockdown/CarKit/iAP2 走 USB，
+ * 数据面默认用户态 NCM + VpnService TUN（`Ipv6NcmBridge`）；实验开关可切内核 cdc_ncm（无 TUN/VPN）。
+ * 已裁剪的只是旧 CH341/I2C/REMOTE MFi 与 P2P/LocalOnly 热点字段。
  */
 class CarPlayRuntimeConfig(
     val hostMac: ByteArray = DEFAULT_HOST_MAC,
@@ -70,6 +72,12 @@ class CarPlayRuntimeConfig(
     // 1.1.6(vc76)：有线 cdc_ncm 解绑守护开关（TS7 无 root 裁决实验）。默认 true=正式路径；
     // false 时不启动 WiredNcmGuard，验证「仅 NTB16 重同步、无 root 无守护」能否稳住会话。
     val wiredNcmGuardEnabled: Boolean = true,
+    // 2026-11-07：有线实验 —— 内核 cdc_ncm 数据面。true 时 WIRED 会话只走内核 NCM：
+    // 不请求/建 VpnService TUN、不建 Ipv6NcmBridge、不 claim NCM control/data、跳过
+    // WiredNcmGuard 与 NcmUsbBridge.forceClaim；AirPlay 直接 bind 在内核网卡地址上。
+    // probe/bind/iAP2 任一失败即结束本次有线会话并上报原因，**不回落 TUN**。
+    // 退出方式只有用户取消勾选后重连（回到默认用户态 NCM + TUN 路径）。
+    val wiredKernelNcmExperiment: Boolean = false,
     // vc102 USB bootstrap 无线升级（实验）：有线 CSM 建好后不走 NCM/有线控制环，改走
     // 「开热点 + AirPlay 监听 + mDNS + 识别帧 group16+24 + 无线控制环（0x5703 经 USB 隧道）」。
     // Apple 官方「插 USB 弹提醒可无线」流程的配件侧实现；热点参数复用 wirelessHotspotMode 组。

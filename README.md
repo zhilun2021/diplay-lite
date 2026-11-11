@@ -1,46 +1,82 @@
-# DiPlay
+# DiPlay Lite (Chinese community fork)
 
-> ## DiPlay Lite — Chinese community fork (README top notice)
->
-> This repository contains **DiPlay Lite**, an independent community-maintained fork of
-> [shihabal3amri/DiPlay](https://github.com/shihabal3amri/DiPlay) (upstream of [shilapi/xcertplay](https://github.com/shilapi/xcertplay) lineage),
-> adapted for low-spec Chinese-market Android head units (Android 4.1+ / various OEM platforms).
-> It is maintained on a **non-commercial** basis for personal research, owner-to-owner exchange and
-> compatibility maintenance. No commercial sales, paid licensing or commercial support is provided.
-> This positioning does not alter the rights granted by the original code licenses; assets may carry
-> their own restrictions, see below.
->
-> ### License & attribution
-> - Receiver and derivative code: upstream **GPL-3.0** retained, together with existing notices. GPL itself permits commercial use and redistribution, subject to its obligations.
-> - UI adapted from **DiAuto** (AGPL-3.0) — preserve those notices when distributing.
-> - Upstream projects and original contributors keep full authorship credit.
->
-> ### Trademarks
-> CarPlay, iPhone, iPad and Apple are trademarks of Apple Inc.; OEM brand names and logos (BYD, Geely,
-> Ora/Haval, Chery, etc.) belong to their respective owners. Neither the code license nor this project
-> grants any right to use those marks, and no affiliation with or endorsement by Apple, any OEM or the
-> upstream authors is implied.
->
-> ### Experimental accessory identity
-> This is **not an Apple-certified product**. Builds may bundle an experimental accessory identity
-> recovered from publicly available third-party firmware. The **source repository excludes all
-> authentication keys and Android signing keys**; runtime identity assets are described in the build
-> instructions. Future iOS updates may break it at any time.
->
-> ### Warranty & safety
-> The software is provided **AS IS**, without warranty of any kind. Compatibility is verified only on
-> specific tested platforms/firmware/iOS combinations; nothing is promised for any other device.
-> You install and use it **at your own risk**. Head units are driving-related equipment — do not
-> operate or configure the app while driving, and obey local laws.
->
-> ### Device modification & diagnostics
-> Some features (wired CarPlay on certain platforms, adb self-boot, NCM guard) rely on **modifying your
-> own head-unit system** (root/adb). Such actions may void warranties or brick devices and are entirely
-> the user's responsibility. Diagnostic logs leave the device **only when you explicitly trigger an
-> upload**; the log-upload credential is injected at build time and never committed.
->
-> ---
->
+A community-adapted build that provides wired and wireless CarPlay for older and various Android head units (API 16+). It is independently evolved from [shihabal3amri/DiPlay](https://github.com/shihabal3amri/DiPlay) and the [shilapi/xcertplay](https://github.com/shilapi/xcertplay) receiver base, with a DiAuto-style interface. Upstream attribution, licensing and porting provenance are documented in the [third-party notices](docs/THIRD_PARTY_NOTICES.md) (including JmDNS, Bouncy Castle and the AGPL text for DiAuto).
+
+**Download**: the latest release build is available under [Gitee Releases](https://gitee.com/wangliunian/diplay-lite/releases); install it directly—no local compilation is needed (build instructions are below).
+
+## Disclaimer
+
+**Positioning**: This project is an independent community fork, maintained on a **non-commercial** basis for personal research, owner-to-owner exchange and compatibility maintenance. No commercial sales, paid licensing or commercial support is provided. This positioning does not alter the rights granted by the original code licenses; assets with their own restrictions must comply with those terms—the code's GPL license cannot override asset restrictions.
+
+**License and attribution**:
+
+| Item | Terms |
+|---|---|
+| Receiver and derivative code | Upstream [GPL-3.0](LICENSE) and existing notices retained; GPL itself permits commercial use and paid distribution subject to its obligations—this fork adds no "non-commercial" clause to it |
+| DiAuto-derived interface style | The upstream interface base is DiAuto (AGPL-3.0); modified distributions must retain those notices |
+| Opus codec | BSD license |
+| CarPlay, iPhone names and icons; automotive brand names and logos | Rights belong to their respective owners; the code license does not automatically grant any right to use brands, marks or other assets |
+
+Upstream projects and original authors retain full authorship credit. This fork is not an official version of the upstream authors or any vendor.
+
+**Trademarks and brands**: CarPlay, iPhone, iPad and Apple are trademarks of Apple Inc.; automotive brand names and logos (BYD, Geely, Ora/Haval, Chery, etc.) belong to their respective owners and are used only for owner identification. This project has no affiliation with, or official support from, Apple, any automaker or the upstream authors, and implies no endorsement.
+
+**Experimental accessory identity**: This project is **not an Apple-certified product**. The experimental CarPlay accessory identity is extracted from publicly available third-party firmware and may stop working after any future iOS update.
+
+**This repository contains no authentication private keys and no Android signing keys**: `identity.pk8` / `certificate.p7b` are explicitly excluded (see `.gitignore`) and blocked by CI—the first step of `.github/workflows/android.yml` runs `scripts/check_public_tree.py`, and any private key, credential or packaged artifact entering the index fails the build. You can also run that script locally as a pre-commit self-check.
+
+**Release builds are provided; everyday use does not require compiling from source**: every release APK is published under [Releases](https://gitee.com/wangliunian/diplay-lite/releases) on the Gitee open-source repository and already bundles the experimental CarPlay accessory identity, so it can be installed and used directly. The source repository and source archives contain no identity assets.
+
+**Building your own release requires providing runtime identity assets yourself**; they are injected at build time and never travel with the source:
+
+- Default source: the private directory `auth/offline-mfi/` at the repository root (containing `identity.pk8` and `certificate.p7b`);
+- Alternatively, point the `DIPLAY_IDENTITY_DIR` environment variable at your own directory (more convenient for CI or when switching machines);
+- If neither exists, the build continues as a "source-only environment" (the code still compiles), but the resulting APK contains no identity assets and therefore cannot pass CarPlay authentication; the build log warns that identity assets are missing.
+
+Only those two filenames are accepted; a missing one is an error. Keep them safe and **never commit them to any version-control repository** (including private repositories and forks). Compiling and using the result is your own compliance responsibility.
+
+**Compatibility scope and verification status**: compatibility has only been verified on the tested platform/firmware/iOS combinations below; nothing else is promised.
+
+**Model mapping** (project short name ↔ retail device; HU = head unit, Phone = smartphone):
+
+| Short name | Retail device | Type |
+|---|---|---|
+| K60 | Redmi K60 | Phone |
+| C8815 | Huawei C8815 | Phone |
+| ONEPLUS A5000 | OnePlus 5 | Phone |
+| T3 | Dingwei T3 | HU |
+| TS7 | Dingwei TS7 | HU |
+| EU5 | BAIC EU5 (2019) | HU |
+| FE-6 | Geely Binrui (2020) | HU |
+| AC822X | FlyAudio GS1 | HU |
+| at8317 | Nuoyumi | HU |
+
+| Item | Scope / result |
+|---|---|
+| Verified platforms | K60 (Redmi K60, Android 14 / API34; wireless + wired + external dongle, primary test device), C8815 (Huawei C8815, Android 4.1.2 / API16; minSdk baseline), T3 (Dingwei T3, Android 4.4.2 / API19; wired only), TS7 (Dingwei TS7; historical wired/wireless primary), EU5 (BAIC EU5 2019, Android 6.0.1 / API23), FE-6 (Geely Binrui 2020, Android 5.1 / API22), AC822X (FlyAudio GS1, Android 4.2.2 / API17), at8317 (Nuoyumi, 1920×720), ONEPLUS A5000 (OnePlus 5, Android 10; long-run wired) |
+| Confirmed working | Wireless CarPlay (car hotspot): the full flow passes on K60; C8815 connects (the first join is affected by iOS evaluating a hotspot without internet access; measured 76.5 s). Wired CarPlay, full feature set (display / touch / audio / Siri / phone): verified on TS7, ONEPLUS A5000 and K60. External USB Bluetooth dongle: CSR8510 (on-chip firmware, plug-and-play) and CM390 / RTL8761BUV (firmware loaded by the app; verified on T3 hardware). Call audio: EU5 (e5t1). Steering-wheel controls: FE-6 (learning, binding and dispatch). |
+| Known limitations / in progress (as of 2026-11) | T3: wireless is not feasible at the hardware level (the SoC Bluetooth is physically disabled), wired only; rendering is limited to about 25 fps. AC822X: no `/dev/tun` in the kernel, so the wired link is unavailable. at8317: page-switch stutter (rendering side), currently mitigated with `videoScalePercent` ≈ 67% uniform scaling. FE-6: no sound after Siri and root microphone capture fails; wireless is constrained by the ECARX Bluetooth architecture. PATEO C40DB-EHU (PATEO, Android 6.0.1 / API23): the wired iAP2 TLS channel drops after about 17 min (suspected USB physical/driver issue), and there is no microphone uplink. K60: horizontal page switching shows freezes of ≥125 ms (2026-11 screen-recording analysis, under investigation). |
+| Not promised | Real-car compatibility for other years, chipsets and firmware; NCM/multicast behavior differs significantly on older kernels such as Android 4.4.2 (KK) and is not promised; continued availability after future iOS releases; complete model coverage for features such as Siri and calls; no conclusions are drawn for devices that cannot be attributed in logs (no `ROM version` field). |
+
+"Adapted/verified" refers only to the specific platforms and verified features above; it does not mean that every model, firmware or feature has passed real-car testing.
+
+**No warranty and driving safety**: The software is provided "as is", without any express or implied warranty. Installation and use are at your own risk. Head units are driving-related equipment—**do not operate or configure this app while driving**, and comply with local laws.
+
+**Device modification and diagnostic data**: Some features (wired CarPlay on certain platforms, adb self-boot, the NCM unbind guard, etc.) rely on **modifying your own head unit's system** (root/adb), which may void the warranty or even brick the device; you are fully responsible for the consequences. Diagnostic logs leave the device only when you **explicitly trigger an upload**; the log-upload credential is injected at build time and never committed.
+
+**Signing and overwrite installation**: A personally rebuilt APK usually has a different signature and cannot be installed over an existing signed package (uninstall and reinstall is required; settings are not preserved).
+
+## Credits
+
+- [DiPlay / shihabal3amri](https://github.com/shihabal3amri/DiPlay): direct upstream.
+- [xcertplay / shilapi](https://github.com/shilapi/xcertplay): CarPlay receiver base.
+- [DiAuto](https://github.com/shihabal3amri/DiAuto): interface style base.
+- Original project contributors and owners who took part in real-car testing.
+
+Original licenses, attribution and third-party notices: see [LICENSE](LICENSE).
+
+---
+
 > The remainder of this README is the upstream project's description, preserved for reference.
 
 **CarPlay for compatible Android head units.** Wired and wireless, with the familiar DiAuto interface. Independent app: `com.shihab.diplay`.

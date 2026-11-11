@@ -9,6 +9,7 @@ import android.hardware.usb.UsbRequest
 import android.os.Build
 import android.os.Environment
 import android.util.Log
+import com.shilapi.xcertplay.CarPlayFailureClass
 import com.shilapi.xcertplay.usbbt.UsbBtResetCounter
 import java.io.Closeable
 import java.io.File
@@ -805,6 +806,7 @@ class NcmUsbBridge internal constructor(
                     NcmClaimTrace.trace("first claim FAILED iface=${first.id} -> DeviceUnavailable")
                     throw IphoneUsbException.DeviceUnavailable(
                         "Android could not claim the NCM interface ${first.id}",
+                        failureClass = CarPlayFailureClass.ClaimBusy,
                     )
                 }
                 claimed.add(first)
@@ -830,6 +832,7 @@ class NcmUsbBridge internal constructor(
                             NcmClaimTrace.trace("data claim FAILED iface=${function.data.id} errno=$forceErrno (not ENOENT) -> fail")
                             throw IphoneUsbException.DeviceUnavailable(
                                 "Android could not claim the NCM data interface ${function.data.id}",
+                                failureClass = CarPlayFailureClass.ClaimBusy,
                             )
                         }
                         // vc103k/l（sysfs 终审定案后的配置舞 2.0）：内核活动配置（sysfs

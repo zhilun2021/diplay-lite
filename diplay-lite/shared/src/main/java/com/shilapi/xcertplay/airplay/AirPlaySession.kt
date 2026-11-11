@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
+import com.shilapi.xcertplay.diag.CarPlayStageLog
 import com.shilapi.xcertplay.diag.boundedTrace
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
@@ -14,6 +15,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
@@ -28,6 +30,15 @@ data class AirPlayDeviceInfo(
 
 /** Session lifecycle and command callbacks for the driver/UI layer. */
 interface AirPlaySessionListener {
+    /**
+     * vc250-08：AirPlay TCP 连接刚被 accept（会话对象已建、控制环尚未启动）。
+     *
+     * 作为「iPhone 已进到 Wi-Fi/RTSP 段」的最早绝对锚点交给编排层——此前
+     * handoff 看门狗只在收到 disableBluetooth 时武装，iPhone 只建 TCP 不发该命令时
+     * 会话永远到不了 SESSION_ACTIVE，断流后也无人回收（僵尸）。默认空实现，
+     * 有线/其他监听方零影响。
+     */
+    fun onControlConnectionAccepted(session: AirPlaySession) {}
     fun onSessionActive(session: AirPlaySession) {}
     fun onSessionEnded(session: AirPlaySession) {}
     fun onVideoFrameRendered(session: AirPlaySession) {}
@@ -72,6 +83,11 @@ class AirPlaySession(
     private val mfi: MfiAuthenticator?,
     private val listener: AirPlaySessionListener,
     private val media: AirPlayMediaHandler,
+    /**
+     * vc250-08：握手期首字节读超时（毫秒）。0 = 不启用（有线）。
+     * 只由无线 attach 传入 [AIRPLAY_HANDSHAKE_ZERO_BYTE_TIMEOUT_MILLIS]。
+     */
+    private val handshakeIdleTimeoutMillis: Int = 0,
 ) : Closeable {
     internal val pairSetup = PairSetup(identity, pairings)
     internal val pairVerify = PairVerify(identity, pairings)
@@ -93,6 +109,9 @@ class AirPlaySession(
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
+    // vc250：会话建立（RECORD）即请求一次关键帧；无论成功与否都只试一次，
+    // 不取代原有「stall / 恢复后请求」路径（部分接收端会丢弃首帧前的请求）。
+    private val initialKeyFrameRequested = AtomicBoolean(false)
     // vc84：Siri 后无声恢复看门狗（FE-6 fe6t2 日志 diplay-20261015-110554 实证）。iPhone 进
     // Siri 时拆媒体音频流（TEARDOWN type=100 ended=true）→ SETUP speechrecognition 上行 →
     // Siri 结束后第二个 TEARDOWN，此后 iPhone 不再重发媒体音频 SETUP，音乐静音到用户手动
@@ -184,6 +203,17 @@ class AirPlaySession(
             close()
             false
         }
+    }
+
+    /**
+     * vc250：会话建立完成（RECORD）即主动请求一次关键帧，不必等 stall。
+     * 部分接收端会丢弃首帧前的关键帧请求，因此保留原有 stall 后请求路径；
+     * 本方法只尝试一次，失败仅落日志，不阻断会话。
+     */
+    private fun requestInitialKeyFrame() {
+        if (!initialKeyFrameRequested.compareAndSet(false, true)) return
+        val sent = sendCommand(mapOf("type" to "forceKeyFrame"))
+        debugLog("airplay initial keyframe requested at session establishment sent=$sent")
     }
 
     fun sendTouch(contacts: List<AirPlayContact>): Boolean {
@@ -296,12 +326,49 @@ class AirPlaySession(
         controlOutput = output
         var accumulated = ByteArray(0)
         val buffer = ByteArray(READ_CHUNK_BYTES)
+        // vc250-08：握手期零字节看门狗——iPhone 只建 TCP 却一个 RTSP 字节都不发时，
+        // 裸阻塞读会让这条连接永久挂着。只约束「首字节」这一段，收到任意字节立刻恢复
+        // 无限阻塞，运行期（SETUP/RECORD 后的长空闲）保持原样，避免误伤慢车机。
+        // 仅无线启用：有线（USB/NCM）握手正常 < 1 s，加这个限制只会给慢车机带来误伤风险，
+        // 没有收益；僵尸连接（建了 TCP 却不发 RTSP）是无线链路的特征问题。
+        var handshakeByteBounded = false
+        if (handshakeIdleTimeoutMillis > 0) {
+            handshakeByteBounded = runCatching {
+                socket.soTimeout = handshakeIdleTimeoutMillis
+                true
+            }.getOrDefault(false)
+            if (handshakeByteBounded) {
+                debugLog(
+                    "airplay handshake zero-byte watchdog on (wireless): " +
+                        "${handshakeIdleTimeoutMillis}ms for first byte",
+                )
+            } else {
+                debugLog("airplay handshake zero-byte watchdog unavailable; keeping blocking read")
+            }
+        } else {
+            debugLog("airplay handshake zero-byte watchdog off (wired); blocking read for first byte")
+        }
         try {
             while (!closed.get()) {
-                val count = input.read(buffer)
+                val count = try {
+                    input.read(buffer)
+                } catch (timeout: SocketTimeoutException) {
+                    if (!handshakeByteBounded) throw timeout
+                    lastCloseReason =
+                        "handshake idle timeout: no RTSP bytes within " +
+                            "${handshakeIdleTimeoutMillis}ms"
+                    debugLog("airplay $lastCloseReason")
+                    break
+                }
                 if (count < 0) {
                     lastCloseReason = "peer EOF"
                     break
+                }
+                if (handshakeByteBounded) {
+                    handshakeByteBounded = false
+                    // 恢复无限阻塞；socket 已坏时抛 IOException，交给外层统一收口。
+                    socket.soTimeout = 0
+                    debugLog("airplay handshake bytes arrived; control read restored to blocking")
                 }
                 var plaintext = buffer.copyOf(count)
                 val activeCipher = cipher
@@ -383,6 +450,7 @@ class AirPlaySession(
             }
             "RECORD" -> {
                 listener.onSessionActive(this)
+                requestInitialKeyFrame()
                 return RtspMessage.Response(status = 200)
             }
             "TEARDOWN" -> return handleTeardown(request)
@@ -719,11 +787,66 @@ class AirPlaySession(
 
     private fun runKeepAlive(socket: DatagramSocket) {
         val buffer = ByteArray(512)
+        // vc250（VC248-08）：socket 已关但 closed 尚未置位时，receive() 会立即抛异常，
+        // 原循环零休眠会把一核打满。加 500ms 读超时让空闲等待变成有界阻塞，并对
+        // 连续异常计数——同一 socket 反复抛错说明它已不可用，直接退出线程。
+        val soTimeoutApplied = runCatching {
+            socket.soTimeout = KEEPALIVE_SO_TIMEOUT_MILLIS
+        }.isSuccess
+        if (!soTimeoutApplied) {
+            debugLog("airplay keepalive soTimeout 设置失败，保持原有阻塞读")
+        }
+        var consecutiveFailures = 0
+        // vc250（VC248-10）：对端断电/死机时不会发 TEARDOWN，也没有 DETACH 广播，
+        // 只能靠 keepalive 静默判断。首个保活包到达后才开始计时——从未发过保活包
+        // 的机型（keepAliveLowPower=false 或实现差异）不参与判死，避免误伤正常会话。
+        var lastKeepAliveNanos: Long? = null
+        // 每段静默只报一次；保活包恢复后清零，下一次静默再报。
+        var timeoutReported = false
         while (!closed.get()) {
             try {
                 socket.receive(DatagramPacket(buffer, buffer.size))
-            } catch (_: Exception) {
+                consecutiveFailures = 0
+                lastKeepAliveNanos = System.nanoTime()
+                timeoutReported = false
+            } catch (_: SocketTimeoutException) {
+                // 空闲期正常（500ms 无包），不计失败；但连续 3 个保活周期无包则判死。
+                val last = lastKeepAliveNanos
+                if (last != null && System.nanoTime() - last >= KEEPALIVE_TIMEOUT_NANOS) {
+                    if (!timeoutReported) {
+                        timeoutReported = true
+                        val silentMillis = (System.nanoTime() - last) / 1_000_000L
+                        // action 明示当前闸位：observe-only = 只记不拆；teardown = 已恢复完整动作。
+                        val action =
+                            if (KEEPALIVE_TIMEOUT_TEARDOWN_ENABLED) "teardown" else "observe-only"
+                        CarPlayStageLog.failure(
+                            "tunnel",
+                            "tunnel-timeout",
+                            "keepalive timeout no-packet ${silentMillis}ms" +
+                                " threshold=${KEEPALIVE_TIMEOUT_MILLIS}ms" +
+                                " period=${KEEPALIVE_PERIOD_MILLIS}ms" +
+                                " action=$action",
+                        )
+                    }
+                    if (KEEPALIVE_TIMEOUT_TEARDOWN_ENABLED) {
+                        // 静默 teardown 回 Idle：不落 Failed、不弹失败卡；不接自动重连。
+                        Thread({ runCatching { close() } }, "airplay-keepalive-teardown").apply {
+                            isDaemon = true
+                            start()
+                        }
+                        return
+                    }
+                }
+            } catch (error: Exception) {
                 if (closed.get()) return
+                consecutiveFailures += 1
+                if (consecutiveFailures >= KEEPALIVE_MAX_CONSECUTIVE_FAILURES) {
+                    debugLog(
+                        "airplay keepalive socket failed $consecutiveFailures times, " +
+                            "stop thread: ${error.message}",
+                    )
+                    return
+                }
             }
         }
     }
@@ -913,6 +1036,21 @@ class AirPlaySession(
         const val READ_CHUNK_BYTES = 16 * 1024
         const val EVENT_READY_POLL_MILLIS = 25L
         const val NANOS_PER_MILLISECOND = 1_000_000L
+
+        // vc250（VC248-08）：keepalive 空闲读超时与连续异常退出阈值。
+        const val KEEPALIVE_SO_TIMEOUT_MILLIS = 500
+        const val KEEPALIVE_MAX_CONSECUTIVE_FAILURES = 3
+        // vc250（VC248-10）：iPhone 在 low-power keepalive 会话中的发包周期（按现网观测 5s）。
+        const val KEEPALIVE_PERIOD_MILLIS = 5_000L
+        // 连续 3 个周期没有保活包 → 判定对端断电/死机；阈值由周期推导，不写死秒数。
+        const val KEEPALIVE_TIMEOUT_MILLIS = KEEPALIVE_PERIOD_MILLIS * 3
+        /**
+         * vc250（VC248-10）：判死后是否真的拆会话。
+         * 真机样本造出来之前只观测——照打 failure 行但会话保持原样；样本验证通过后
+         * 置 true 即恢复完整动作（打行 + `close()` 静默 teardown 回 Idle）。
+         */
+        const val KEEPALIVE_TIMEOUT_TEARDOWN_ENABLED = false
+        private const val KEEPALIVE_TIMEOUT_NANOS = KEEPALIVE_TIMEOUT_MILLIS * 1_000_000L
     }
 }
 
@@ -964,3 +1102,10 @@ private fun asMap(value: Any?): Map<String, Any?>? {
 private fun string(value: Any?): String = value as? String ?: ""
 
 private fun long(value: Any?): Long? = (value as? Number)?.toLong()
+
+/**
+ * vc250-08：握手期「零字节」读超时（仅无线）。只作用于控制连接的首字节之前——
+ * iPhone 已建 TCP 但不发 RTSP 时，30s 内收尾这条死连接；一旦有字节到达即恢复无限阻塞
+ * （运行期 RTSP 长时间空闲属正常）。有线不传该值（0），保持历史无限阻塞。
+ */
+internal const val AIRPLAY_HANDSHAKE_ZERO_BYTE_TIMEOUT_MILLIS = 30_000

@@ -30,6 +30,12 @@ object AnchorLog {
 
     private val generation = AtomicInteger(0)
 
+    /**
+     * vc250-11：进程级短 id 的只读出口。上传骨架标签与结构化 summary 用它做绝对锚，
+     * 与每条 ANCHOR 行的 `session=` 直接对齐（同一进程内所有日志可归到同一份会话）。
+     */
+    fun sessionId(): String = sessionShortId
+
     /** 已连接链路（link-ready 已到）但还没有对应的 connect-begin 来消费它。 */
     private var pendingLinkReadyGen = 0
     private var pendingLinkReadyAtMs = 0L

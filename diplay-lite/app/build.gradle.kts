@@ -29,8 +29,8 @@ android {
         // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
-        versionCode = 249
-        versionName = "1.5.0-vc249"
+        versionCode = 250
+        versionName = "1.5.1-vc250"
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties
@@ -272,5 +272,34 @@ tasks.register("ciRelease") {
         target.parentFile.mkdirs()
         output.copyTo(target, overwrite = true)
         println("ciRelease：APK 已归档 ${target.absolutePath}")
+    }
+}
+
+// vc250（2026-11-07）：版本号自检——不合规就让构建在配置阶段直接失败，不靠人记。
+// 规则唯一源：工程文档/10-同步规范.md §八。覆盖两条：
+//   ① versionName 必须匹配 a.b.c-vcN（a/b/c 各一位 0–9，N 为十进制）；
+//   ② 名字里的 vcN 必须等于 versionCode。
+// 放在脚本末尾、配置阶段执行：assembleDebug / assembleRelease / ciRelease / tasks
+// 等任何构建都会触发，无需额外手动跑任务。
+run {
+    val checkedName = android.defaultConfig.versionName ?: ""
+    val checkedCode = android.defaultConfig.versionCode
+    val versionNamePattern = Regex("""^\d\.\d\.\d-vc\d+$""")
+    if (!versionNamePattern.matches(checkedName)) {
+        throw GradleException(
+            "VERSION CHECK FAILED: versionName=\"$checkedName\" does not match a.b.c-vcN.\n" +
+                "  expected: each of a/b/c is ONE digit 0-9, then \"-vc<versionCode>\" (e.g. 1.5.1-vc250)\n" +
+                "  actual:   versionName=\"$checkedName\", versionCode=$checkedCode\n" +
+                "  rule: sync spec section 8 (工程文档/10-同步规范.md §8)"
+        )
+    }
+    val nameCode = checkedName.substringAfter("-vc").toIntOrNull()
+    if (nameCode != checkedCode) {
+        throw GradleException(
+            "VERSION CHECK FAILED: vc in versionName (${nameCode ?: "unparsable"}) != versionCode ($checkedCode).\n" +
+                "  expected: versionName ends with \"-vc$checkedCode\"\n" +
+                "  actual:   versionName=\"$checkedName\", versionCode=$checkedCode\n" +
+                "  rule: sync spec section 8 (工程文档/10-同步规范.md §8)"
+        )
     }
 }

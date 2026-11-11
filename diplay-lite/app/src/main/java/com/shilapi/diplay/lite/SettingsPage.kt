@@ -735,7 +735,7 @@ class SettingsPage(private val activity: MainActivity) {
             },
             block(),
         )
-        // 设备码：明文蓝牙 MAC（DeviceCode），供用户报障时报号，可直接与蓝牙清单对账。
+        // 设备码：明文蓝牙 MAC + ROM 指纹（DeviceCode，VC250-02），供用户报障时报号，可直接与蓝牙清单对账。
         // 点按/长按都复制，避免老车机触摸屏长按判定不稳（不能只做长按）。
         val deviceCode = DeviceCode.of()
         column.addView(

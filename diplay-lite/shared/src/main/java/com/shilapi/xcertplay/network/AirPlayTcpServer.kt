@@ -44,6 +44,8 @@ class AirPlayTcpServer {
         val mfi: MfiAuthenticator?,
         val listener: AirPlaySessionListener,
         val media: AirPlayMediaHandler,
+        /** vc250-08：握手期首字节读超时（0 = 有线，不启用）。 */
+        val handshakeIdleTimeoutMillis: Int,
     )
 
     private val active = AtomicBoolean(false)
@@ -67,6 +69,8 @@ class AirPlayTcpServer {
         mfi: MfiAuthenticator?,
         listener: AirPlaySessionListener,
         media: AirPlayMediaHandler,
+        /** vc250-08：握手期首字节读超时（毫秒）。无线传 30 s，有线传 0（保持无限阻塞）。 */
+        handshakeIdleTimeoutMillis: Int = 0,
     ): AttachResult {
         if (active.get()) {
             Log.i(TAG, "replacing stale wireless attachment")
@@ -75,7 +79,16 @@ class AirPlayTcpServer {
         active.set(true)
         return try {
             val boundPort = startAirPlayServer(
-                AirPlayAttachment(bindAddress, config, identity, pairings, mfi, listener, media),
+                AirPlayAttachment(
+                    bindAddress,
+                    config,
+                    identity,
+                    pairings,
+                    mfi,
+                    listener,
+                    media,
+                    handshakeIdleTimeoutMillis,
+                ),
             )
             AttachResult.Started(boundPort)
         } catch (error: Exception) {
@@ -288,7 +301,7 @@ class AirPlayTcpServer {
                 socket.tcpNoDelay = true
                 socket.keepAlive = true
                 socket.setSoLinger(true, 0)
-                val session = synchronized(this) {
+                val accepted = synchronized(this) {
                     if (!active.get()) {
                         socket.close()
                         return
@@ -298,22 +311,28 @@ class AirPlayTcpServer {
                         socket.close()
                         return
                     }
-                    AirPlaySession(
-                        socket = socket,
-                        config = current.config,
-                        identity = current.identity,
-                        pairings = current.pairings,
-                        mfi = current.mfi,
-                        listener = object : AirPlaySessionListener by current.listener {
-                            override fun onSessionEnded(session: AirPlaySession) {
-                                removeSession(session)
-                                current.listener.onSessionEnded(session)
-                            }
-                        },
-                        media = current.media,
-                    ).also(::addSession)
+                    Pair(
+                        AirPlaySession(
+                            socket = socket,
+                            config = current.config,
+                            identity = current.identity,
+                            pairings = current.pairings,
+                            mfi = current.mfi,
+                            listener = object : AirPlaySessionListener by current.listener {
+                                override fun onSessionEnded(session: AirPlaySession) {
+                                    removeSession(session)
+                                    current.listener.onSessionEnded(session)
+                                }
+                            },
+                            media = current.media,
+                            handshakeIdleTimeoutMillis = current.handshakeIdleTimeoutMillis,
+                        ).also(::addSession),
+                        current.listener,
+                    )
                 }
-                session.start()
+                // vc250-08：accept 即上报（锁外回调，避免监听方在会话表锁内调度）。
+                runCatching { accepted.second.onControlConnectionAccepted(accepted.first) }
+                accepted.first.start()
             }
         } catch (error: IOException) {
             if (active.get()) {

@@ -2,6 +2,7 @@ package com.shilapi.diplay.lite
 
 import android.app.Application
 import android.os.Environment
+import com.shilapi.xcertplay.diag.CarPlayStageLog
 import com.shilapi.xcertplay.diag.boundedTrace
 import java.io.File
 
@@ -15,6 +16,17 @@ class LiteApp : Application() {
     override fun onCreate() {
         super.onCreate()
         LiteLog.attachFileLog(logDirectory())
+        // vc250：共享层 USB/权限阶段直接落同一个日志出口（服务未起也能记）。
+        CarPlayStageLog.install { stage, detail -> LiteLog.stage(stage, detail) }
+        // vc250（VC248-10）：keepalive 判死等共享层失败也走同一 failure 出口。
+        CarPlayStageLog.installFailure { stage, failureClass, detail ->
+            LiteLog.failure(stage, failureClass, detail)
+        }
+        // vc250-05：凭据三态的源头事实（0x5703 下发瞬间是否已有 TCP / TCP 是否到达）。
+        CarPlayStageLog.installCredential(
+            credential = { beforeTcp -> LiteLog.credentialIssued(beforeTcp) },
+            tcpAccepted = { LiteLog.airPlayTcpAccepted() },
+        )
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             // 兜 Throwable：若是 OutOfMemoryError，拼字符串本身也可能抛 Error，
@@ -30,7 +42,7 @@ class LiteApp : Application() {
         }
         LiteLog.log("app", "DiPlay Lite 进程启动 versionName=${packageManager.getPackageInfo(packageName, 0).versionName}")
         // 本地日志也带归机码：用户直接拷日志时同样能分辨来自哪台机器。
-        // 设备码是明文蓝牙 MAC（用户拍板）；describe 在取不到 MAC 时写明 unknown 的具体原因。
+        // 设备码是明文蓝牙 MAC + ROM 指纹（VC250-02）；describe 在取不到 MAC 时写明 unknown 的具体原因。
         LiteLog.log("app", "设备码 ${DeviceCode.describe()}")
     }
 

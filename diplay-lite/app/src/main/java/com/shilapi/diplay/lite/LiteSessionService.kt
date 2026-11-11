@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Base64
 import android.view.WindowManager
+import com.shilapi.xcertplay.CarPlayFailureClass
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
@@ -61,6 +62,9 @@ import java.util.Locale
 class LiteSessionService : Service() {
 
     private var controller: CarPlayController? = null
+
+    // vc250：结构化日志的当前阶段（仅用于失败行归因，不改变既有日志输出）。
+    @Volatile private var currentStage: LiteLog.Stage = LiteLog.Stage.UsbEnum
 
     // 探针（1.1.2-test）：蓝牙 A2DP/HFP 连接状态广播——bt_audio 模式核心观测点。
     // 判读：CarPlay 会话建立前后若 A2DP 断开，即「无线 handoff 断蓝牙」，蓝牙出声前提不成立。
@@ -165,6 +169,7 @@ class LiteSessionService : Service() {
             LiteState.phase = LiteState.Phase.ACTIVE
             LiteState.statusText = "CarPlay 会话已激活"
             LiteLog.log("airplay", "会话已激活 peer=${session.host}")
+            markStage(LiteLog.Stage.AirPlayEstablish, "session active peer=${session.host}")
         }
 
         override fun onSessionEnded(session: AirPlaySession) {
@@ -175,6 +180,10 @@ class LiteSessionService : Service() {
                 if (userStopped) "会话已结束"
                 else "连接已断开：重新插入 USB 线（或点连接）即可自动恢复"
             LiteLog.log("airplay", "会话已结束 userStopped=$userStopped")
+            // vc250：会话结束回到链路起点，避免下一次失败沿用上一会话的阶段。
+            currentStage = LiteLog.Stage.UsbEnum
+            // vc250-03：会话结束落一行耗时汇总（中途断开也打，result 由是否走到 first-frame 判定）。
+            LiteLog.endSession()
             // vc239（LOG-238-02）：清锚点代际的「等链路」状态，避免下次连接误沿用本代。
             AnchorLog.onSessionEnded()
         }
@@ -195,8 +204,17 @@ class LiteSessionService : Service() {
             LiteLog.log("airplay", message)
             // 日志头段锚点：首帧上屏（当前为固定英文文案，可 grep）。
             if (message.contains("first frame rendered")) {
+                markStage(LiteLog.Stage.FirstFrame, "first frame rendered")
                 // vc239：带 session/gen，与同代 connect-begin/link-ready 对齐。
                 LiteLog.log("anchor", AnchorLog.firstFrame())
+            }
+            // vc250：关键帧请求多次仍无上屏 → 结构化失败分类（既有 recovery 流程不变）。
+            if (message.contains("recovery stalled: keyframe requested")) {
+                LiteLog.failure(
+                    LiteLog.Stage.FirstFrame,
+                    LiteLog.FailureClass.KeyframeStall,
+                    message,
+                )
             }
             // vc96（FE-6 断链取证）：wedge/断链事件触发内核级快照（sysfs 设备树 + dmesg 尾部），
             // 回答「谁先动手」（iPhone 侧复位 vs host 端口楔死）。探针未启用（无 root）时 no-op。
@@ -254,6 +272,8 @@ class LiteSessionService : Service() {
         ClusterDisplayProbe.probe(this)
         // vc102 状态栏探针：会话期顶栏占用正是用户报的场景，session-start 取全局窗口清单。
         StatusBarProbe.probe(this, "session-start")
+        // vc250-03：服务侧发起连接即开启本次计时会话（各阶段 t/dt 与汇总的起点），重复连接重置。
+        LiteLog.beginSession()
         startController()
         return START_STICKY
     }
@@ -292,6 +312,8 @@ class LiteSessionService : Service() {
         LiteState.phase = LiteState.Phase.IDLE
         LiteState.statusText = "未连接"
         stopForeground(true)
+        // vc250-03：兜底——连接中直接 stopService（未走到状态机终态）也要出汇总；幂等不会重复。
+        LiteLog.endSession()
         LiteLog.log("service", "会话服务已停止")
         current = null
         super.onDestroy()
@@ -584,6 +606,18 @@ class LiteSessionService : Service() {
     /** CarPlayStatus -> LiteState 映射；controller 已投递到主线程回调。 */
     private fun onStatus(status: CarPlayStatus) {
         LiteLog.log("carplay", "状态：$status")
+        // vc250：先落阶段标记，失败行据此归因；正常状态不额外改变 UI/日志可读行为。
+        if (status !is CarPlayStatus.Failed) {
+            val next = stageOfStatus(status)
+            if (next == LiteLog.Stage.Permission || next == LiteLog.Stage.Credential) {
+                // vc250：permission 由 USB 侧（CarPlayController）直接打点；credential 由
+                // 0x5703 下发桥打点（vc250-10 边界重指）。这里只推进 currentStage 供失败
+                // 归因，不再重复落日志（否则 summary 会沿用旧的「起监听」时刻）。
+                currentStage = next
+            } else if (next != null) {
+                markStage(next, "status=$status")
+            }
+        }
         // vc176：重枚举标志随状态机自动维护——仅 WaitingForReenumeration 期间为真，
         // 其余任何状态（含 Failed/ControlEnded/新授权请求）一律清除。
         LiteState.reenumerating = status is CarPlayStatus.WaitingForReenumeration
@@ -613,9 +647,84 @@ class LiteSessionService : Service() {
             is CarPlayStatus.ControlEnded -> {
                 LiteState.phase = LiteState.Phase.IDLE
                 LiteState.statusText = "控制通道已结束"
+                // vc250-03：有线控制通道结束即本次连接终态。
+                LiteLog.endSession()
             }
             is CarPlayStatus.RecoveryHint -> connecting(status.message)
-            is CarPlayStatus.Failed -> fail(localizeFailure(status.message))
+            is CarPlayStatus.Failed -> {
+                // vc250：优先用源头标注；上游仍是 Unknown 时才按文案兜底猜测。
+                val failureClass = if (status.failureClass != CarPlayFailureClass.Unknown) {
+                    toLiteFailureClass(status.failureClass)
+                } else {
+                    classifyFailure(status.message)
+                }
+                LiteLog.failure(currentStage, failureClass, status.message)
+                fail(localizeFailure(status.message))
+            }
+        }
+    }
+
+    /** vc250：阶段只记一次转场；重复状态不刷屏。 */
+    private fun markStage(next: LiteLog.Stage, detail: String) {
+        if (next == currentStage) return
+        currentStage = next
+        LiteLog.stage(next, detail)
+    }
+
+    /** vc250：CarPlayStatus → 本机 Host 链路阶段；null 表示纯 UI/恢复提示，不推进阶段。 */
+    private fun stageOfStatus(status: CarPlayStatus): LiteLog.Stage? = when (status) {
+        is CarPlayStatus.DiscoveringIphone,
+        is CarPlayStatus.WaitingForIphone -> LiteLog.Stage.UsbEnum
+        is CarPlayStatus.RequestingIphonePermission -> LiteLog.Stage.Permission
+        is CarPlayStatus.WaitingForReenumeration,
+        is CarPlayStatus.SelectingConfiguration,
+        is CarPlayStatus.OpeningDataPaths -> LiteLog.Stage.ConfigSwitch
+        is CarPlayStatus.Pairing,
+        is CarPlayStatus.ConnectingControl,
+        is CarPlayStatus.ConnectingBluetooth -> LiteLog.Stage.Iap2Handshake
+        // vc250-10：AttachingNetwork 只静默推进 currentStage（credential 边界已改为
+        // 0x5703 成功下发）；RunningWireless 不再代表 AirPlay 建立，airplay-establish
+        // 由 onSessionActive 打点。
+        is CarPlayStatus.AttachingNetwork -> LiteLog.Stage.Credential
+        is CarPlayStatus.RunningWireless -> null
+        is CarPlayStatus.RunningControl,
+        is CarPlayStatus.WirelessActive -> LiteLog.Stage.Tunnel
+        else -> null
+    }
+
+    /** vc250：源头分类 → 本层枚举；值一一对应，不做二次猜测。 */
+    private fun toLiteFailureClass(failureClass: CarPlayFailureClass): LiteLog.FailureClass =
+        when (failureClass) {
+            CarPlayFailureClass.BtNoResponse -> LiteLog.FailureClass.BtNoResponse
+            CarPlayFailureClass.ClaimBusy -> LiteLog.FailureClass.ClaimBusy
+            CarPlayFailureClass.CredTimeout -> LiteLog.FailureClass.CredTimeout
+            CarPlayFailureClass.TunnelTimeout -> LiteLog.FailureClass.TunnelTimeout
+            CarPlayFailureClass.KeyframeStall -> LiteLog.FailureClass.KeyframeStall
+            CarPlayFailureClass.Iap2Timeout -> LiteLog.FailureClass.Iap2Timeout
+            CarPlayFailureClass.Unknown -> LiteLog.FailureClass.Unknown
+        }
+
+    /**
+     * vc250：兜底猜测——只在 `CarPlayStatus.Failed.failureClass == Unknown`（上游没标注）时使用。
+     * 主分类职责已下沉到各链路源头，这里保持旧关键词，避免历史路径无分类。
+     */
+    private fun classifyFailure(message: String): LiteLog.FailureClass {
+        val m = message.lowercase()
+        return when {
+            "keyframe" in m || "key frame" in m || "render stall" in m ->
+                LiteLog.FailureClass.KeyframeStall
+            "tunnel" in m || "handoff timed out" in m -> LiteLog.FailureClass.TunnelTimeout
+            "credential" in m || "first tcp" in m || "0 tcp" in m ||
+                "join-stagnation" in m ||
+                "pair failed" in m || "pairing failed" in m || "auth failed" in m ->
+                LiteLog.FailureClass.CredTimeout
+            "could not claim usbmux" in m || "claim failed" in m || "ebusy" in m ->
+                LiteLog.FailureClass.ClaimBusy
+            "bluetooth" in m || "rfcomm" in m || "bt socket" in m ||
+                "page timed out" in m || "page failed" in m || "no page response" in m ->
+                LiteLog.FailureClass.BtNoResponse
+            "iap2" in m -> LiteLog.FailureClass.Iap2Timeout
+            else -> LiteLog.FailureClass.Unknown
         }
     }
 
@@ -753,6 +862,8 @@ class LiteSessionService : Service() {
         LiteState.phase = LiteState.Phase.FAILED
         LiteState.statusText = text
         LiteLog.log("service", "失败：$text")
+        // vc250-03：失败也是会话终态；failureClass 已由先行的 LiteLog.failure 记入本会话。
+        LiteLog.endSession()
     }
 
     // ---------- 部署辅助 ----------

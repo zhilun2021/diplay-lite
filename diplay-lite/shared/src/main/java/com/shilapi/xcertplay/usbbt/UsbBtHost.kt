@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.usbbt
 
 import android.util.Log
+import com.shilapi.xcertplay.CarPlayFailureClass
 import com.shilapi.xcertplay.diag.AnchorLog
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
@@ -203,9 +204,6 @@ internal class UsbBtHost(
          * 2. 常驻广播手动关（`discoverableEnabled == false`）→ 2
          * 3. 有配对：`since = maxOf(linkReadyAtMs, lastLinkLostAtMs)`，60s 内 → 3，否则 → 2
          * 4. 无配对且常驻广播开 → 3
-         *
-         * // vc247 TEST：待 K60 真机验证（① 已配对列表仍可见 ② 点按能连上 ③ 连上能出画面），
-         * // 验证不过就整体回退 scan=3 —— 只需改本函数内的 2 分支，档位不散落在别处。
          */
         internal fun evaluateScanMode(): Int {
             val now = System.currentTimeMillis()
@@ -477,6 +475,11 @@ internal class UsbBtHost(
     /** 状态文本（D2 沿途搬进 UsbBtBootstrapStream.lastStatusText）。 */
     @Volatile
     var statusText: String = "未启动"
+        private set
+
+    /** vc250：失败分类（源头标注）；建链/HCI/控制器错误统一 BtNoResponse。 */
+    @Volatile
+    var failureClass: CarPlayFailureClass = CarPlayFailureClass.Unknown
         private set
 
     private fun setStatus(text: String) {
@@ -823,10 +826,11 @@ internal class UsbBtHost(
     private fun le16(b: ByteArray, off: Int): Int =
         (b[off].toInt() and 0xff) or ((b[off + 1].toInt() and 0xff) shl 8)
 
-    fun failWith(reason: String) {
+    fun failWith(reason: String, failure: CarPlayFailureClass = CarPlayFailureClass.BtNoResponse) {
         if (phase == Phase.STOPPED) return
         phase = Phase.FAILED
         statusText = reason
+        failureClass = failure
         log("host failed: $reason")
         // vc219：有持久化 link key 时，host 瞬态失败（dongle  wedge/端口复位兜底中等）不再把
         // PAIRED 打回 UNPAIRED——配对关系在 SharedPreferences 里，跟 host 进程态无关。
@@ -1016,7 +1020,7 @@ internal class UsbBtHost(
     /**
      * vc238：立刻按总闸状态重发 Write_Scan_Enable（开=3 可发现 / 关=2 仅 page scan）。
      * 只走命令队列，不触碰链路；调用方（standby）已确认控制器未被占用。
-     * vc247（V13）// vc247 TEST：档位同样只读 [evaluateScanMode]（与 onTick 同一谓词）。
+     * vc247（V13）：档位同样只读 [evaluateScanMode]（与 onTick 同一谓词）。
      */
     internal fun pushScanModeNow(): Boolean {
         if (phase != Phase.DISCOVERABLE || currentScanMode < 0) return false
@@ -1229,7 +1233,7 @@ internal class UsbBtHost(
             return
         }
         connections[event.handle] = event.addr
-        // vc247（V13）// vc247 TEST：链路就绪时刻 —— 60s 可发现缓冲的起点之一。
+        // vc247（V13）：链路就绪时刻 —— 60s 可发现缓冲的起点之一。
         linkReadyAtMs = System.currentTimeMillis()
         lastLinkReadyAtMs = linkReadyAtMs
         // vc239（BT-238-01）：关闭期仍建链成功 → 直接证伪「关掉后配对设备也连不上」，
@@ -1317,7 +1321,7 @@ internal class UsbBtHost(
     }
 
     private fun onDisconnectionComplete(event: HciEvent.DisconnectionComplete) {
-        // vc247（V13）// vc247 TEST：断链时刻 —— 60s 可发现缓冲的起点之一。
+        // vc247（V13）：断链时刻 —— 60s 可发现缓冲的起点之一。
         lastLinkLostAtMs = System.currentTimeMillis()
         val addr = connections.remove(event.handle)
         outgoing.remove(event.handle)
@@ -1487,7 +1491,7 @@ internal class UsbBtHost(
         // 链路就绪/断链后 60s 内保持 scan=3，之后收敛到 2（仅 page scan），
         // 避免长时间常驻可发现；回连仍可由 iPhone 主动 page 发起。
         if (phase == Phase.DISCOVERABLE && currentScanMode >= 0) {
-            // vc247（V13）// vc247 TEST：档位统一读 evaluateScanMode()（不在此硬编码）。
+            // vc247（V13）：档位统一读 evaluateScanMode()（不在此硬编码）。
             val want = evaluateScanMode()
             if (want != currentScanMode) {
                 currentScanMode = want

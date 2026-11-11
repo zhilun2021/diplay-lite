@@ -98,6 +98,8 @@ class MainActivity : Activity() {
 
     // 视图引用：render()/homePanel() 程序化构建并在其中完成全部监听挂接与引用赋值
     private lateinit var video: SurfaceView
+    // vc250（VC248-07）：常驻根容器——切页复用同一个 root 与 SurfaceView，只换覆盖层。
+    private var rootView: FrameLayout? = null
 
     // 1.0.29：分辨率设定=自动（拉伸）时，视频不做等比 letterbox，直接铺满容器。
     // onCreate 初始化、onResume 刷新（设置页可能改过）。
@@ -265,6 +267,8 @@ class MainActivity : Activity() {
         // 的脏会话）。拔线即执行「用户断开等价清理」（LiteSessionService.onDestroy 全拆
         // controller 栈 + mediaSink + VPN），重插 ATTACHED 经 onNewIntent 触发全新建链。
         registerUsbDetachReceiver()
+        // vc250：冷启动由 ATTACHED intent 直接拉起时不会走 onNewIntent，这里补一次 usb-enum。
+        logUsbAttach(intent)
         // vc245：外置蓝牙兜底自检（有界 3s、三态可判别）。只挂 dongle 链路，
         // 车机蓝牙链路零变化。
         if (LiteConfig.load(this).usbBtDongle) startDongleSelfCheck()
@@ -372,6 +376,8 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        // vc250：USB 插入侧直接落 usb-enum，不依赖会话服务是否已起。
+        logUsbAttach(intent)
         autoConnectTried = false
         usbSixFields("usb", "attach-settle", "receiver", "auto-connect-after-1.5s")
         // vc246（USB-246-03）：ATTACHED 后 1.5s 静默期（与 DETACHED 后 1.0s 对称）。
@@ -785,12 +791,12 @@ class MainActivity : Activity() {
     // ---------- 原版式 render：整页重建 ----------
 
     /**
-     * 根视图：Surface 铺满 → home 面板 → 悬浮球 → errorCard。
-     * 面板布局方向用 Display 实际宽高判定（isLandscapeDisplay），勿信 configuration.orientation。
+     * vc250（VC248-07）：首次建根容器与 SurfaceView 并挂上 contentView；
+     * 之后所有 render() 复用同一 root/Surface，切页不再销毁重建 Surface。
      */
-    internal fun render() {
+    private fun ensureRenderRoot(): FrameLayout {
+        rootView?.let { return it }
         val root = FrameLayout(this).apply { background = ColorDrawable(Ui.BG) }
-
         // M3：CarPlay 画面镜像到该 SurfaceView；M4k：铺满整屏 + 接手势转发。
         // 子页时铺在页面底下（子页根布局不透明遮住），Surface 常驻避免切页反复换 Surface。
         video = SurfaceView(this)
@@ -808,7 +814,28 @@ class MainActivity : Activity() {
             }
         })
         video.setOnTouchListener { _, event -> forwardTouch(event) }
-        root.addView(video, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        root.addView(
+            video,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
+        )
+        setContentView(root)
+        rootView = root
+        return root
+    }
+
+    /**
+     * 根视图：Surface 铺满 → home 面板 → 悬浮球 → errorCard。
+     * 面板布局方向用 Display 实际宽高判定（isLandscapeDisplay），勿信 configuration.orientation。
+     */
+    internal fun render() {
+        val root = ensureRenderRoot()
+
+        // vc250（VC248-07）：切页只换面板/悬浮球/失败卡，SurfaceView 常驻不重建——
+        // 原实现每次 render 都 new SurfaceView + setContentView，切页会销毁再创建 Surface，
+        // 导致 1~5s 冻结与黑屏竞态。
+        for (index in root.childCount - 1 downTo 0) {
+            if (root.getChildAt(index) !== video) root.removeViewAt(index)
+        }
 
         panel = when (page) {
             "settings" -> {
@@ -937,7 +964,6 @@ class MainActivity : Activity() {
                 },
             )
         }
-        setContentView(root)
         setPanelVisible(panelVisible)
         // M6k24k 方向诊断：每个 page 构建完成后记录一次（tag=当前 page）。
         logOrientation(this, page)
@@ -1417,6 +1443,8 @@ class MainActivity : Activity() {
     private fun connect(channel: String, auto: Boolean = false) {
         // vc247（V3）：任何一次真实连接都视为用户回来了，解除断开抑制。
         userDisconnected = false
+        // vc250：连接入口总线扫描——dongle 在场时也落 usb-enum。
+        logUsbDonglePresence()
         val config = LiteConfig.load(this)
         when (channel) {
             "car" -> {
@@ -1702,11 +1730,53 @@ class MainActivity : Activity() {
         }
     }
 
+    /** vc250：把 ATTACHED intent 里的 Apple / dongle 设备落到 usb-enum；只带 VID/PID（不含序列号）。 */
+    private fun logUsbAttach(intent: Intent?) {
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        @Suppress("DEPRECATION")
+        val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
+        val role = when (device.vendorId) {
+            APPLE_USB_VENDOR_ID -> "iphone"
+            UsbDongleGuard.VENDOR_ID -> "dongle"
+            else -> return
+        }
+        LiteLog.stage(
+            LiteLog.Stage.UsbEnum,
+            "attach-intent vid=0x%04x pid=0x%04x role=$role".format(
+                device.vendorId, device.productId,
+            ),
+        )
+    }
+
+    /** vc250：连接入口的总线扫描——dongle 在场时落 usb-enum；复用 UsbDongleGuard 的 VID 判定。 */
+    private fun logUsbDonglePresence() {
+        val manager = getSystemService(USB_SERVICE) as? UsbManager ?: return
+        val dongle = UsbDongleGuard.findDongle(manager) ?: return
+        LiteLog.stage(
+            LiteLog.Stage.UsbEnum,
+            "bus-check vid=0x%04x pid=0x%04x role=dongle".format(
+                dongle.vendorId, dongle.productId,
+            ),
+        )
+    }
+
     /** 枚举 USB 设备看是否有 Apple VID（iPhone/iPad），无需任何权限。 */
-    private fun hasAppleUsbDevice(): Boolean =
-        (getSystemService(USB_SERVICE) as? UsbManager)?.deviceList?.values?.any {
-            it.vendorId == APPLE_USB_VENDOR_ID
-        } == true
+    private fun hasAppleUsbDevice(): Boolean {
+        val apple = (getSystemService(USB_SERVICE) as? UsbManager)?.deviceList?.values
+            ?.firstOrNull { it.vendorId == APPLE_USB_VENDOR_ID }
+        // vc250：总线枚举结果直接落 usb-enum（服务未起时也能记；只带 VID/PID）。
+        LiteLog.stage(
+            LiteLog.Stage.UsbEnum,
+            if (apple != null) {
+                "bus-check appleUsbPresent=true vid=0x%04x pid=0x%04x role=iphone".format(
+                    apple.vendorId, apple.productId,
+                )
+            } else {
+                "bus-check appleUsbPresent=false role=iphone"
+            },
+        )
+        return apple != null
+    }
 
     /** vc93：root 免对话框写 appops 放行 ACTIVATE_VPN（授权组件被裁的 ROM 上绕过对话框）。
      *  只负责尝试写 op，最终是否生效由调用方复检 VpnService.prepare 判定。
@@ -1931,13 +2001,13 @@ class MainActivity : Activity() {
      * `layer=usb|bt / trigger / holder / gen / present / next`
      * - layer：usb=端口/句柄层，bt=蓝牙链路层；**bulk read -1 不再单列一层**，只计入计数。
      * - holder：当前持有句柄的一方（standby / controller / gate / none）。
-     * - present：sysfs 是否仍能看到 0a12（只读旁证，不走 binder，不惧 D 态）。
+     * - present：sysfs 旁证看到的 0a12 设备 vid:pid（只读旁证，不走 binder，不惧 D 态；无则 absent）。
      */
     private fun usbSixFields(layer: String, trigger: String, holder: String, next: String) {
         LiteLog.log(
             "usb",
             "layer=$layer trigger=$trigger holder=$holder gen=${UsbBtStandby.generationSnapshot}" +
-                " present=${UsbDongleGuard.sysfsPresent} next=$next",
+                " present=${UsbDongleGuard.sysfsId() ?: "absent"} next=$next",
         )
     }
 

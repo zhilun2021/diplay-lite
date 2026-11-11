@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.res.Resources
 import android.os.Build
 import android.util.Base64
+import com.shilapi.xcertplay.diag.AnchorLog
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -411,8 +412,10 @@ object RuntimeLogUploader {
             }
         }
         val gens = groups.mapNotNull { it.gen }.distinct()
+        // vc250-11：骨架标签带 session=<进程短 id>，与 ANCHOR 行/结构化 summary 绝对对齐。
+        val sessionId = runCatching { AnchorLog.sessionId() }.getOrDefault("?")
         val stats = buildString {
-            append("（骨架区：完整 $totalLines 行 / ${kbText(totalBytes)} 超 160KB 上限；")
+            append("（骨架区：session=$sessionId 完整 $totalLines 行 / ${kbText(totalBytes)} 超 160KB 上限；")
             append("按「每个 gen 强制保留关键锚点行 + 该 gen 头尾各若干行、优先省略 HCI 明细」裁剪：")
             append("保留 ${gens.size} 个 gen")
             if (gens.isNotEmpty()) {
@@ -421,14 +424,16 @@ object RuntimeLogUploader {
             append("，保留 $keptLines 行 / ${kbText(keptBytes)}，")
             append("省略 $omittedLines 行（其中 HCI 明细 $omittedHci 行）)\n")
             val perGroup = groups.indices.joinToString("、") { i ->
-                val label = groups[i].gen?.let { "gen=$it" } ?: "无 gen 段"
+                val label = groups[i].gen?.let { "session=$sessionId gen=$it" }
+                    ?: "session=$sessionId / 无 gen 段"
                 "$label:${keep[i].count { it }}"
             }
             if (perGroup.isNotEmpty()) append("（骨架区每段保留行数：$perGroup）\n")
         }
         val body = buildString {
             groups.forEachIndexed { i, group ->
-                val label = group.gen?.let { "gen=$it" } ?: "无 gen 段"
+                val label = group.gen?.let { "session=$sessionId gen=$it" }
+                    ?: "session=$sessionId / 无 gen 段"
                 var idx = 0
                 while (idx < group.lines.size) {
                     if (keep[i][idx]) {
@@ -574,7 +579,7 @@ object RuntimeLogUploader {
     ): String = buildString {
         append("运行日志（含 dongle 链路）\n\n")
         append("设备：").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
-        // 设备码是明文蓝牙 MAC（DeviceCode，用户拍板）：保留型号行之外，多台同型号车机靠它归机。
+        // 设备码是明文蓝牙 MAC + ROM 指纹（DeviceCode，VC250-02）：保留型号行之外，同 MAC 的不同车机靠指纹区分归机。
         // 上传脱敏只放行这一处「设备码」行（见 LogUploadPrivacy.DEVICE_CODE_MARK）。
         append("设备码：").append(deviceCode).append('\n')
         val metrics = Resources.getSystem().displayMetrics

@@ -22,6 +22,12 @@ internal class UpdateCheckException(val userMessage: String) : Exception(userMes
 
 internal object UpdateApi {
     /**
+     * vc250（VC250-04）：版本名提取，容忍 `1.5.0-vc249`、`1.5.0（vc249）`、`1.5.0(vc249)`
+     * 三种写法；命中的统一写成 `1.5.0-vc249`（落盘名/弹窗都不再出现全角括号）。
+     * 三段数字 + `vc<code>` 的旧写法结果与 vc248 完全一致；纯 `vc249` 标题不命中，仍回落 tag。
+     */
+    private val VERSION_NAME = Regex("""(\d+\.\d+\.\d+)[\s\-（(]*vc(\d+)""")
+    /**
      * 单次匿名 GET `releases/latest`：解析版本号、更新内容、APK 资产直链。
      * 失败抛 [UpdateCheckException]；调用方只呈现一次结果，不重试。
      */
@@ -102,8 +108,10 @@ internal object UpdateApi {
         val name = json.optString("name", "")
         val versionCode = versionCodeOf(tag) ?: versionCodeOf(name)
             ?: throw UpdateCheckException("发行信息不完整，请到发行页手动下载：${UpdateConfig.RELEASE_PAGE}")
-        val versionName = Regex("""(\d+\.\d+\.\d+-vc\d+)""")
-            .find("$name $tag")?.groupValues?.get(1) ?: tag
+        // vc250（VC250-04）：比较逻辑不变（仍比 versionCode）；仅版本名提取放宽分隔符。
+        val versionName = VERSION_NAME.find("$name $tag")?.let {
+            "${it.groupValues[1]}-vc${it.groupValues[2]}"
+        } ?: tag
         val changelog = json.optString("body", "").trim().let {
             if (it.length > 2000) it.substring(0, 2000) else it
         }

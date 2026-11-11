@@ -64,6 +64,17 @@ object UsbDongleGuard {
     val sysfsPresent: Boolean
         get() = runCatching { sysfsNode() != null }.getOrDefault(false)
 
+    /**
+     * vc250：sysfs 旁证看到的 dongle 身份（"vid:pid"，任意 0x0a12 PID，判据与 [findDongle] 一致）。
+     * 无设备或读不到 idVendor/idProduct 时返回 null。
+     */
+    fun sysfsId(): String? {
+        val dir = sysfsNode() ?: return null
+        val vendor = readHex(File(dir, "idVendor")) ?: return null
+        val product = readHex(File(dir, "idProduct")) ?: return null
+        return "%04x:%04x".format(vendor, product)
+    }
+
     fun findDongle(manager: UsbManager): UsbDevice? {
         val list = manager.deviceList?.values ?: return null
         return list.firstOrNull { it.vendorId == VENDOR_ID && it.productId == PRODUCT_ID }
@@ -90,6 +101,8 @@ object UsbDongleGuard {
         if (!checkRunning.compareAndSet(false, true)) {
             val skipped = Report(Status.SKIPPED, "自检已跳过（已有自检在跑）")
             log(tag, skipped)
+            val generation = UsbBtStandby.generationSnapshot
+            logStage(tag, skipped, generation, generation)
             return skipped
         }
         try {
@@ -142,7 +155,28 @@ object UsbDongleGuard {
         }
         val out = if (tracked) track(effective) else effective
         log(tag, out)
+        logStage(tag, out, generationAtStart, generationNow)
         return out
+    }
+
+    /**
+     * vc250：自检结论落 usb-enum，只记录、不改控制流。
+     * 三档结论：ok（HCI 正常应答）/ no-response（HCI 没回话）/ unavailable（su 不可用、
+     * 无权限或环境不满足）；status 保留原始细分，gen 记录自检起止代际供 T3-D 对照。
+     */
+    private fun logStage(tag: String, report: Report, generationAtStart: Int, generationNow: Int) {
+        val outcome = when (report.status) {
+            Status.OK -> "ok"
+            Status.HCI_NO_RESPONSE -> "no-response"
+            else -> "unavailable"
+        }
+        runCatching {
+            LiteLog.stage(
+                LiteLog.Stage.UsbEnum,
+                "role=dongle check=$outcome status=${report.status} context=$tag " +
+                    "gen=$generationAtStart->$generationNow",
+            )
+        }
     }
 
     /** vc247（V2）：OK 清零、真失败 +1、SKIPPED 不增不减；达到阈值只上屏一次。 */
@@ -176,7 +210,7 @@ object UsbDongleGuard {
         // vc246（USB-246-03）：三段 binder 分别计时，>3s 即置进程级粘性 D 态门禁。
         val listStarted = System.currentTimeMillis()
         val device = findDongle(manager)
-            ?: return Report(Status.ABSENT, "设备列表无 0a12:0001")
+            ?: return Report(Status.ABSENT, "设备列表未发现 vendor 0x0a12 的 dongle")
         noteBinderSpan("getDeviceList", listStarted)
         val permissionStarted = System.currentTimeMillis()
         val permitted = manager.hasPermission(device)
@@ -228,7 +262,7 @@ object UsbDongleGuard {
         val elapsed = System.currentTimeMillis() - startedMs
         if (UsbBinderGate.noteCall(source, elapsed)) {
             val line = "usb_246_03: layer=usb trigger=binder-slow holder=none" +
-                " gen=${UsbBtStandby.generationSnapshot} present=$sysfsPresent" +
+                " gen=${UsbBtStandby.generationSnapshot} present=${sysfsId() ?: "absent"}" +
                 " next=forbid-open detail=$source ${elapsed}ms"
             LiteLog.log("usbdongle", line)
             Log.w("usbdongle", line)
@@ -240,8 +274,8 @@ object UsbDongleGuard {
         val entries = File("/sys/bus/usb/devices").listFiles() ?: return null
         for (dir in entries) {
             val vendor = readHex(File(dir, "idVendor"))
-            val product = readHex(File(dir, "idProduct"))
-            if (vendor == VENDOR_ID && product == PRODUCT_ID) return dir
+            // vc250：判据与 findDongle 一致——任意 0x0a12 PID 都算 dongle，不再限定 0x0001。
+            if (vendor == VENDOR_ID) return dir
         }
         return null
     }

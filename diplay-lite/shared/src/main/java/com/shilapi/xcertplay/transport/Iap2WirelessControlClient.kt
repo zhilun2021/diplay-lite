@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import com.shilapi.xcertplay.CarPlayFailureClass
 import com.shilapi.xcertplay.iap2.message.Iap2CarPlayMessages
 import com.shilapi.xcertplay.iap2.message.Iap2ControlMessages
 import com.shilapi.xcertplay.iap2.message.Iap2WirelessMessages
@@ -53,6 +54,9 @@ class Iap2WirelessControlClient(
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
         phoneOnAirPlay: () -> Boolean = { false },
+        // vc250-05：真凭证 0x5703 成功写出时回调，携带「发送瞬间 iPhone 是否还没有
+        // AirPlay TCP」快照，只供 summary 判定 credential=full|cached|none，不参与控制流。
+        onCredentialSent: ((beforeAirPlayTcp: Boolean) -> Unit)? = null,
         // [RELAY-TEST] 1.0.28-中继test 实验参数：(假SSID, 随机密码)。null = 实验关闭。
         relayTestFakeCredential: Pair<String, String>? = null,
         // vc83 中继踢出（攻「iPhone 提前连到中继 WiFi 后 CarPlay 永远连不上」）：
@@ -100,6 +104,14 @@ class Iap2WirelessControlClient(
         // 真交接的隧道路径本来就传 NO_TIMEOUT_MILLIS，这里让「蓝牙承载 iAP2」的降级态行为一致。
         // 退出仍由 socket 关闭（session.isClosed → CHANNEL_CLOSED）驱动，不会泄漏线程。
         deadlineNanos = Long.MAX_VALUE
+
+        // vc250-05：所有「真凭证」0x5703 的唯一出口（relay 恢复 / 凭证重发 / iPhone 请求 /
+        // post-transport）。发送成功才回调；快照必须在 send 之前取，否则会被本轮 TCP 污染。
+        fun sendRealCredential() {
+            val beforeAirPlayTcp = !phoneOnAirPlay()
+            sendRealCredential()
+            onCredentialSent?.invoke(beforeAirPlayTcp)
+        }
 
         var forwardedFrames = 0
         var wifiConfigurationsSent = 0
@@ -236,7 +248,7 @@ class Iap2WirelessControlClient(
                                     "(expect iPhone to leave current AP)",
                             )
                         } else {
-                            send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+                            sendRealCredential()
                             send(carPlayStartSession(endpoint), deadlineNanos)
                             relayTestPhase = 3
                             credentialResendsSent = 0
@@ -268,7 +280,7 @@ class Iap2WirelessControlClient(
                         System.nanoTime() >= resendAt &&
                         !phoneOnAirPlay()
                     ) {
-                        send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+                        sendRealCredential()
                         wifiConfigurationsSent++
                         send(carPlayStartSession(endpoint), deadlineNanos)
                         carPlayStartSessionsSent++
@@ -318,7 +330,7 @@ class Iap2WirelessControlClient(
                                 "iap2 0x5703 ignored: maximum Wi-Fi configuration sends reached",
                             )
                         } else {
-                            send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+                            sendRealCredential()
                             stage = later(
                                 stage,
                                 if (postTransport) {
@@ -385,7 +397,7 @@ class Iap2WirelessControlClient(
                                     "maximum Wi-Fi configuration sends reached",
                             )
                         } else {
-                            send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+                            sendRealCredential()
                             stage = later(
                                 stage,
                                 Iap2WirelessControlStage.POST_TRANSPORT_WIFI_CONFIG_SENT,
@@ -526,7 +538,10 @@ class Iap2WirelessControlClient(
         }
 
         private fun requireRemaining(deadlineNanos: Long): Long = remainingMillis(deadlineNanos).also {
-            if (it == 0L) throw IphoneUsbException.TimedOut("Timed out during wireless iAP2 control bring-up")
+            if (it == 0L) throw IphoneUsbException.TimedOut(
+                "Timed out during wireless iAP2 control bring-up",
+                failureClass = CarPlayFailureClass.Iap2Timeout,
+            )
         }
 
         private fun remainingMillis(deadlineNanos: Long): Long {

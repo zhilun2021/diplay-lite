@@ -11,26 +11,36 @@ import java.util.Locale
  */
 internal object LogRedactor {
 
+    // vc250（VC250-04）：键名 `name=` 收进 group1 一并原样输出，只对值打码（此前 value 组把
+    // 键名也吃进去，打成 `na***#xxxx`）。
     private val NAME_FIELD = Regex(
-        "(?i)(\\s|^)(name=)([^\\r\\n]+?)" +
+        "(?i)((?:\\s|^)name=)([^\\r\\n]+?)" +
             "(?=\\s+(?:deviceId|model|address|localBt|btMac|sole|wifiMac|bssid|ssid|rssi|ip)=" +
             "|\\s*$)",
     )
     private val DEVICE_ID_FIELD = Regex("(?i)(deviceId=)([^\\s,;&\"']+)")
     /**
-     * 设备码落点（2026-11-07 用户拍板：设备码改为**明文蓝牙 MAC**）。
+     * 设备码落点（vc249 用户拍板明文 MAC；vc250 / VC250-02 扩为 **MAC + ROM 指纹**）。
      *
-     * 只放行「设备码」这一处：日志头 `设备码：22:22:37:4D:5C:0D`、启动日志
-     * `设备码 22:22:37:4D:5C:0D（bt=ok）`。做法是先把这处 MAC 换成不可命中的占位符，
-     * 跑完其余脱敏规则后还原——这样**只有设备码保留原文**，同一份日志里其它位置的 MAC
-     * （`btMac=`、`address=`、任何裸 MAC）仍按原规则打码，不会因为这次放开而整份外露。
+     * 只放行「设备码」这一处：日志头 `设备码：22-22-0B-E8-E6-92-t3p1-20181203`、启动日志
+     * `设备码 22-22-0B-E8-E6-92-t3p1-20181203（bt=ok）`。做法是先把这处整串（MAC 段 +
+     * 可选 `-<ROM 指纹>`）换成不可命中的占位符，跑完其余脱敏规则后还原——这样**只有设备码
+     * 保留原文**，同一份日志里其它位置的 MAC（`btMac=`、`address=`、任何裸 MAC）仍按原规则
+     * 打码，不会因为这次放开而整份外露。
+     *
+     * 同时保留 vc249 的冒号纯 MAC 分支：老日志里只有 MAC、没有指纹，按前缀匹配即可对照，
+     * 历史日志不做改写。两种写法都要求到行尾（允许末尾带「（bt=ok）」这类来源标注）。
      *
      * 为什么开这个白名单：用户明确选择明文 MAC 以便与蓝牙清单/路由器记录直接对账；
      * 代价是上传件（日志头 + 日志文件名）含明文 MAC。`deviceId=` 是安装身份（重装即变），
      * 不在放行范围，照常打码。
      */
     private val DEVICE_CODE_MARK = Regex(
-        "(?m)(设备码[：:]?\\s*)((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})" +
+        "(?m)(设备码[：:]?\\s*)" +
+            // VC250-02 新格式：横杠分隔 MAC + 可选 `-<ROM 指纹>`；
+            // 第二分支是 vc249 老日志的冒号纯 MAC，兼容保留。
+            "((?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}(?:-[A-Za-z0-9-]+)?" +
+            "|(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})" +
             // 必须到行尾（允许末尾带「（bt=ok）」这类来源标注）才算设备码落点；
             // 句中顺势写出「设备码 MAC 其他内容」不豁免，避免这条白名单被当成通用漏口。
             "(?=\\s*(?:（[^）]*）)?\\s*$)",
@@ -39,15 +49,17 @@ internal object LogRedactor {
     private const val GUARD_CLOSE = "\u0001"
     private val SSID_FIELD = Regex("(?i)(ssid=)([^\\s,;&\"']+)")
     private val PASSPHRASE_FIELD = Regex("(?i)(passphrase=)([^\\s,;&\"']+)")
+    // vc250（VC250-04）：`=` 收进 group1，键名与等号原样保留（此前等号落在分组外被吞）。
     private val BT_FIELD = Regex(
-        "(?i)(address|localBt|btMac|sole|btaddr)=" +
+        "(?i)((?:address|localBt|btMac|sole|btaddr)=)" +
             "((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{12})",
     )
     private val MAC_GENERIC = Regex("(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
 
     /** 整体脱敏：对上传件正文调用一次即可。 */
     fun redact(text: String): String {
-        // 先给「设备码」落点的 MAC 打上占位符，全量脱敏后再还原（原因见 DEVICE_CODE_MARK 注释）。
+        // 先给「设备码」落点的整串（MAC + 可选 ROM 指纹）打上占位符，全量脱敏后再还原
+        // （原因见 DEVICE_CODE_MARK 注释）。
         val deviceCodes = ArrayList<String>()
         var out = DEVICE_CODE_MARK.replace(text) { match ->
             deviceCodes.add(match.groupValues[2])
@@ -73,7 +85,7 @@ internal object LogRedactor {
                     tag(mac.replace("-", ":").lowercase(Locale.US))
             }
         }
-        // 还原设备码落点的 MAC 原文：整份日志里只有这一处豁免。
+        // 还原设备码落点原文（MAC 段 + 可选 ROM 指纹）：整份日志里只有这一处豁免。
         for (index in deviceCodes.indices) {
             out = out.replace(GUARD_OPEN + index + GUARD_CLOSE, deviceCodes[index])
         }

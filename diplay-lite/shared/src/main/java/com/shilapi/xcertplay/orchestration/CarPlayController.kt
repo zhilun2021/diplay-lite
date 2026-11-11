@@ -20,11 +20,15 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import com.shilapi.xcertplay.CarPlayClassifiedException
+import com.shilapi.xcertplay.CarPlayFailureClass
+import com.shilapi.xcertplay.diag.CarPlayStageLog
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
+import com.shilapi.xcertplay.airplay.AIRPLAY_HANDSHAKE_ZERO_BYTE_TIMEOUT_MILLIS
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.PairingStore
@@ -76,6 +80,7 @@ import com.shilapi.xcertplay.transport.KernelNcmProbe
 import com.shilapi.xcertplay.transport.LockdownCarKitClient
 import com.shilapi.xcertplay.transport.LockdownPairingClient
 import com.shilapi.xcertplay.transport.LockdownPairRecord
+import com.shilapi.xcertplay.carPlayFailureClass
 import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
 import com.shilapi.xcertplay.transport.NcmFunctionDiscovery
 import com.shilapi.xcertplay.transport.NcmUsbBridge
@@ -130,7 +135,13 @@ sealed class CarPlayStatus {
     object Pairing : CarPlayStatus() { override fun toString() = "Pairing" }
     object ConnectingControl : CarPlayStatus() { override fun toString() = "ConnectingControl" }
     object RunningControl : CarPlayStatus() { override fun toString() = "RunningControl" }
-    data class Failed(val message: String) : CarPlayStatus()
+    data class Failed(
+        val message: String,
+        val failureClass: CarPlayFailureClass = CarPlayFailureClass.Unknown,
+    ) : CarPlayStatus() {
+        // vc250：保持既有日志文案（文档按 "Failed(message=...)" 做锚点），不把新字段带进可读输出。
+        override fun toString() = "Failed(message=$message)"
+    }
     // M6k11：iPhone 僵尸会话提示——重试大概率无效，需要用户干预（关开 iPhone 蓝牙）。
     data class RecoveryHint(val message: String) : CarPlayStatus()
 }
@@ -278,7 +289,10 @@ class CarPlayController(
     // 1.0.15：本代 0x5703 实际下发的信道；SESSION_ACTIVE 后写入成功配置记忆。
     @Volatile private var lastAdvertisedHotspotChannel = 0
     private val wirelessGeneration = AtomicInteger(0)
-    private val wirelessConnectionProof = WirelessConnectionProof<AirPlaySession>()
+    // vc250-06：控制面与媒体面拆成两条独立事实。活性判定（看门狗/降级/断流回收）
+    // 只认无线媒体面；控制面（蓝牙 RFCOMM / type-130 隧道）死亡不再等同会话失败。
+    private val wirelessControlProof = ControlProof<AirPlaySession>()
+    private val wirelessMediaProof = MediaProof<AirPlaySession>()
 
     // vc152（微信语音挂断后会话不自愈）：无线控制环 client 引用——run 存活期间可被
     // 会话结束后自动重投逻辑调用 sendCarPlayInvitation()（外部线程直发 0x4301）。
@@ -295,6 +309,12 @@ class CarPlayController(
     // vc202：handoff 请求时刻锚点——SESSION_ACTIVE 附 handoffMs（请求→完成的纯 handoff 段耗时）。
     @Volatile private var wirelessHandoffRequestedAtMs = 0L
     @Volatile private var wirelessRestartEpisodeStartedAtMs = 0L
+    /**
+     * vc250-07：本连接纪元内是否出过画（跨重试粘性）。与 06 的媒体面事实同源（由
+     * onVideoFrameRendered 在 mediaProof 接受该帧时置位），决定快链耗尽后的慢轮节奏：
+     * 出过画=LONG_OUTAGE 走 60s 快慢轮；从未出画=SLOW_FIRST_DISPLAY 保持 5min。
+     */
+    @Volatile private var wirelessRenderedThisEpisode = false
     // M6k11：RFCOMM 连接成功时刻锚点——CSM 打开后 <500ms 被 iPhone 关流（瞬时 EOF）
     // 即归为 IPHONE_ZOMBIE（TS7 实测 3 轮全是 +175ms 秒杀）。
     @Volatile private var wirelessLinkOpenedAtMs = 0L
@@ -554,11 +574,26 @@ class CarPlayController(
     fun isWirelessSessionAlive(): Boolean =
         wirelessActiveReported.get() || wirelessDegradedActive.get() || wirelessEverActive.get()
 
+    /**
+     * vc250-07：出过画事实清零必须可观测。验收靠三条证据互证：
+     * ①同代 `rendered=yes` + `slow-retry cadence kind=long-outage intervalMs=60000`；
+     * ②跨代先见到本行 `reason=...`，随后才是 `kind=slow-first-display intervalMs=300000`；
+     * ③不出现 `rendered=no` 却 `kind=long-outage` 的矛盾组合。
+     * 只清零不打印时，跨代回 5 min 只能从慢轮行反推，故每次清零都留一行（带 was 值）。
+     */
+    private fun resetRenderedEpisode(reason: String) {
+        val was = wirelessRenderedThisEpisode
+        wirelessRenderedThisEpisode = false
+        debugLog("wireless rendered flag reset reason=$reason was=$was")
+    }
+
     fun start() {
         synchronized(this) {
             if (closed) return
         }
         wirelessRetryCount.set(0)
+        // vc250-07：服务侧新起一轮 = 新连接纪元，出过画事实从零开始（打印原因，便于验收）。
+        resetRenderedEpisode("service-recreate")
         // 1.0.10：用户手动重连 = 重新给满 wired 自动重试额度（对齐无线链 M6h 语义）。
         wiredRetryCount.set(0)
         // vc153：启动看门狗重试额度同步给满。
@@ -581,6 +616,8 @@ class CarPlayController(
         if (closed) return
         // M6h：用户手动重连 = 重新给满自动重试额度，否则上一轮用尽的计数会让这次秒失败。
         wirelessRetryCount.set(0)
+        // vc250-07：手动重连视为新连接纪元（同 start()），清零留原因行。
+        resetRenderedEpisode("user-reconnect")
         // 1.0.10：wired 额度同步重置。
         wiredRetryCount.set(0)
         // vc153：启动看门狗重试额度同步重置。
@@ -894,6 +931,27 @@ class CarPlayController(
         }
     }
 
+    /**
+     * vc250（VC248-09）：快链退避额度用尽后的低频续试入口。
+     *
+     * 只调整重试的频率与时机（5min 一轮），不改「连续多次失败即停快链」的既有策略：
+     * 慢轮不复位计数，若仍失败会走到同一个 exhausted 分支，再排下一轮。
+     */
+    private fun scheduleSlowAutoRetry(
+        tag: String,
+        canRun: () -> Boolean = { true },
+        // vc250-07：慢轮间隔可按链路事实分型（无线：出过画 60s / 从未出画 5min），
+        // 默认仍为原 5min，wired 调用点不变。
+        delayMs: Long = AUTO_RETRY_SLOW_INTERVAL_MILLIS,
+        action: () -> Unit,
+    ) {
+        mainHandler.postDelayed({
+            if (closed || !canRun()) return@postDelayed
+            debugLog("$tag slow auto-retry tick after ${delayMs}ms")
+            action()
+        }, delayMs)
+    }
+
     private fun runWireless(generation: Int) {
         try {
             debugLog("wireless bring-up generation=$generation starting")
@@ -913,7 +971,9 @@ class CarPlayController(
                 return
             }
             val startedHotspot = hotspot
-            wirelessConnectionProof.begin(generation) {
+            // vc250-06：热点确认仍要求「控制面鉴权 ∧ 媒体面渲染」，两处交叉判定。
+            wirelessControlProof.begin(generation)
+            wirelessMediaProof.begin(generation) {
                 if (!isStaleWirelessRun(generation)) startedHotspot?.onCarPlayConfirmed()
             }
             val hostAddress = hotspotInfo.hostAddress
@@ -1007,6 +1067,8 @@ class CarPlayController(
                     mfi = mfi,
                     listener = wirelessSessionListener(generation),
                     media = media,
+                    // vc250-08：零字节看门狗只给无线——有线握手正常 < 1 s，加了只增误伤风险。
+                    handshakeIdleTimeoutMillis = AIRPLAY_HANDSHAKE_ZERO_BYTE_TIMEOUT_MILLIS,
                 )
             ) {
                 is AirPlayTcpServer.AttachResult.Started -> {
@@ -1212,6 +1274,10 @@ class CarPlayController(
                 onProgress = ::debugLog,
                 // M6k24（A 方案）：iPhone 一旦发起过 AirPlay TCP 连接就停止凭证重发。
                 phoneOnAirPlay = { (airPlayServer?.acceptedConnectionCount() ?: 0) > 0 },
+                // vc250-05：真凭证 0x5703 下发成功 → summary credential 三态（full/cached）。
+                onCredentialSent = { beforeAirPlayTcp ->
+                    CarPlayStageLog.credentialIssued(beforeAirPlayTcp)
+                },
                 relayTestFakeCredential = relayTestFakeCredential,
                 // vc83：中继模式 2 次重发（~10s）仍 0 TCP 即进入假凭证踢出，
                 // 踢出后 1.5s 恢复真凭证并持续重发（详见 Iap2WirelessControlClient 注释）。
@@ -1236,14 +1302,30 @@ class CarPlayController(
                             "wirelessActive=${wirelessActiveReported.get()}",
                     )
                     if (!wirelessActiveReported.get()) {
+                        // vc250-06：媒体面已成立（确有渲染帧）时，控制面（蓝牙 RFCOMM）断开
+                        // 只降级——不拆栈、不消耗重试、不 Failed；Wi-Fi A/V 继续跑。
+                        if (wirelessMediaProof.hasRenderedFrame(generation)) {
+                            debugLog(
+                                "wireless control plane closed but media is live; " +
+                                    "degrading instead of tearing down " +
+                                    "(handoffRequested=${wirelessHandoffRequested.get()} " +
+                                    "tunnelReady=${wirelessTunnelReady.get()})",
+                            )
+                            completeWirelessHandoffDegraded(
+                                generation,
+                                handoffReason = "control-closed-media-alive",
+                            )
+                            return
+                        }
                         val handoffInProgress = isWirelessHandoffInProgress(
                             handoffRequested = wirelessHandoffRequested.get(),
                             tunnelActive = wirelessTunnelChannel != null,
                             sessionActive = activeSession != null,
                         )
                         if (!handoffInProgress) {
-                            throw IOException(
+                            throw CarPlayClassifiedException(
                                 "Wireless CarPlay control channel closed before tunnel iAP2 ready",
+                                CarPlayFailureClass.TunnelTimeout,
                             )
                         }
                         debugLog(
@@ -1271,7 +1353,20 @@ class CarPlayController(
             if (closed || generation != wirelessGeneration.get()) {
                 return
             }
-            if (wirelessActiveReported.get() && error !is Error) {
+            // vc250-06：媒体面成立时控制面异常（RFCOMM 断/控制环异常）只降级——
+            // 不拆栈、不消耗重试、不 Failed；音视频照常，后续断流由媒体看门狗接管。
+            if (error !is Error && wirelessMediaProof.hasRenderedFrame(generation)) {
+                debugLog(
+                    "wireless control plane failed while media is live: " +
+                        "${error.message}; degrading instead of tearing down",
+                )
+                if (!wirelessActiveReported.get()) {
+                    completeWirelessHandoffDegraded(
+                        generation,
+                        handoffReason = "control-failed-media-alive",
+                    )
+                }
+            } else if (wirelessActiveReported.get() && error !is Error) {
                 debugLog("wireless RFCOMM control ended after tunnel handoff: ${error.message}")
             } else {
                 debugLog("wireless bring-up failed", error)
@@ -1360,6 +1455,26 @@ class CarPlayController(
         if (attempt > MAX_WIRELESS_RETRIES) {
             debugLog("wireless auto-retry exhausted after $MAX_WIRELESS_RETRIES attempts")
             fail(error)
+            // vc250（VC248-09）：快链额度用尽不彻底放弃——低频续试。慢轮不重置计数，
+            // 失败后自然再排下一轮，既覆盖 iPhone 中途上车，也不会把 vc246 压掉的自激环放回来。
+            // vc250-07：按「本纪元是否出过画」分型——LONG_OUTAGE（用户正在用、曾上屏）
+            // 走 4×15s=60s 快慢轮；SLOW_FIRST_DISPLAY（从未上屏）保持 5min，避免空转。
+            val renderedThisEpisode = wirelessRenderedThisEpisode
+            val slowDelayMs = if (renderedThisEpisode) {
+                WIRELESS_RETRY_DELAY_MAX_MILLIS * 4
+            } else {
+                AUTO_RETRY_SLOW_INTERVAL_MILLIS
+            }
+            debugLog(
+                "wireless slow-retry cadence: " +
+                    "kind=${if (renderedThisEpisode) "long-outage" else "slow-first-display"} " +
+                    "intervalMs=$slowDelayMs",
+            )
+            scheduleSlowAutoRetry(
+                "wireless",
+                { phase == Phase.WIRELESS && generation == wirelessGeneration.get() },
+                slowDelayMs,
+            ) { restartWireless() }
             return
         }
         val failureClass = lastWirelessFailureClass ?: wirelessFailureClass(error)
@@ -1481,19 +1596,59 @@ class CarPlayController(
                         Iap2WirelessControlTerminal.TIMED_OUT ->
                             onStatus(CarPlayStatus.ControlEnded)
                         Iap2WirelessControlTerminal.CHANNEL_CLOSED ->
-                            onStatus(CarPlayStatus.Failed("Wireless iAP2 tunnel closed"))
+                            // vc250-06：媒体面成立时隧道（控制面）死亡只降级，
+                            // 不拆栈、不消耗重试、不 Failed。
+                            if (wirelessMediaProof.hasRenderedFrame(generation)) {
+                                debugLog(
+                                    "wireless iAP2 tunnel closed while media is live; " +
+                                        "degrading instead of tearing down",
+                                )
+                                if (!wirelessActiveReported.get()) {
+                                    completeWirelessHandoffDegraded(
+                                        generation,
+                                        handoffReason = "tunnel-closed-media-alive",
+                                    )
+                                }
+                            } else {
+                                onStatus(
+                                    CarPlayStatus.Failed(
+                                        "Wireless iAP2 tunnel closed",
+                                        CarPlayFailureClass.TunnelTimeout,
+                                    ),
+                                )
+                            }
                         // 1.0.29：tunnel 路径未传 phoneOnAirPlay，看门狗不会触发；穷尽分支兜底。
                         Iap2WirelessControlTerminal.AIRPLAY_STALLED ->
-                            onStatus(CarPlayStatus.Failed("Wireless iAP2 tunnel stalled"))
+                            onStatus(
+                                CarPlayStatus.Failed(
+                                    "Wireless iAP2 tunnel stalled",
+                                    CarPlayFailureClass.TunnelTimeout,
+                                ),
+                            )
                     }
                 } catch (error: Throwable) {
                     if (!closed && generation == wirelessGeneration.get()) {
-                        debugLog("tunneled iAP2 control failed", error)
-                        onStatus(
-                            CarPlayStatus.Failed(
-                                error.message ?: error.javaClass.simpleName,
-                            ),
-                        )
+                        // vc250-06：媒体面成立时隧道控制面异常只降级，不 Failed。
+                        if (error !is Error && wirelessMediaProof.hasRenderedFrame(generation)) {
+                            debugLog(
+                                "tunneled iAP2 control failed while media is live: " +
+                                    "${error.message}; degrading instead of tearing down",
+                            )
+                            if (!wirelessActiveReported.get()) {
+                                completeWirelessHandoffDegraded(
+                                    generation,
+                                    handoffReason = "tunnel-failed-media-alive",
+                                )
+                            }
+                        } else {
+                            debugLog("tunneled iAP2 control failed", error)
+                            onStatus(
+                                CarPlayStatus.Failed(
+                                    error.message ?: error.javaClass.simpleName,
+                                    error.carPlayFailureClass(CarPlayFailureClass.TunnelTimeout),
+                                ),
+                            )
+                        }
                     }
                 } finally {
                     if (wirelessTunnelChannel === channel) wirelessTunnelChannel = null
@@ -1510,17 +1665,35 @@ class CarPlayController(
 
     private fun wirelessSessionListener(generation: Int): AirPlaySessionListener =
         object : AirPlaySessionListener by sessionListener {
+            /**
+             * vc250-08：首个 AirPlay TCP accept 即武装 handoff 锚点看门狗。
+             * 旧路径只在 disableBluetooth 时武装，iPhone 只建 TCP 不发该命令时
+             * 永远落不到 SESSION_ACTIVE（僵尸），此处补独立锚点。
+             */
+            override fun onControlConnectionAccepted(session: AirPlaySession) {
+                if (isStaleWirelessRun(generation)) return
+                // vc250-05：TCP 到达事实（含缓存凭证入网），供 summary credential 三态。
+                CarPlayStageLog.airPlayTcpAccepted()
+                debugLog(
+                    "wireless AirPlay TCP accepted; handoff anchor armed " +
+                        "timeout=${WIRELESS_TCP_ANCHOR_TIMEOUT_MILLIS}ms gen=$generation",
+                )
+                armWirelessTcpAnchorWatchdog(generation)
+            }
+
             override fun onSessionActive(session: AirPlaySession) {
                 if (isStaleWirelessRun(generation)) return
                 // vc152：重投成功（自动邀请或 iPhone 自发 0x4300）即撤销邀请定时器。
                 peerEndInvitationArmed.set(false)
-                wirelessConnectionProof.activate(generation, session)
+                wirelessControlProof.activate(generation, session)
+                wirelessMediaProof.activate(generation, session)
                 sessionListener.onSessionActive(session)
             }
 
             override fun onSessionEnded(session: AirPlaySession) {
                 if (isStaleWirelessRun(generation)) return
-                wirelessConnectionProof.end(generation, session)
+                wirelessControlProof.end(generation, session)
+                wirelessMediaProof.end(generation, session)
                 handlePreStreamEof(generation, session)
                 // vc152：本代会话曾激活 + 对端正常结束（微信语音挂断等）→ 自动邀请重投。
                 // 用户断开（disconnect）走整代拆栈 → generation 失配/isStale 已拦。
@@ -1532,8 +1705,15 @@ class CarPlayController(
 
             override fun onVideoFrameRendered(session: AirPlaySession) {
                 if (isStaleWirelessRun(generation) || activeSession !== session) return
-                wirelessConnectionProof.rendered(generation, session)
-                // vc202（竞品 legacy handoff 对照）：已渲染帧 = 已鉴权 AirPlay 帧到达。
+                wirelessMediaProof.rendered(generation, session)
+                // vc250-07：出过画事实（同源媒体面），供慢轮节奏分型。
+                wirelessRenderedThisEpisode = true
+                // vc250-06：媒体面成立；若控制面已鉴权，则补上热点确认（旧 confirmed 语义）。
+                if (wirelessControlProof.hasAuthenticatedControl(generation)) {
+                    wirelessMediaProof.confirm(generation)
+                }
+                // vc202（竞品 legacy handoff 对照）：已渲染帧 = 媒体面成立（vc250-06 拆分后
+                // 这不等同控制面鉴权；控制面是否鉴权另由 wirelessControlProof 记录）。
                 // handoff 已请求但隧道未就绪时立即按 degraded 完成，不再死等 45s 看门狗；
                 // 隧道继续在后台建立（onWirelessTunnelReady → maybeCompleteWirelessHandoff
                 // 走升级分支），不丢隧道。开关关闭则回退 vc201 行为。
@@ -1647,7 +1827,7 @@ class CarPlayController(
     private fun handlePreStreamEof(generation: Int, session: AirPlaySession) {
         if (closed || phase != Phase.WIRELESS || generation != wirelessGeneration.get()) return
         if (wirelessActiveReported.get() || wirelessDegradedActive.get()) return
-        if (wirelessConnectionProof.hasRenderedFrame(generation)) return
+        if (wirelessMediaProof.hasRenderedFrame(generation)) return
         val reason = session.lastCloseReason.lowercase()
         if (!reason.contains("eof") && !reason.contains("decrypt failed")) return
         preStreamEofCount++
@@ -1685,7 +1865,11 @@ class CarPlayController(
         }
         wirelessTunnelReady.set(true)
         wirelessAuthenticated.set(true)
-        wirelessConnectionProof.authenticated(generation)
+        wirelessControlProof.authenticated(generation)
+        // vc250-06：控制面刚鉴权；若媒体面已渲染，补上热点确认（旧 confirmed 语义）。
+        if (wirelessMediaProof.hasRenderedFrame(generation)) {
+            wirelessMediaProof.confirm(generation)
+        }
         debugLog(
             "wireless iAP2 tunnel ready; " +
                 "handoffRequested=${wirelessHandoffRequested.get()}",
@@ -1739,7 +1923,7 @@ class CarPlayController(
      * 野蛮退出 CarPlay 不发 teardown——媒体 UDP 静默死、BT iAP2 心跳仍活、RTSP 会话挂
      * ended=false 傻等 4 分钟+（若 iPhone 走了文明的 teardown 路径，AIRPLAY_STALLED
      * 看门狗已覆盖，无需本机制）。判死依据在媒质层（sink 音视频双静默 20s），回收动作
-     * 在编排层：无线会话激活（正式或降级态）时按链路掉线整代重启，热点保留（M6k24）。
+     * 在编排层：媒体面成立（有渲染帧或已上报 active/degraded）时按链路掉线整代重启，热点保留（M6k24）。
      * 代次护栏防与控制环并发调度竞态；有线会话（WIRELESS 判定天然为假）不受影响。
      */
     fun notifyWirelessMediaStall() {
@@ -1749,7 +1933,13 @@ class CarPlayController(
                 if (closed || phase != Phase.WIRELESS || generation != wirelessGeneration.get()) {
                     return@Thread
                 }
-                if (!wirelessActiveReported.get() && !wirelessDegradedActive.get()) {
+                // vc250-06：活性只看媒体面。旧门槛要求「正式/降级 SESSION_ACTIVE 已上报」，
+                // 而 handoff 未完成时会话既非 active 也非 degraded → 断流后无人回收（僵尸）。
+                if (
+                    !wirelessActiveReported.get() &&
+                    !wirelessDegradedActive.get() &&
+                    !wirelessMediaProof.hasRenderedFrame(generation)
+                ) {
                     return@Thread
                 }
                 // vc201：判活到拆栈必须原子化——双静默回调与 AIRPLAY_STALLED 同帧到达时，
@@ -1807,7 +1997,7 @@ class CarPlayController(
                         // - 已渲染帧：iPhone 已建立 Wi-Fi A/V 但始终未请求 type-130 iAP2 隧道，属合法降级场景，
                         //   不再拆栈/失败，保持「蓝牙 iAP2 控制 + Wi-Fi A/V」继续运行，避免可见重连循环。
                         // - 未渲染帧：会话并未真正建立，走作者逻辑拆栈并 fail。
-                        if (wirelessConnectionProof.hasRenderedFrame(generation)) {
+                        if (wirelessMediaProof.hasRenderedFrame(generation)) {
                             completeWirelessHandoffDegraded(
                                 generation,
                                 handoffReason = "watchdog-timeout",
@@ -1818,7 +2008,10 @@ class CarPlayController(
                         // 直接躺平，而 First TCP 超时靠重连自愈）——与控制环 catch 同款分类：
                         // 先分类留证，再拆栈，可重试族走 RESTART 链；postDelayed 里的
                         // generation 护栏保证控制环并发调度时后到者作废，不会双开新一代。
-                        val error = IOException("Wireless CarPlay handoff timed out")
+                        val error = CarPlayClassifiedException(
+                            "Wireless CarPlay handoff timed out",
+                            CarPlayFailureClass.TunnelTimeout,
+                        )
                         lastWirelessFailureClass = wirelessFailureClass(error)
                         closeWirelessStack()
                         if (isRetryableWirelessFailure(error)) {
@@ -1838,10 +2031,76 @@ class CarPlayController(
     }
 
     /**
+     * vc250-08：交棒看门狗的第二个锚点——首个 AirPlay TCP accept（不再只依赖
+     * disableBluetooth）。iPhone 只建 TCP 不发该命令时，旧路径的 45s handoff 看门狗
+     * 从未装弹，maybeCompleteWirelessHandoff 也无从触发，会话永远落不到
+     * SESSION_ACTIVE；而媒体断供看门狗要求 active/degraded 才回收，断流后无人拆栈
+     * （僵尸）。本看门狗只补「成功收口」：到期已有渲染帧 → 按 degraded 完成（复用
+     * [completeWirelessHandoffDegraded]，不拆栈、不消耗重试，隧道随后补齐仍可升级）。
+     * 未渲染帧只在日志留证，失败收口继续交给既有链（handoff/first-TCP/pre-stream EOF），
+     * 不改既有失败语义。
+     */
+    private fun armWirelessTcpAnchorWatchdog(generation: Int) {
+        // disableBluetooth 已到 → 既有 45s handoff 看门狗接管，避免双收口。
+        if (wirelessHandoffRequested.get()) return
+        mainHandler.postDelayed(
+            {
+                if (
+                    closed ||
+                    phase != Phase.WIRELESS ||
+                    generation != wirelessGeneration.get() ||
+                    wirelessHandoffRequested.get() ||
+                    wirelessActiveReported.get() ||
+                    wirelessDegradedActive.get() ||
+                    wirelessEverActive.get()
+                ) {
+                    return@postDelayed
+                }
+                Thread(
+                    {
+                        if (
+                            closed ||
+                            phase != Phase.WIRELESS ||
+                            generation != wirelessGeneration.get() ||
+                            wirelessHandoffRequested.get() ||
+                            wirelessActiveReported.get() ||
+                            wirelessDegradedActive.get() ||
+                            wirelessEverActive.get()
+                        ) {
+                            return@Thread
+                        }
+                        if (!wirelessMediaProof.hasRenderedFrame(generation)) {
+                            debugLog(
+                                "wireless handoff anchor: TCP up ${WIRELESS_TCP_ANCHOR_TIMEOUT_MILLIS}ms " +
+                                    "without disableBluetooth or rendered frame; " +
+                                    "leaving recovery to existing chains gen=$generation",
+                            )
+                            return@Thread
+                        }
+                        debugLog(
+                            "wireless handoff anchor: frames rendered but no disableBluetooth " +
+                                "within ${WIRELESS_TCP_ANCHOR_TIMEOUT_MILLIS}ms; " +
+                                "completing degraded reason=tcp-anchor gen=$generation",
+                        )
+                        completeWirelessHandoffDegraded(generation, handoffReason = "tcp-anchor")
+                    },
+                    "xcertplay-wireless-tcp-anchor",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
+            },
+            WIRELESS_TCP_ANCHOR_TIMEOUT_MILLIS,
+        )
+    }
+
+    /**
      * degraded 完成 handoff 的共用收口（原 watchdog 内联块抽出，vc202）。
      * 语义不变：保留蓝牙 iAP2 + Wi-Fi A/V，不补 type-130 隧道；先置位再上报防竞态。
-     * [handoffReason] 落 SESSION_ACTIVE 日志（airplay-frame=已鉴权帧提前判据 /
-     * watchdog-timeout=45s 看门狗兜底），供外测直接区分完成路径与耗时。
+     * [handoffReason] 落 SESSION_ACTIVE 日志（airplay-frame=已渲染帧提前判据 /
+     * watchdog-timeout=45s 看门狗兜底 / tcp-anchor=首个 TCP accept 锚点兜底 /
+     * control-closed-media-alive、control-failed-media-alive、tunnel-closed-media-alive、
+     * tunnel-failed-media-alive=vc250-06 控制面死亡但媒体面存活），供外测区分完成路径与耗时。
      */
     private fun completeWirelessHandoffDegraded(generation: Int, handoffReason: String) {
         // M6g：先置位再上报，避免与控制环超时分支/提前判据并发双发。
@@ -1975,6 +2234,7 @@ class CarPlayController(
                                                 "(stale mDNS cache / Wi-Fi not joined / AP isolation)"
                                         }),
                                     ),
+                                    CarPlayFailureClass.CredTimeout,
                                 )
                             },
                             "xcertplay-first-tcp-timeout",
@@ -2380,10 +2640,11 @@ class CarPlayController(
         }
         // vc186：失败原因不再吞——保留 "RFCOMM connect failed" 前缀以兼容既有失败分类，
         // 附带各轮摘要与立败/超时计数（App 层据此分级文案），cause 保留原异常。
-        val failure = IOException(
+        val failure = CarPlayClassifiedException(
             "RFCOMM connect failed after $RFCOMM_ROUNDS rounds" +
                 " (fastFail=$fastFailures, timeout=$timeouts)" +
                 (if (attempts.isNotEmpty()) ": " + attempts.joinToString(" | ") else ""),
+            CarPlayFailureClass.BtNoResponse,
             lastFailure,
         )
         // 全轮失败：最终再探一次，坐实"服务仍在广播但框架 SDP 建不了链"
@@ -2637,7 +2898,8 @@ class CarPlayController(
     }
 
     private fun closeWirelessStack(keepHotspotForReuse: Boolean = false) {
-        wirelessConnectionProof.clear()
+        wirelessControlProof.clear()
+        wirelessMediaProof.clear()
         wirelessLinkOpenedAtMs = 0L
 
         // 断链顺序（M6k8 调整）：**先下线 Bonjour 广报**（NsdManager unregisterService /
@@ -2809,6 +3071,13 @@ class CarPlayController(
                 "wired iPhone discovered vid=0x${device.vendorId.toString(16)} " +
                     "pid=0x${device.productId.toString(16)}",
             )
+            // vc250：USB 枚举侧直接打点（只带 VID/PID，不带序列号/MAC）。
+            CarPlayStageLog.stage(
+                "usb-enum",
+                "iphone discovered vid=0x%04x pid=0x%04x role=iphone".format(
+                    device.vendorId, device.productId,
+                ),
+            )
             availabilityPollGeneration.incrementAndGet()
             // vc96：恢复发现后复位黑等取证状态（计数/计时/提示），下一轮断链重新计。
             waitingSnapshotCount = 0
@@ -2833,11 +3102,24 @@ class CarPlayController(
             when (val request = host.requestPermission(device)) {
                 is IphoneUsbHost.PermissionRequest.AlreadyGranted -> {
                     debugLog("wired iPhone USB permission already granted")
+                    // vc250：权限侧直接打点。
+                    CarPlayStageLog.stage(
+                        "permission",
+                        "already-granted vid=0x%04x pid=0x%04x".format(
+                            request.device.vendorId, request.device.productId,
+                        ),
+                    )
                     permissionGrant.set(false)
                     onIphonePermission(IphoneUsbHost.PermissionResult.Granted(request.device))
                 }
                 is IphoneUsbHost.PermissionRequest.Requested -> {
                     debugLog("wired iPhone USB permission requested")
+                    CarPlayStageLog.stage(
+                        "permission",
+                        "requested vid=0x%04x pid=0x%04x".format(
+                            request.device.vendorId, request.device.productId,
+                        ),
+                    )
                     permissionGrant.set(false)
                     onStatus(CarPlayStatus.RequestingIphonePermission)
                     pollIphonePermission(device)
@@ -2854,6 +3136,12 @@ class CarPlayController(
                 // The system broadcast and the polling fallback can both observe the grant.
                 if (!permissionGrant.compareAndSet(false, true)) return
                 debugLog("wired iPhone USB permission granted")
+                CarPlayStageLog.stage(
+                    "permission",
+                    "granted vid=0x%04x pid=0x%04x".format(
+                        result.device.vendorId, result.device.productId,
+                    ),
+                )
                 permissionPollGeneration += 1
                 when (phase) {
                     Phase.REENUMERATION, Phase.IPHONE -> {
@@ -2923,6 +3211,12 @@ class CarPlayController(
             }
             is IphoneUsbHost.PermissionResult.Denied -> {
                 permissionGrant.set(true)
+                CarPlayStageLog.stage(
+                    "permission",
+                    "denied vid=0x%04x pid=0x%04x".format(
+                        result.device.vendorId, result.device.productId,
+                    ),
+                )
                 onStatus(CarPlayStatus.Failed("iPhone USB permission was denied"))
             }
         }
@@ -2942,6 +3236,12 @@ class CarPlayController(
                 }
                 if (System.nanoTime() >= deadlineNanos) {
                     if (permissionGrant.compareAndSet(false, true)) {
+                        CarPlayStageLog.stage(
+                            "permission",
+                            "timeout vid=0x%04x pid=0x%04x".format(
+                                device.vendorId, device.productId,
+                            ),
+                        )
                         onStatus(
                             CarPlayStatus.Failed(
                                 "iPhone USB permission was not granted; tap Reconnect iPhone to retry",
@@ -3487,6 +3787,8 @@ class CarPlayController(
             if (attempt > MAX_WIRED_RETRIES) {
                 debugLog("wired auto-retry exhausted after $MAX_WIRED_RETRIES attempts")
                 onStatus(CarPlayStatus.ControlEnded)
+                // vc250（VC248-09）：额度用尽后转 5min 低频续试；用户已转无线时不抢占。
+                scheduleSlowAutoRetry("wired", { phase != Phase.WIRELESS }) { startIphone() }
                 return
             }
             // 1.0.29：楔死类分流——0x4301 已发但 iPhone 零流帧（watchdog 关桥或自然断链均落到此形态）
@@ -3550,6 +3852,7 @@ class CarPlayController(
                 if (attempt > MAX_WIRED_RETRIES) {
                     debugLog("wired usbmux-version-timeout auto-retry exhausted")
                     onStatus(CarPlayStatus.ControlEnded)
+                    scheduleSlowAutoRetry("wired", { phase != Phase.WIRELESS }) { startIphone() }
                     return
                 }
                 onStatus(
@@ -3595,6 +3898,7 @@ class CarPlayController(
                 if (attempt > MAX_WIRED_RETRIES) {
                     debugLog("wired usbmux-reset auto-retry exhausted")
                     onStatus(CarPlayStatus.ControlEnded)
+                    scheduleSlowAutoRetry("wired", { phase != Phase.WIRELESS }) { startIphone() }
                     return
                 }
                 val delayMs = minOf(WIRED_RETRY_DELAY_BASE_MILLIS * attempt, WIRED_RETRY_DELAY_MAX_MILLIS)
@@ -3675,6 +3979,8 @@ class CarPlayController(
                 mfi = mfi,
                 listener = sessionListener,
                 media = media,
+                // vc250-08：USB bootstrap 走无线引导（Iap2WirelessControlClient），同属无线链路。
+                handshakeIdleTimeoutMillis = AIRPLAY_HANDSHAKE_ZERO_BYTE_TIMEOUT_MILLIS,
             )
         ) {
             is AirPlayTcpServer.AttachResult.Started -> {
@@ -4383,12 +4689,17 @@ class CarPlayController(
         type.equals("disableBluetooth", ignoreCase = true) ||
             type.equals("disable-bluetooth", ignoreCase = true)
 
-    private fun fail(error: Throwable) {
+    private fun fail(error: Throwable, failureClass: CarPlayFailureClass = CarPlayFailureClass.Unknown) {
         if (closed) return
         // M6k11：重连链终结后清掉僵尸模式，防止污染用户下一次手动重连的退避策略。
         wirelessZombieMode = false
         lastWirelessFailureClass = null
-        onStatus(CarPlayStatus.Failed(error.message ?: error.javaClass.simpleName))
+        val resolved = if (failureClass != CarPlayFailureClass.Unknown) {
+            failureClass
+        } else {
+            error.carPlayFailureClass()
+        }
+        onStatus(CarPlayStatus.Failed(error.message ?: error.javaClass.simpleName, resolved))
     }
 
     private fun debugLog(message: String) {
@@ -4501,6 +4812,12 @@ class CarPlayController(
         private const val CONTROL_LOOP_TIMEOUT_MILLIS = 5 * 60_000L
         private const val LOCATION_CONTROL_LOOP_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L
+        /**
+         * vc250-08：TCP 锚点看门狗窗口。与 handoff 看门狗同量级——从首个 AirPlay
+         * TCP accept 起算，超时仍无 disableBluetooth 且已有渲染帧即按 degraded 完成。
+         * 取 45s 不抢在正常 handoff 路径（同样 45s、但以 disableBluetooth 为起点）之前。
+         */
+        private const val WIRELESS_TCP_ANCHOR_TIMEOUT_MILLIS = 45_000L
         // M6k20：first-TCP 看门狗超时。vc83 30s→60s：082530 日志实证热点直连模式 iPhone
         // 实际入网 39s（0x5703 首发→pair-setup），30s 判死差 9s；60s 覆盖慢入网，
         // fire 后仍有 35s 宽限复查兜底（总上限 60+35=95s）。
@@ -4532,6 +4849,8 @@ class CarPlayController(
         private const val MAX_WIRELESS_RETRIES = 5
         private const val WIRELESS_RETRY_DELAY_BASE_MILLIS = 4_000L
         private const val WIRELESS_RETRY_DELAY_MAX_MILLIS = 15_000L
+        // vc250（VC248-09）：快链退避额度用尽后的低频续试间隔（车机常电 / iPhone 中途上车）。
+        private const val AUTO_RETRY_SLOW_INTERVAL_MILLIS = 5 * 60 * 1000L
         // 1.1.4（B 方案）：残留会话打断轮的最小全断窗口（蓝牙+热点），实测 17s 内可重连成功。
         private const val STALE_SESSION_BOUNCE_DELAY_MILLIS = 8_000L
         // 1.0.10：wired peer 断链自动重试（与无线链同款退避节奏，API16 安全原语）。

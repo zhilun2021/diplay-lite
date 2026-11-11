@@ -27,7 +27,7 @@ import javax.net.ssl.SSLContext
  *
  * 命名（截图字段为准）：
  * `dongle-<yyyyMMdd>-<HHmmss>-<设备码>-Android<ver>-api<SDK>-v<version>_<vc>-<model>.txt`
- * 例：dongle-20261101-115212-22:22:37:4D:5C:0D-Android14-api34-v1.3.0_vc207-23013RK75C.txt
+ * 例：dongle-20261101-115212-22-22-0B-E8-E6-92-t3p1-20181203-Android14-api34-v1.3.0_vc207-23013RK75C.txt
  */
 object DongleLogUploader {
     private const val MAX_BYTES = 512 * 1024
@@ -77,7 +77,7 @@ object DongleLogUploader {
         val header = buildString {
             append("dongle 连接日志（外置 USB 蓝牙）\n\n")
             append("设备：").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n")
-            // 设备码是明文蓝牙 MAC（用户拍板），多台同型号车机靠它归机，便于与蓝牙清单对账。
+            // 设备码是明文蓝牙 MAC + ROM 指纹（VC250-02），多台同型号/同 MAC 车机靠它归机，便于与蓝牙清单对账。
             append("设备码：").append(deviceCode).append("\n")
             append("系统版本：Android").append(Build.VERSION.RELEASE)
                 .append("（api ").append(Build.VERSION.SDK_INT).append("）\n")

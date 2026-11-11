@@ -2,6 +2,8 @@ package com.shilapi.xcertplay.usbbt
 
 import android.content.Context
 import android.util.Log
+import com.shilapi.xcertplay.CarPlayClassifiedException
+import com.shilapi.xcertplay.CarPlayFailureClass
 import com.shilapi.xcertplay.diag.AnchorLog
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 
@@ -268,8 +270,14 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 val deadline = System.currentTimeMillis() + linkTimeoutMillis
                 while (true) {
                     when (readyHost.phase) {
-                        UsbBtHost.Phase.FAILED -> fail("建链失败：${readyHost.statusText}")
-                        UsbBtHost.Phase.STOPPED -> fail("dongle 已停止")
+                        UsbBtHost.Phase.FAILED -> fail(
+                            "建链失败：${readyHost.statusText}",
+                            readyHost.failureClass,
+                        )
+                        UsbBtHost.Phase.STOPPED -> fail(
+                            "dongle 已停止",
+                            CarPlayFailureClass.Unknown,
+                        )
                         else -> Unit
                     }
                     val remain = deadline - System.currentTimeMillis()
@@ -387,9 +395,12 @@ class UsbBtBootstrapStream private constructor() : BlockingDuplexByteStream {
                 "未收到 iPhone 响应：请确认手机蓝牙已开启，并在蓝牙列表中点选本机"
         }
 
-        private fun fail(reason: String): Nothing {
+        private fun fail(
+            reason: String,
+            failureClass: CarPlayFailureClass = CarPlayFailureClass.BtNoResponse,
+        ): Nothing {
             status(reason)
-            throw java.io.IOException(reason)
+            throw CarPlayClassifiedException(reason, failureClass)
         }
     }
 }

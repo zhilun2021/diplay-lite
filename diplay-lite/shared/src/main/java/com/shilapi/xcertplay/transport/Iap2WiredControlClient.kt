@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import com.shilapi.xcertplay.CarPlayFailureClass
 import com.shilapi.xcertplay.iap2.message.Iap2CarPlayMessages
 import com.shilapi.xcertplay.iap2.message.Iap2ControlMessages
 import com.shilapi.xcertplay.iap2.session.Iap2Session
@@ -273,7 +274,10 @@ class Iap2WiredControlClient(
         }
 
         private fun requireRemaining(deadlineNanos: Iap2ControlDeadline): Long = remainingMillis(deadlineNanos).also {
-            if (it == 0L) throw IphoneUsbException.TimedOut("Timed out during wired iAP2 control bring-up")
+            if (it == 0L) throw IphoneUsbException.TimedOut(
+                "Timed out during wired iAP2 control bring-up",
+                failureClass = CarPlayFailureClass.Iap2Timeout,
+            )
         }
 
         private fun remainingMillis(deadlineNanos: Iap2ControlDeadline): Long = deadlineNanos.remainingMillis()

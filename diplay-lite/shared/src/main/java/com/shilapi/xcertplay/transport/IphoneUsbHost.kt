@@ -15,6 +15,7 @@ import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbRequest
 import android.os.Build
 import android.util.Log
+import com.shilapi.xcertplay.CarPlayFailureClass
 import java.io.Closeable
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -489,6 +490,7 @@ class IphoneUsbHost(
             if (!connection.claimInterface(usbMux, true)) {
                 throw IphoneUsbException.DeviceUnavailable(
                     "Android could not claim USBMUX interface ${usbMux.id} (attempt#$attempt)",
+                    failureClass = CarPlayFailureClass.ClaimBusy,
                 )
             }
             report("attempt#$attempt usbmux interface claimed")

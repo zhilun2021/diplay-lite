@@ -569,6 +569,8 @@ class WifiP2pGroupManager(
                 hostAddress = hostAddress,
                 bandLabel = band,
                 backend = WirelessHotspotBackend.WIFI_P2P,
+                channelSource = "p2p-group",
+                frequencySource = "p2p-group",
             )
         }
     }

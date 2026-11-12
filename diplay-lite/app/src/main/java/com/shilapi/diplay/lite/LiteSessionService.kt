@@ -14,6 +14,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Base64
@@ -315,6 +316,9 @@ class LiteSessionService : Service() {
         // vc250-03：兜底——连接中直接 stopService（未走到状态机终态）也要出汇总；幂等不会重复。
         LiteLog.endSession()
         LiteLog.log("service", "会话服务已停止")
+        // vc255：这一行是下一次启动时 classifyPreviousSession 判 clean 的唯一依据，
+        // 停在 8 条批量缓冲里会让正常退出被误判成 abnormal——写完立刻落盘再销毁。
+        LiteLog.flushNow()
         current = null
         super.onDestroy()
     }
@@ -446,6 +450,9 @@ class LiteSessionService : Service() {
                 "mode=${am.mode} scoOn=${am.isBluetoothScoOn} a2dpOn=${am.isBluetoothA2dpOn} " +
                     "wiredHeadset=${am.isWiredHeadsetOn} speakerphoneOn=${am.isSpeakerphoneOn}"
             },
+            // vc253（出画后掉帧取证）：Wi-Fi 侧只读快照——首帧后 60s 内并入 video stats 行，
+            // 用于区分「编码侧降档」与「射频侧丢包」，不参与任何连接判断。
+            networkDiagnostics = { wifiLinkSnapshot() },
             // 1.1.5/e5t1(vc85)：麦克风静音位检查/自动恢复——EU5 QG DSP 仲裁链可能在
             // Android 层留 mute 位（setMicMute 全栈无错可报），上行启动前检测并解除。
             microphoneMuteRestore = {
@@ -1048,6 +1055,36 @@ class LiteSessionService : Service() {
             LiteLog.log("media", "通话声音路由设置失败 active=$active speakerRouted=$speakerRouted ${error.message}")
         }
     }
+
+    /**
+     * vc253（出画后掉帧取证）：STA 侧只读可观测项（RSSI / link speed / 频点 / 本机 IP）。
+     *
+     * vc256：这里读的是 `WifiManager.getConnectionInfo()`，即车机作为 STA 连外部路由
+     * （如「7205」2.4G）的链路，与 CarPlay 热点无关；video stats 里以 `sta=` 前缀落盘，
+     * 只用于区分「编码侧降档」与「射频侧丢包」，不要当作 CarPlay 链路质量。
+     * 只调读接口，不发起扫描、不改连接判断；取不到的值写 "?"，异常只落类名。
+     */
+    private fun wifiLinkSnapshot(): String {
+        val wifi = getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return "wm=unavailable"
+        return try {
+            val info = wifi.connectionInfo ?: return "wm=no-info"
+            val rssi = info.rssi
+            val linkSpeed = info.linkSpeed
+            val frequency =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) info.frequency else 0
+            "rssi=${if (rssi in -120..0) "${rssi}dBm" else "?"} " +
+                "link=${if (linkSpeed > 0) "${linkSpeed}Mbps" else "?"} " +
+                "freq=${if (frequency > 0) "${frequency}MHz" else "?"} " +
+                "ip=${ipv4Text(info.ipAddress)}"
+        } catch (error: Throwable) {
+            "wm-error=${error.javaClass.simpleName}"
+        }
+    }
+
+    private fun ipv4Text(value: Int): String =
+        "${(value shr 24) and 0xff}.${(value shr 16) and 0xff}." +
+            "${(value shr 8) and 0xff}.${value and 0xff}"
 
     @Suppress("DEPRECATION")
     private fun screenMetrics(): Pair<Int, Int> {

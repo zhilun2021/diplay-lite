@@ -18,12 +18,14 @@ import com.shilapi.xcertplay.orchestration.ManualHotspotBand
 import com.shilapi.xcertplay.orchestration.ManualHotspotSecurity
 import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import java.io.IOException
+import java.lang.reflect.Proxy
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.SocketException
 import java.util.Collections
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 
 /**
@@ -58,6 +60,9 @@ class ManualHotspotManager(
     @Volatile
     private var closed = false
 
+    /** vc256：SoftApCallback 探针（API30+ 反射注册；不可用时 status 记原因，不影响连接）。 */
+    private var softApProbe: SoftApCallbackProbe? = null
+
     init {
         require(expectedSsid.isNotBlank()) { "ssid must not be blank" }
         require('\u0000' !in expectedSsid) { "ssid must not contain U+0000" }
@@ -81,6 +86,11 @@ class ManualHotspotManager(
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
 
         val deadlineNanos = deadlineAfter(timeoutMillis)
+        if (softApProbe == null) {
+            softApProbe = SoftApCallbackProbe(appContext, wifiManager, onDiagnostic).also {
+                it.register()
+            }
+        }
         val apConfiguration = readApConfiguration()
         if (apConfiguration != null && apConfiguration.ssid != expectedSsid) {
             throw IOException(
@@ -97,36 +107,74 @@ class ManualHotspotManager(
             if (localInterface != null) {
                 val connectionFrequency = frequencyFromConnectionInfo()
                 val scanFrequency = frequencyFromScanResult(localInterface)
-                val observedChannel = observedManualHotspotChannel(
+                // vc256：SoftApCallback 的 onInfoChanged 给出热点真实频点（K60 实测 5745MHz），
+                // 拿不到才退回其它观测源；所有来源都空时 channel=0，不再猜 6。
+                val softApFrequency = softApProbe?.frequencyMHz
+                    ?: awaitSoftApFrequency(softApProbe, SOFT_AP_CALLBACK_WAIT_MILLIS)
+                val observation = observeManualHotspotChannel(
                     apChannel = apConfiguration?.channel ?: 0,
+                    softApFrequencyMHz = softApFrequency,
                     connectionFrequencyMHz = connectionFrequency,
                     scanFrequencyMHz = scanFrequency,
                     apFrequencyMHz = apConfiguration?.frequencyMHz,
                 )
-                // 实测读不到信道时（C8815/nova3e 的 4.x / 9 ROM 在 AP 模式下既拿不到
-                // scanResults、也读不到 apChannel）退回用户手填的信道——UI 的信道栏本就为
-                // 此准备（“留空自动实测，失败请手填”）；否则会永远下发 channel=0。
-                // 1.0.13：观测信道吸附到标准信道（2.4G→1/6/11，5G→36/44/149/157）；
                 // 1.0.15：观测/手填都没有时，优先复用上次会话成功确认过的信道
-                // （ConfirmedChannelMemory），最后才兜底猜 6。
-                val channel = when {
-                    observedChannel > 0 -> snapHotspotChannel(observedChannel)
-                    expectedChannel > 0 -> snapHotspotChannel(expectedChannel)
-                    else ->
-                        ConfirmedChannelMemory.recall(appContext, ConfirmedChannelMemory.ROLE_CAR)
+                // （ConfirmedChannelMemory）；仍然没有就发 0（未知），由 0x4301 省略该字段。
+                val channel: Int
+                val channelSource: String
+                when {
+                    observation.channel > 0 -> {
+                        channel = snapHotspotChannel(observation.channel)
+                        channelSource = observation.source
+                    }
+                    expectedChannel > 0 -> {
+                        channel = snapHotspotChannel(expectedChannel)
+                        channelSource = "user-config"
+                    }
+                    else -> {
+                        val recalled = ConfirmedChannelMemory
+                            .recall(appContext, ConfirmedChannelMemory.ROLE_CAR)
                             .takeIf { it > 0 }
-                            ?: 6
+                        channel = if (recalled != null) snapHotspotChannel(recalled) else 0
+                        channelSource = if (recalled != null) "memory" else "unknown"
+                    }
                 }
-                val frequencyMHz = when {
-                    apConfiguration?.frequencyMHz != null -> apConfiguration.frequencyMHz
-                    connectionFrequency != null -> connectionFrequency
-                    scanFrequency != null -> scanFrequency
-                    else -> null
+                val frequencyMHz: Int?
+                val frequencySource: String
+                when {
+                    softApFrequency != null -> {
+                        frequencyMHz = softApFrequency
+                        frequencySource = "softap-callback"
+                    }
+                    apConfiguration?.frequencyMHz != null -> {
+                        frequencyMHz = apConfiguration.frequencyMHz
+                        frequencySource = "ap-config"
+                    }
+                    connectionFrequency != null -> {
+                        frequencyMHz = connectionFrequency
+                        frequencySource = "sta-connection"
+                    }
+                    scanFrequency != null -> {
+                        frequencyMHz = scanFrequency
+                        frequencySource = "scan"
+                    }
+                    else -> {
+                        frequencyMHz = null
+                        frequencySource = "unknown"
+                    }
                 }
                 val security = apConfiguration?.security ?: expectedSecurity
+                // vc256：配置值/观测值/实际下发值分开标注，去掉没有依据的数值。
                 onDiagnostic("Manual hotspot configReadable=${apConfiguration != null} " +
-                    "security=$security channelKnown=${observedChannel > 0} " +
-                    "observed=$observedChannel advertised=$channel " +
+                    "security=$security " +
+                    "configChannel=${channelText(apConfiguration?.channel ?: 0)} " +
+                    "expectedChannel=${channelText(expectedChannel)} " +
+                    "observedChannel=${channelText(observation.channel)} " +
+                    "observedSource=${observation.source} " +
+                    "sendChannel=${channelText(channel)} " +
+                    "sendChannelSource=$channelSource " +
+                    "softApCallback=${softApProbe?.status ?: "off"} " +
+                    "softApFrequency=${softApFrequency?.let { "${it}MHz" } ?: "unknown"} " +
                     "hardwareAddressKnown=${localInterface.hardwareAddress != null} iface=${localInterface.name} " +
                     "ipv4Preferred=$preferIpv4 " +
                     "family=${if (localInterface.hostAddress is Inet6Address) "IPv6" else "IPv4"}")
@@ -143,12 +191,17 @@ class ManualHotspotManager(
                     )
                 }
 
-                if (observedChannel == 0) {
+                if (observation.channel == 0 && channel == 0) {
                     Log.w(
                         TAG,
                         "Could not read the active hotspot channel from Android public APIs; " +
-                            "advertising $channel" +
-                            if (channel > 0) " (best guess)" else " (auto)",
+                            "0x4301 channel field will be omitted (iPhone scans all channels)",
+                    )
+                } else if (observation.channel == 0) {
+                    Log.w(
+                        TAG,
+                        "Active hotspot channel was not observable; using $channel " +
+                            "(source=$channelSource)",
                     )
                 }
                 val observedBandLabel = wifiBandLabel(apConfiguration?.band)
@@ -168,6 +221,8 @@ class ManualHotspotManager(
                             frequencyMHz?.let(::bandLabel) ?: observedBandLabel ?: "Auto"
                     },
                     backend = WirelessHotspotBackend.MANUAL_HOTSPOT,
+                    channelSource = channelSource,
+                    frequencySource = frequencySource,
                 )
             }
 
@@ -184,6 +239,8 @@ class ManualHotspotManager(
 
     override fun close() {
         closed = true
+        softApProbe?.unregister()
+        softApProbe = null
     }
 
     private fun validateApConfiguration(configuration: ManualApConfiguration?) {
@@ -529,6 +586,25 @@ class ManualHotspotManager(
     private fun remainingNanos(deadlineNanos: Long): Long =
         (deadlineNanos - System.nanoTime()).coerceAtLeast(0L)
 
+    /** 0 表示未知：日志显示 auto，0x4301 里直接省略该字段，不再输出猜测值。 */
+    private fun channelText(value: Int): String = if (value > 0) value.toString() else "auto"
+
+    /**
+     * 等 SoftApCallback 的首个 onInfoChanged（最多 [maxMillis]）。
+     * 只有已注册且尚无频点时才等；API<30 / 注册失败立即返回 null，不增加耗时。
+     */
+    private fun awaitSoftApFrequency(probe: SoftApCallbackProbe?, maxMillis: Long): Int? {
+        probe ?: return null
+        probe.frequencyMHz?.let { return it }
+        if (!probe.registered) return null
+        val deadline = deadlineAfter(maxMillis)
+        while (remainingNanos(deadline) > 0L) {
+            sleep(minOf(remainingNanos(deadline), SOFT_AP_CALLBACK_POLL_NANOS))
+            probe.frequencyMHz?.let { return it }
+        }
+        return null
+    }
+
     private class ManualApConfiguration(
         val ssid: String,
         val band: Int?,
@@ -547,7 +623,10 @@ class ManualHotspotManager(
     private companion object {
         const val TAG = "xcertplay-usb"
         const val NANOS_PER_MILLISECOND = 1_000_000L
+        /** vc256：等待 SoftApCallback 首个频点的上限（热点已在运行、回调可能不重放时）。 */
+        const val SOFT_AP_CALLBACK_WAIT_MILLIS = 600L
         val INTERFACE_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(250)
+        val SOFT_AP_CALLBACK_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(100)
         val EXCLUDED_INTERFACE_PREFIXES = listOf(
             "lo",
             "dummy",
@@ -567,6 +646,102 @@ private fun ManualHotspotSecurity.toIap2Security(): Iap2WirelessSecurity = when 
     ManualHotspotSecurity.WPA2 -> Iap2WirelessSecurity.WPA_WPA2
     ManualHotspotSecurity.WPA3_TRANSITION -> Iap2WirelessSecurity.WPA3_TRANSITION
     ManualHotspotSecurity.WPA3 -> Iap2WirelessSecurity.WPA3_ONLY
+}
+
+/**
+ * vc256：读取热点真实频点的 SoftApCallback 探针。
+ *
+ * `registerSoftApCallback` / `SoftApInfo` 都是 API 30+，minSdk 16 不能静态引用（NewApi 必须 0）；
+ * `SoftApCallback` 是框架接口，业务侧无法直接实现，只能经 `Proxy` 动态代理。整条路径反射，
+ * 失败只把原因写进诊断行，绝不阻断连接。
+ */
+private class SoftApCallbackProbe(
+    private val context: Context,
+    private val wifiManager: WifiManager,
+    private val onDiagnostic: (String) -> Unit,
+) {
+    @Volatile
+    var frequencyMHz: Int? = null
+        private set
+
+    /** unsupported（API<30）/ not-registered / registered / failed:<异常类名>。 */
+    @Volatile
+    var status: String = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        "not-registered"
+    } else {
+        "unsupported"
+    }
+        private set
+
+    val registered: Boolean get() = status == "registered"
+
+    private var proxy: Any? = null
+    private var callbackType: Class<*>? = null
+
+    @SuppressLint("PrivateApi")
+    fun register() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        try {
+            val type = Class.forName("android.net.wifi.WifiManager\$SoftApCallback")
+            callbackType = type
+            val created = Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { _, method, args ->
+                when (method.name) {
+                    "onInfoChanged", "onConnected", "onDisconnected" ->
+                        args?.firstOrNull { it?.javaClass?.name == "android.net.wifi.SoftApInfo" }
+                            ?.let(::readFrequency)
+                    else -> Unit
+                }
+                null
+            }
+            val executor = Executor { command -> command.run() }
+            WifiManager::class.java
+                .getMethod("registerSoftApCallback", Executor::class.java, type)
+                .invoke(wifiManager, executor, created)
+            proxy = created
+            status = "registered"
+        } catch (error: Throwable) {
+            // 反射调用会把被调方异常包成 InvocationTargetException，诊断必须打印真实 cause
+            // （例如 SecurityException 会点名缺哪个权限），否则都只剩一句 null。
+            val cause = (error as? java.lang.reflect.InvocationTargetException)?.targetException ?: error
+            status = "failed:${cause.javaClass.simpleName}"
+            onDiagnostic(
+                "Manual hotspot SoftApCallback unavailable: " +
+                    "${cause.javaClass.name}: ${cause.message} " +
+                    "(fineLocation=${permissionGranted(android.Manifest.permission.ACCESS_FINE_LOCATION)} " +
+                    "nearbyWifi=${permissionGranted("android.permission.NEARBY_WIFI_DEVICES")})",
+            )
+        }
+    }
+
+    fun unregister() {
+        val created = proxy ?: return
+        val type = callbackType ?: return
+        proxy = null
+        try {
+            WifiManager::class.java.getMethod("unregisterSoftApCallback", type)
+                .invoke(wifiManager, created)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun readFrequency(info: Any) {
+        val mhz = try {
+            (info.javaClass.getMethod("getFrequency").invoke(info) as? Number)?.toInt()
+        } catch (_: Throwable) {
+            null
+        } ?: return
+        if (mhz > 0) {
+            frequencyMHz = mhz
+            status = "registered"
+        }
+    }
+
+    private fun permissionGranted(permission: String): Boolean = try {
+        context.packageManager.checkPermission(permission, context.packageName) ==
+            PackageManager.PERMISSION_GRANTED
+    } catch (_: Throwable) {
+        false
+    }
 }
 
 /**

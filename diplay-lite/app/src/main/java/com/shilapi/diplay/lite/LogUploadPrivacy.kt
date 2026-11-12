@@ -48,6 +48,19 @@ internal object LogRedactor {
     private const val GUARD_OPEN = "\u0001dc"
     private const val GUARD_CLOSE = "\u0001"
     private val SSID_FIELD = Regex("(?i)(ssid=)([^\\s,;&\"']+)")
+    // vc254：带引号写法（如 `ssid='7205'`、`name="iPhone"`）此前整体漏过——上面的通用规则把
+    // 引号排除在值字符集外，导致这类值根本匹配不上。这里先按引号分支打码，再走通用分支。
+    private val SSID_QUOTED = Regex("(?i)(ssid=)([\"'])([^\"'\\r\\n]{0,64})([\"'])")
+    private val NAME_QUOTED = Regex("(?i)((?:\\s|^)name=)([\"'])([^\"'\\r\\n]{0,64})([\"'])")
+    // vc255：全角引号（“…” / ‘…’）同样是成对写法（如 `name=“华”的 iPhone`），此前整段落进
+    // 通用分支、右引号被吞导致引号不配对。全角开闭是「异形」字符，无法像 ASCII 那样用同一个
+    // 字符类兜住，这里按「开引号 + 引号内值 + 闭引号」整体匹配：开闭引号原样保留，只替换值；
+    // ssid / name 共用一条（键名仍从 group1 取，按 3 段/2 段前缀分别打码）。
+    private val QUOTED_FIELD_FULLWIDTH = Regex(
+        "(?i)((?:\\s|^)(?:ssid|name)=)([“‘])([^“‘”’\\r\\n]{0,64})([”’])",
+    )
+    // vc254：IPv4 保留前两段（`192.168.*.*`），避免上传件暴露内网主机位；已打码的值不再命中。
+    private val IPV4 = Regex("\\b(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\b")
     private val PASSPHRASE_FIELD = Regex("(?i)(passphrase=)([^\\s,;&\"']+)")
     // vc250（VC250-04）：`=` 收进 group1，键名与等号原样保留（此前等号落在分组外被吞）。
     private val BT_FIELD = Regex(
@@ -69,6 +82,24 @@ internal object LogRedactor {
         out = replaceValues(DEVICE_ID_FIELD, out) { value ->
             if (value.contains("#")) value else "dev#" + tag(value)
         }
+        // vc254：引号写法先处理（通用分支的字符集排除了引号，之前整类漏网）。
+        out = replaceQuoted(SSID_QUOTED, out) { value ->
+            if (value.contains("***")) value else prefix(value, 3) + "***"
+        }
+        out = replaceQuoted(NAME_QUOTED, out) { value ->
+            if (value.contains("***")) value else prefix(value, 2) + "***#" + tag(value)
+        }
+        // vc255：全角引号分支（“…”/‘…’），保留成对引号，只替换引号内的值。
+        out = QUOTED_FIELD_FULLWIDTH.replace(out) { match ->
+            val head = match.groupValues[1]
+            val value = match.groupValues[3]
+            val masked = if (head.contains("ssid=", ignoreCase = true)) {
+                if (value.contains("***")) value else prefix(value, 3) + "***"
+            } else {
+                if (value.contains("***")) value else prefix(value, 2) + "***#" + tag(value)
+            }
+            head + match.groupValues[2] + masked + match.groupValues[4]
+        }
         out = replaceValues(SSID_FIELD, out) { value ->
             if (value.contains("***")) value else prefix(value, 3) + "***"
         }
@@ -83,6 +114,15 @@ internal object LogRedactor {
             if (parts.size != 6) mac else {
                 parts.take(3).joinToString(sep) + sep + "**" + sep + "**" + sep + "**#" +
                     tag(mac.replace("-", ":").lowercase(Locale.US))
+            }
+        }
+        // vc254：IPv4 只保留前两段，避免暴露内网主机位（`192.168.*.*`）；非法/已打码的值原样返回。
+        out = IPV4.replace(out) { match ->
+            val parts = (1..4).map { match.groupValues[it].toIntOrNull() ?: -1 }
+            if (parts.any { it < 0 || it > 255 }) {
+                match.value
+            } else {
+                match.groupValues[1] + "." + match.groupValues[2] + ".*.*"
             }
         }
         // 还原设备码落点原文（MAC 段 + 可选 ROM 指纹）：整份日志里只有这一处豁免。
@@ -106,6 +146,16 @@ internal object LogRedactor {
         val head = match.groupValues[1]
         val value = match.groupValues[2]
         head + transform(value)
+    }
+
+    /** 引号分支：保留键名 + 引号，只对引号内的值打码。 */
+    private fun replaceQuoted(
+        regex: Regex,
+        text: String,
+        transform: (String) -> String,
+    ): String = regex.replace(text) { match ->
+        match.groupValues[1] + match.groupValues[2] + transform(match.groupValues[3]) +
+            match.groupValues[4]
     }
 
     private fun prefix(value: String, keep: Int): String =

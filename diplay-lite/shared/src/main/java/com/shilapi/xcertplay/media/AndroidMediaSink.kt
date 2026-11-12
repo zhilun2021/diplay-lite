@@ -98,6 +98,12 @@ class AndroidMediaSink(
      */
     private val microphoneSystemSnapshot: () -> String = { "" },
     /**
+     * vc253（出画后掉帧取证）：Wi-Fi 侧只读快照（RSSI / link speed 等 WifiManager 可取项），
+     * 由持 Context 的上层注入。仅在首帧后 60s 内并入 video stats 行，用于区分「编码侧降档」
+     * 与「射频侧丢包」；空串表示没有采样源，日志格式与历史版本一致。
+     */
+    private val networkDiagnostics: () -> String = { "" },
+    /**
      * 1.1.5/e5t1(vc85)：麦克风静音位检查/自动恢复，由持 Context 的上层注入（返回描述串
      * 落诊断）。EU5 QG DSP 仲裁链可能在 Android 层留 mute 位，App 层可检测并解除；
      * 未注入时跳过，其他平台零行为变化。
@@ -458,6 +464,8 @@ class AndroidMediaSink(
             vsyncPacingSeq = { vsyncPacer?.seq ?: 0L },
             // vc237（A1）：待渲帧不合并（默认关；关时逐字节等价于 vc236 的合并策略）。
             noCoalesce = videoNoCoalesce,
+            // vc253：首帧后 60s 内的 Wi-Fi 侧只读采样（与 video stats 同一行）。
+            networkDiagnostics = networkDiagnostics,
         )
         return videoDecoders.putIfAbsent(type, created) ?: created
     }
@@ -548,6 +556,8 @@ private class VideoDecoder(
     private val vsyncPacingSeq: () -> Long = { 0L },
     /** vc237（A1）：待渲帧不合并（true 时按 VSYNC 逐帧上屏，允许积压）。 */
     private val noCoalesce: Boolean = false,
+    /** vc253：Wi-Fi 侧只读快照（首帧后 60s 内并入 video stats 行）。 */
+    private val networkDiagnostics: () -> String = { "" },
 ) : Closeable {
     private val queue = VideoDecodeQueue()
     @Volatile private var running = true
@@ -598,6 +608,8 @@ private class VideoDecoder(
     // （renderHold=false）+ 持续 3s 零渲染 → 走 recover(flush)+请求关键帧，10s 限频防抖。
     private var lastRenderNanos = 0L
     private var lastStallRecoveryNanos = 0L
+    // vc253（出画后掉帧取证）：首帧上屏时刻——之后 60s 内的 video stats 行附 Wi-Fi 侧采样。
+    private var firstRenderNanos = 0L
     // The main screen keeps the historical log format; other screens are labelled.
     private val stats = VideoStats(if (streamType == 110) "" else " stream=$streamType")
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true; start() }
@@ -657,7 +669,7 @@ private class VideoDecoder(
                         null -> Unit
                     }
                     decoder?.let(::drainOutput)
-                    stats.logIfDue()?.let(report)
+                    stats.logIfDue()?.let { report(withWifiSample(it)) }
                     maybeRecoverRenderStall()
                     if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) requestKeyFrameIfDue()
                 } catch (error: Exception) {
@@ -1124,6 +1136,8 @@ private class VideoDecoder(
                 if (render) {
                     stats.onRendered()
                     lastRenderNanos = nowNs // vc150：静默渲染看门狗的「上次渲染」基准
+                    // vc253：首帧锚点（只记第一次），供 60s Wi-Fi 采样窗口计算。
+                    if (firstRenderNanos == 0L) firstRenderNanos = nowNs
                     // 1.0.29：恢复看门狗复位——有画面了，通道健康。
                     keyframeRequestsWithoutRender = 0
                     keyframeStallReported = false
@@ -1254,6 +1268,23 @@ private class VideoDecoder(
         }
     }
 
+    /**
+     * vc253（出画后掉帧取证）：首帧后 60s 内，把 Wi-Fi 侧只读采样并入同一条 video stats 行，
+     * 让「编码侧降档（fps/码率主动降）」与「射频侧丢包（RSSI/link speed 掉）」能在同一时刻对照。
+     * vc256：采样取自 `WifiManager.getConnectionInfo()`，是车机作为 STA 连外部路由的那条链路，
+     * 与 CarPlay 热点无关——前缀改成 `sta=`，避免被误读成 CarPlay 链路质量。
+     */
+    private fun withWifiSample(line: String): String {
+        val anchor = firstRenderNanos
+        if (anchor == 0L || System.nanoTime() - anchor > WIFI_SAMPLE_WINDOW_NS) return line
+        val sample = try {
+            networkDiagnostics()
+        } catch (_: Throwable) {
+            ""
+        }
+        return if (sample.isEmpty()) line else "$line sta=$sample"
+    }
+
     private companion object {
         const val TAG = "xcertplay-usb"
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
@@ -1262,6 +1293,8 @@ private class VideoDecoder(
         const val ERROR_STACK_FRAMES = 4
         // 1.0.29：恢复看门狗阈值——关键帧请求达此次数仍无渲染帧，报通道疑似死亡（只报一次）。
         const val KEYFRAME_STALL_REPORT_AFTER = 3
+        // vc253：首帧后 Wi-Fi 侧采样的窗口长度（与「出画后掉帧」复现窗口 60s 对齐）。
+        const val WIFI_SAMPLE_WINDOW_NS = 60_000_000_000L
         // 可容忍的最大排队延迟：帧从到达到被解码超过它，就判为"积压"——丢队列 + 等关键帧。
         // M6b：250ms → 350ms。C8815 上解码偶发被抢占（processMaxUs 峰值 111ms/包），250ms 会被
         // 误判成积压而频繁 forceKeyFrame（每次触发画面冻结到关键帧到达，主观上更卡）；

@@ -23,11 +23,19 @@ class WirelessHotspotInfo(
     val hostAddress: InetAddress?,
     val bandLabel: String,
     val backend: WirelessHotspotBackend,
+    /**
+     * vc256：channel / frequency 的来源标注（只用于诊断日志，不参与连接判断）。
+     * 取值：softap-callback / ap-config / sta-connection / scan / user-config / memory /
+     * p2p-group / unknown / unlabeled（后端未标注）。
+     */
+    val channelSource: String = "unlabeled",
+    val frequencySource: String = "unlabeled",
 ) {
     override fun toString(): String =
         "WirelessHotspotInfo(backend=${backend.label}, ssid='$ssid', " +
             "passphrase=<redacted>, security=$security, channel=$channel, " +
-            "frequencyMHz=$frequencyMHz, bssid='$bssid', interfaceName=$interfaceName, " +
+            "channelSource=$channelSource, frequencyMHz=$frequencyMHz, " +
+            "frequencySource=$frequencySource, bssid='$bssid', interfaceName=$interfaceName, " +
             "hostAddress=$hostAddress, bandLabel='$bandLabel')"
 }
 
@@ -88,20 +96,34 @@ internal fun legacyHotspotBandToSoftApBand(band: Int?): Int? = when (band) {
 }
 
 /**
- * Returns only a channel observed from Android. An unknown channel must stay unknown instead of
- * echoing the user's desired channel back to the iPhone in 0x5703.
+ * Returns only a channel observed from Android, together with where it came from.
+ * An unknown channel stays 0 ("auto" / field omitted) instead of echoing the user's desired
+ * channel back to the iPhone in 0x4301.
  */
-internal fun observedManualHotspotChannel(
+internal class ObservedHotspotChannel(val channel: Int, val source: String)
+
+internal fun observeManualHotspotChannel(
     apChannel: Int,
+    softApFrequencyMHz: Int?,
     connectionFrequencyMHz: Int?,
     scanFrequencyMHz: Int?,
     apFrequencyMHz: Int?,
-): Int {
-    if (apChannel > 0) return apChannel
-    connectionFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let { return it }
-    scanFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let { return it }
-    apFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let { return it }
-    return 0
+): ObservedHotspotChannel {
+    // SoftApCallback 的 frequency 是热点当前真实频点，优先级高于配置值（配置可能是 auto）。
+    softApFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let {
+        return ObservedHotspotChannel(it, "softap-callback")
+    }
+    if (apChannel > 0) return ObservedHotspotChannel(apChannel, "ap-config")
+    connectionFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let {
+        return ObservedHotspotChannel(it, "sta-connection")
+    }
+    scanFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let {
+        return ObservedHotspotChannel(it, "scan")
+    }
+    apFrequencyMHz?.let(::wifiFrequencyMhzToChannel)?.let {
+        return ObservedHotspotChannel(it, "ap-config")
+    }
+    return ObservedHotspotChannel(0, "unknown")
 }
 
 /** 2.4 GHz 的三个非重叠标准信道。 */

@@ -21,6 +21,10 @@ object CarPlayStageLog {
     @Volatile
     private var tcpAcceptedSink: (() -> Unit)? = null
 
+    // vc253：静默轮判据命中（iPhone 压根没来）——只用于 summary failureKind 分型。
+    @Volatile
+    private var credentialNoAuthSink: (() -> Unit)? = null
+
     fun install(sink: ((stage: String, detail: String) -> Unit)?) {
         this.sink = sink
     }
@@ -32,9 +36,16 @@ object CarPlayStageLog {
     fun installCredential(
         credential: ((beforeAirPlayTcp: Boolean) -> Unit)?,
         tcpAccepted: (() -> Unit)?,
+        noAuth: (() -> Unit)? = null,
     ) {
         credentialSink = credential
         tcpAcceptedSink = tcpAccepted
+        credentialNoAuthSink = noAuth
+    }
+
+    /** vc253：静默轮判据命中——控制面建立后 20s 内 0x5702 / 隧道鉴权 / 首 TCP 全无。 */
+    fun credentialNoAuth() {
+        credentialNoAuthSink?.invoke()
     }
 
     /** vc250-05：真凭证 0x5703 成功写出；[beforeAirPlayTcp]=发送瞬间 iPhone 尚无 AirPlay TCP。 */

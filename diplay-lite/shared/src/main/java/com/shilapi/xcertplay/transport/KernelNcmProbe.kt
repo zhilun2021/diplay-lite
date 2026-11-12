@@ -256,8 +256,10 @@ object KernelNcmProbe {
             val nif = runCatching { NetworkInterface.getByName(name) }.getOrNull() ?: return null
             // API16~18 没有 NetworkInterface#getIndex（API19+），退回 sysfs ifindex；
             // 链路本地地址必须带 scope，否则 bind/connect 会拒绝（"link-local without scope id"）。
-            val scopeId = runCatching { nif.index }.getOrNull()
-                ?: runCatching { File("/sys/class/net/$name/ifindex").readText().trim().toInt() }.getOrNull()
+            // vc253：先读 sysfs（全版本可用），再以反射兜底 getIndex——避免静态引用 API19
+            // 符号触发 NewApi 门禁（行为与历史一致：sysfs 存在时走的就是同一路径）。
+            val scopeId = runCatching { File("/sys/class/net/$name/ifindex").readText().trim().toInt() }.getOrNull()
+                ?: runCatching { NetworkInterface::class.java.getMethod("getIndex").invoke(nif) as Int }.getOrNull()
             return if (scopeId != null && scopeId > 0) {
                 Inet6Address.getByAddress(null, bytes, scopeId)
             } else {

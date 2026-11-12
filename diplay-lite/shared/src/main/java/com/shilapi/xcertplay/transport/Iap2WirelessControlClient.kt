@@ -54,6 +54,17 @@ class Iap2WirelessControlClient(
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
         phoneOnAirPlay: () -> Boolean = { false },
+        // vc252：0x5703 已下发、iPhone 却迟迟不发起 AirPlay TCP 时，超过该时长直接返回
+        // CREDENTIAL_NO_JOIN 交上层整代重建（实测继续每 5s 重发凭证 4 次全无效，而重建
+        // 一整轮 5.4s 就能入网）。0 = 关闭，隧道/USB 引导路径沿用历史行为。
+        credentialJoinTimeoutMillis: Long = 0L,
+        // vc253 静默轮判据：控制面会话建立后该时长内，既没收到 0x5702、也没完成隧道 iAP2
+        // 鉴权、也没有首个 AirPlay TCP → iPhone 压根没来，直接返回 CREDENTIAL_NO_AUTH 交
+        // 上层整代重建，不再空等 First TCP 看门狗 60s + 35s grace（vc252 单轮白占 95s）。
+        // 0 = 关闭（隧道/USB 引导路径与中继诱导实验沿用历史行为）。
+        authSilenceTimeoutMillis: Long = 0L,
+        // vc253：隧道 iAP2 鉴权是否已完成的只读探针（非静默判据的唯一依据时也参与判断）。
+        phoneAuthenticated: () -> Boolean = { false },
         // vc250-05：真凭证 0x5703 成功写出时回调，携带「发送瞬间 iPhone 是否还没有
         // AirPlay TCP」快照，只供 summary 判定 credential=full|cached|none，不参与控制流。
         onCredentialSent: ((beforeAirPlayTcp: Boolean) -> Unit)? = null,
@@ -84,11 +95,44 @@ class Iap2WirelessControlClient(
         } else {
             deadlineAfter(timeoutMillis)
         }
-        Iap2IdentificationClient(session).identify(identification, requireRemaining(deadlineNanos))
-        onProgress("iap2 identification accepted")
+        // vc253：静默窗口。锚点=控制面会话建立（进入本函数时 RFCOMM CSM 已就绪）。
+        // 识别/MFi 建链阶段同样受该窗口约束：iPhone 若从第一步就不响应，最多等 20s 判死，
+        // 而不是拖满 60s 建链超时才落 First TCP 看门狗。
+        val silenceEnabled = authSilenceTimeoutMillis > 0L && relayTestFakeCredential == null
+        val silenceDeadlineNanos =
+            if (silenceEnabled) deadlineAfter(authSilenceTimeoutMillis) else Long.MAX_VALUE
         var stage = Iap2WirelessControlStage.IDENTIFIED
-
-        mfi.run(session, requireRemaining(deadlineNanos), onProgress)
+        try {
+            val bringUpDeadlineNanos = min(deadlineNanos, silenceDeadlineNanos)
+            Iap2IdentificationClient(session).identify(identification, requireRemaining(bringUpDeadlineNanos))
+            onProgress("iap2 identification accepted")
+            mfi.run(session, requireRemaining(bringUpDeadlineNanos), onProgress)
+        } catch (error: Throwable) {
+            if (
+                silenceEnabled &&
+                !session.isClosed &&
+                System.nanoTime() >= silenceDeadlineNanos &&
+                !phoneOnAirPlay() &&
+                !phoneAuthenticated()
+            ) {
+                onProgress(
+                    "iap2 auth silence: no 0x5702, no tunnel iap2 auth, no first TCP within " +
+                        "${authSilenceTimeoutMillis}ms of control-plane ready; " +
+                        "restarting generation reason=credential-no-auth",
+                )
+                return Iap2WirelessControlResult(
+                    Iap2WirelessControlTerminal.CREDENTIAL_NO_AUTH,
+                    stage,
+                    0,
+                    0,
+                    0,
+                    false,
+                    0,
+                    false,
+                )
+            }
+            throw error
+        }
         stage = Iap2WirelessControlStage.AUTHENTICATED
         onProgress("iap2 authentication accepted")
 
@@ -105,11 +149,17 @@ class Iap2WirelessControlClient(
         // 退出仍由 socket 关闭（session.isClosed → CHANNEL_CLOSED）驱动，不会泄漏线程。
         deadlineNanos = Long.MAX_VALUE
 
+        // vc252：首个「iPhone 尚无 AirPlay TCP 时下发」的真凭证时刻（credential anchor）。
+        // 之后若 credentialJoinTimeoutMillis 内没有任何 TCP accept，整代重建。
+        var credentialSentAtNanos: Long? = null
         // vc250-05：所有「真凭证」0x5703 的唯一出口（relay 恢复 / 凭证重发 / iPhone 请求 /
         // post-transport）。发送成功才回调；快照必须在 send 之前取，否则会被本轮 TCP 污染。
         fun sendRealCredential() {
             val beforeAirPlayTcp = !phoneOnAirPlay()
-            sendRealCredential()
+            send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
+            if (beforeAirPlayTcp && credentialSentAtNanos == null) {
+                credentialSentAtNanos = System.nanoTime()
+            }
             onCredentialSent?.invoke(beforeAirPlayTcp)
         }
 
@@ -133,6 +183,8 @@ class Iap2WirelessControlClient(
         // 让上层走整代重启（scheduleWirelessRetry），而不是用户手点重连。
         var everOnAirPlay = false
         var airPlayLostAtNanos: Long? = null
+        // vc253：静默判据用的「iPhone 主动来要凭证」标记（0x5702 一次即算有人）。
+        var wifiConfigurationRequested = false
         // [RELAY-TEST] 实验状态机：0=阶段1(真凭证重发60s) 1=待发假凭证 2=假凭证已发待恢复 3=已恢复真凭证 -1=实验取消/关闭。
         // 实验链：时序倒挂（iPhone 先连中继 AP）时 iOS 不产生 join 事件、状态机死锁 →
         // 阶段1 重发用尽后发假凭证（真实存在 SSID+随机密码）诱导 iPhone 切出当前 AP →
@@ -140,6 +192,10 @@ class Iap2WirelessControlClient(
         var relayTestPhase = if (relayTestFakeCredential != null) 0 else -1
         while (true) {
                 val remaining = remainingMillis(deadlineNanos)
+                // vc253：静默窗口到点也唤醒检查，避免被 5s 轮询拖到 25s 才判死。
+                val silenceRemaining =
+                    if (silenceEnabled) remainingMillis(silenceDeadlineNanos) else Long.MAX_VALUE
+                val waitBudget = min(remaining, silenceRemaining).coerceAtLeast(1L)
                 if (remaining == 0L) {
                     return Iap2WirelessControlResult(
                         Iap2WirelessControlTerminal.TIMED_OUT,
@@ -157,11 +213,11 @@ class Iap2WirelessControlClient(
                     onProgress("iap2 tx=0xfffb location-information")
                 }
                 val pollTimeout = when {
-                    locationActive -> min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
+                    locationActive -> min(waitBudget, LOCATION_POLL_INTERVAL_MILLIS)
                     nextCredentialResendNanos != null ->
-                        min(remaining, CREDENTIAL_RESEND_POLL_MILLIS)
+                        min(waitBudget, CREDENTIAL_RESEND_POLL_MILLIS)
                     // 1.0.29：稳态下也周期醒来检查 AirPlay 连接存在性（看门狗），不再 recv(∞)。
-                    else -> min(remaining, AIRPLAY_PRESENCE_POLL_MILLIS)
+                    else -> min(waitBudget, AIRPLAY_PRESENCE_POLL_MILLIS)
                 }
                 val incoming = session.recv(pollTimeout)
                 // 1.0.29：AirPlay 断流看门狗——每轮迭代都检查（含有消息的迭代），
@@ -190,6 +246,67 @@ class Iap2WirelessControlClient(
                             wirelessCarPlayAvailableSeen,
                         )
                     }
+                }
+                // vc252 凭证锚点：0x5703 已下发（且下发瞬间 iPhone 尚无 TCP）之后，
+                // 超时仍没有任何 AirPlay TCP accept → 直接返回，交上层整代重建。
+                // 不触发：已来过 TCP（everOnAirPlay）、缓存凭证路径（下发时 TCP 已在，
+                // 不会写入 credentialSentAtNanos）、用户主动断开（session 已关闭）、
+                // 中继诱导实验（relayTestFakeCredential 非空，由实验状态机自管）。
+                val credentialAtNanos = credentialSentAtNanos
+                if (
+                    credentialJoinTimeoutMillis > 0L &&
+                    credentialAtNanos != null &&
+                    !everOnAirPlay &&
+                    !session.isClosed &&
+                    relayTestFakeCredential == null
+                ) {
+                    val waitedMs = (System.nanoTime() - credentialAtNanos) / 1_000_000L
+                    if (waitedMs >= credentialJoinTimeoutMillis) {
+                        onProgress(
+                            "credential anchor: no TCP within ${credentialJoinTimeoutMillis}ms " +
+                                "(waited=${waitedMs}ms); restarting generation " +
+                                "reason=credential-no-join resends=$credentialResendsSent " +
+                                "wifiConfigs=$wifiConfigurationsSent " +
+                                "carPlayStarts=$carPlayStartSessionsSent",
+                        )
+                        return Iap2WirelessControlResult(
+                            Iap2WirelessControlTerminal.CREDENTIAL_NO_JOIN,
+                            stage,
+                            forwardedFrames,
+                            wifiConfigurationsSent,
+                            carPlayStartSessionsSent,
+                            transportNotificationSeen,
+                            postTransportWiFiConfigurationsSent,
+                            wirelessCarPlayAvailableSeen,
+                        )
+                    }
+                }
+                // vc253 静默判据：控制面会话建立后 20s 内 0x5702 / 隧道 iAP2 鉴权 / 首 TCP
+                // 三者全无 → iPhone 压根没来（vc252 retry 1/5 实测此形态白占 95s）。
+                // 只读判断，命中后由上层按既有 retry 路径整代重建（teardown + 退避 + 新 gen）。
+                if (
+                    silenceEnabled &&
+                    !wifiConfigurationRequested &&
+                    !everOnAirPlay &&
+                    !phoneAuthenticated() &&
+                    !session.isClosed &&
+                    System.nanoTime() >= silenceDeadlineNanos
+                ) {
+                    onProgress(
+                        "iap2 auth silence: no 0x5702, no tunnel iap2 auth, no first TCP within " +
+                            "${authSilenceTimeoutMillis}ms of control-plane ready; " +
+                            "restarting generation reason=credential-no-auth",
+                    )
+                    return Iap2WirelessControlResult(
+                        Iap2WirelessControlTerminal.CREDENTIAL_NO_AUTH,
+                        stage,
+                        forwardedFrames,
+                        wifiConfigurationsSent,
+                        carPlayStartSessionsSent,
+                        transportNotificationSeen,
+                        postTransportWiFiConfigurationsSent,
+                        wirelessCarPlayAvailableSeen,
+                    )
                 }
                 if (incoming == null) {
                     if (session.isClosed) {
@@ -308,6 +425,7 @@ class Iap2WirelessControlClient(
 
                 when (incoming.messageId) {
                     REQUEST_ACCESSORY_WIFI_CONFIGURATION -> {
+                        wifiConfigurationRequested = true
                         // [RELAY-TEST] iPhone 侧状态机动了 → 取消诱导实验，走正常流程
                         if (relayTestPhase in 1..2) {
                             relayTestPhase = -1
@@ -500,6 +618,12 @@ class Iap2WirelessControlClient(
         /** vc152：外部线程会话结束后发 0x4301 邀请的发送超时。 */
         private const val INVITATION_SEND_TIMEOUT_MILLIS = 2_000L
 
+        /**
+         * vc253：静默轮判据窗口——控制面建立后该时长内 0x5702 / 隧道 iAP2 鉴权 / 首 TCP
+         * 全无即判「iPhone 没来」。正常冷路径 8139ms、热态 117~1381ms 均远小于此值。
+         */
+        const val IAP2_AUTH_SILENCE_TIMEOUT_MILLIS = 20_000L
+
         /** Reference-compatible 0x5703 body. BSSID is omitted when the platform does not expose it. */
         fun accessoryWiFiConfiguration(endpoint: Iap2WirelessCarPlayEndpoint): Iap2Frame =
             Iap2WirelessMessages.accessoryWiFiConfiguration(
@@ -624,7 +748,19 @@ enum class Iap2WirelessControlStage {
     POST_TRANSPORT_WIFI_CONFIG_SENT,
 }
 
-enum class Iap2WirelessControlTerminal { CHANNEL_CLOSED, TIMED_OUT, AIRPLAY_STALLED }
+/**
+ * vc252：`CREDENTIAL_NO_JOIN` = 真凭证已下发，但超过 credentialJoinTimeoutMillis 仍无任何
+ * AirPlay TCP accept。它不是「链路断了」，而是「iPhone 没入网」，交上层整代重建。
+ * vc253：`CREDENTIAL_NO_AUTH` = 控制面会话建立后 20s 内 0x5702 / 隧道 iAP2 鉴权 / 首个 TCP
+ * 全无，iPhone 压根没来（与「来了但没入网」区分，summary 记为 credential-no-auth）。
+ */
+enum class Iap2WirelessControlTerminal {
+    CHANNEL_CLOSED,
+    TIMED_OUT,
+    AIRPLAY_STALLED,
+    CREDENTIAL_NO_JOIN,
+    CREDENTIAL_NO_AUTH,
+}
 
 /** End state of the control loop only; it is not evidence of a live Wi-Fi or AirPlay session. */
 data class Iap2WirelessControlResult(

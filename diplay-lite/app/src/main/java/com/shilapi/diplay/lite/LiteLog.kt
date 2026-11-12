@@ -4,6 +4,7 @@ import android.util.Log
 import com.shilapi.xcertplay.diag.AnchorLog
 import java.io.File
 import java.io.FileWriter
+import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -20,6 +21,18 @@ object LiteLog {
     private const val FILE_MAX_BYTES = 8L shl 20 // 8MB 上限，测试会话基本不会触发轮转
     private const val FILE_PREFIX = "diplay-log-"
     private const val OLD_SUFFIX = "-old.txt"
+
+    // ---------- vc254：多会话上传 / 崩溃判决 / 磁盘保留 ----------
+    /** 上传取最近 3 个进程会话（当前 + 上一次 + 再上一次）。 */
+    private const val UPLOAD_SESSION_LIMIT = 3
+    /** 目录保留：最近 10 个会话，且合计不超过 64MB（先删最旧，连同其 -old）。 */
+    private const val SESSION_KEEP = 10
+    private const val TOTAL_KEEP_BYTES = 64L shl 20
+    /** 崩溃判决只看尾部落盘内容（栈与收尾行都在末尾）。 */
+    private const val VERDICT_TAIL_BYTES = 16 * 1024
+
+    /** 会话文件名：diplay-log-yyyyMMdd-HHmmss.txt（导出件/历史上传件/轮转件都不匹配）。 */
+    private val SESSION_NAME = Regex("^diplay-log-(\\d{8})-(\\d{6})\\.txt$")
 
     /** vc250：CarPlay Host 自链路的阶段标记（不照搬 CarLife 盒子 S1–S6）。 */
     enum class Stage(val wire: String) {
@@ -57,6 +70,8 @@ object LiteLog {
     private var fileBytes = 0L
     private var unflushed = 0
     @Volatile private var currentFile: File? = null
+    // vc254：上一进程会话的退出判决（crash/clean/abnormal/none），启动时算一次。
+    @Volatile private var lastVerdict: String = "none"
 
     // ---------- vc250-03：阶段耗时（单进程内一次连接一个会话） ----------
     private val stageLock = Any()
@@ -70,6 +85,9 @@ object LiteLog {
     // 事后 grep 不可靠（轮转/截断/跨会话/发送失败都没有关联）。
     private var credentialSentBeforeTcp = false
     private var airPlayTcpAcceptedOnce = false
+    // vc253：静默轮判据命中（控制面建立后 20s 内 0x5702 / 隧道鉴权 / 首 TCP 全无）——
+    // 与 vc252 的 credential-no-join（凭证已下发但没入网）区分，单独成 failureKind。
+    private var credentialNoAuthSeen = false
     // vc250-10：credential/wifi-join 阶段只落第一次（后续重发/重连不刷屏、不改首入时刻）。
     private var credentialStageMarked = false
     private var wifiJoinStageMarked = false
@@ -85,6 +103,8 @@ object LiteLog {
                 writer = FileWriter(file, true)
                 logDirectory = directory
                 currentFile = file
+                // vc254：新会话建立后立刻执行保留策略（不动当前正在写的文件）。
+                pruneLocked()
             } catch (error: Exception) {
                 writer = null
                 logDirectory = null
@@ -102,6 +122,160 @@ object LiteLog {
 
     /** 当前日志文件（带启动时间戳）；未挂载时为 null。 */
     fun currentFile(): File? = currentFile
+
+    /**
+     * vc254：一个进程会话的日志文件集合。
+     * [files] 按时间先后排列——轮转时有 `-old.txt`（前段）在前、本体（后段）在后。
+     */
+    class Session(val name: String, val files: List<File>) {
+        val current: File get() = files[files.size - 1]
+        val hasOld: Boolean get() = files.size > 1
+        val sizeBytes: Long
+            get() {
+                var total = 0L
+                for (file in files) total += file.length()
+                return total
+            }
+    }
+
+    /**
+     * vc254：把缓冲立即落盘。
+     *
+     * 仅供崩溃处理器调用：常规日志仍按 8 条批量 flush 节流（见 [log]），不改成逐条 flush；
+     * 但未捕获异常只有一条 `[crash]`，进程随即被杀，不主动 flush 就等于整条丢失。
+     */
+    fun flushNow() {
+        synchronized(fileLock) {
+            try {
+                writer?.flush()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 最近 [limit] 个进程会话（新 → 旧）；不足时按实际份数返回。 */
+    fun recentSessions(limit: Int = UPLOAD_SESSION_LIMIT): List<Session> {
+        val directory = logDirectory ?: return emptyList()
+        val sessions = synchronized(fileLock) { listSessionsLocked(directory) }
+        return if (sessions.size > limit) sessions.subList(0, limit) else sessions
+    }
+
+    /**
+     * vc254：本进程启动时判定上一会话的退出方式（只看磁盘，不新增状态文件）。
+     *
+     * - `crash`：尾部含 `[crash]` 行（崩溃处理器已 [flushNow]）；
+     * - `clean`：最后一条有效行含「会话服务已停止」；
+     * - `abnormal`：两者都不满足（强杀 / 断电 / 外部 force-stop）；
+     * - `none`：目录里没有上一会话。
+     *
+     * 必须在 [attachFileLog] **之前**调用，否则新会话文件会被当成"上一份"。
+     */
+    fun classifyPreviousSession(directory: File): String {
+        val current = currentFile
+        val candidates = synchronized(fileLock) {
+            listSessionsLocked(directory).filter { it.current != current }
+        }
+        val text = candidates.firstOrNull()?.let { readTail(it.current, VERDICT_TAIL_BYTES) }
+            ?: return "none"
+        val verdict = when {
+            text.contains("[crash]") -> "crash"
+            lastMeaningfulLine(text).contains("会话服务已停止") -> "clean"
+            else -> "abnormal"
+        }
+        lastVerdict = verdict
+        return verdict
+    }
+
+    /** 最近一次启动时对上一会话的判决（供上传件头区与界面提示复用）。 */
+    fun previousVerdict(): String = lastVerdict
+
+    /** 判决短标签（日志与 toast 共用，避免两处措辞漂移）。 */
+    fun verdictLabel(verdict: String): String = when (verdict) {
+        "crash" -> "崩溃"
+        "clean" -> "正常退出"
+        "abnormal" -> "异常终止"
+        else -> "无上一会话"
+    }
+
+    /** 列出目录下的会话（新 → 旧）；跳过 0 字节文件与不匹配命名的历史导出/上传件。 */
+    private fun listSessionsLocked(directory: File): List<Session> {
+        val all = directory.listFiles() ?: return emptyList()
+        val names = ArrayList<String>()
+        for (file in all) {
+            if (file.isDirectory) continue
+            if (!SESSION_NAME.matches(file.name)) continue
+            names.add(file.name)
+        }
+        names.sortDescending() // 文件名内嵌 yyyyMMdd-HHmmss，字典序即时间序
+        val sessions = ArrayList<Session>(names.size)
+        for (name in names) {
+            val main = File(directory, name)
+            val old = File(directory, name.removeSuffix(".txt") + OLD_SUFFIX)
+            val files = ArrayList<File>(2)
+            if (old.isFile && old.length() > 0L) files.add(old)
+            if (main.isFile && main.length() > 0L) files.add(main)
+            if (files.isEmpty()) continue // 刚创建/刚轮转的空文件不算一个会话
+            sessions.add(Session(name, files))
+        }
+        return sessions
+    }
+
+    /**
+     * vc254 磁盘保留：只留最近 [SESSION_KEEP] 个会话且合计不超过 [TOTAL_KEEP_BYTES]，
+     * 先删最旧（连同其 `-old.txt`）；当前正在写的文件永不删除。
+     * 每会话最坏 16MB（8MB 正文 + 8MB 轮转副本），此前无任何清理逻辑。
+     */
+    private fun pruneLocked() {
+        val directory = logDirectory ?: return
+        val current = currentFile
+        val sessions = listSessionsLocked(directory)
+        if (sessions.isEmpty()) return
+        var total = 0L
+        for (session in sessions) total += session.sizeBytes
+        var remaining = sessions.size
+        for (index in sessions.indices.reversed()) {
+            if (remaining <= SESSION_KEEP && total <= TOTAL_KEEP_BYTES) break
+            val session = sessions[index]
+            if (current != null && session.files.contains(current)) continue
+            var freed = 0L
+            var deleted = true
+            for (file in session.files) {
+                freed += file.length()
+                if (!file.delete()) deleted = false
+            }
+            if (!deleted) break // 删除失败（被占用等）就停手，避免反复试错
+            total -= freed
+            remaining--
+        }
+    }
+
+    /**
+     * 读取文件尾部最多 [maxBytes] 字节（UTF-8）；失败返回空串。
+     * vc255：[endOffset] 供上传侧传快照边界，只读边界之前的固定内容（默认读实际文件尾）。
+     */
+    internal fun readTail(file: File, maxBytes: Int, endOffset: Long = Long.MAX_VALUE): String {
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                val length = minOf(raf.length(), endOffset)
+                val start = if (length > maxBytes) length - maxBytes else 0L
+                raf.seek(start)
+                val buffer = ByteArray((length - start).toInt())
+                raf.readFully(buffer)
+                String(buffer, Charsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun lastMeaningfulLine(text: String): String {
+        val lines = text.split('\n')
+        for (index in lines.indices.reversed()) {
+            val line = lines[index].trim()
+            if (line.isNotEmpty()) return line
+        }
+        return ""
+    }
 
     fun log(tag: String, message: String) {
         val stamp = synchronized(timeFormat) { timeFormat.format(Date()) }
@@ -187,8 +361,17 @@ object LiteLog {
             sessionFailureClass = null
             credentialSentBeforeTcp = false
             airPlayTcpAcceptedOnce = false
+            credentialNoAuthSeen = false
             credentialStageMarked = false
             wifiJoinStageMarked = false
+        }
+    }
+
+    /** vc253：静默轮判据命中（iPhone 压根没来）——只影响 summary 的 failureKind 分型。 */
+    fun credentialNoAuth() {
+        synchronized(stageLock) {
+            if (!sessionActive) return
+            credentialNoAuthSeen = true
         }
     }
 
@@ -236,6 +419,7 @@ object LiteLog {
             sessionFailureClass = null
             credentialSentBeforeTcp = false
             airPlayTcpAcceptedOnce = false
+            credentialNoAuthSeen = false
             credentialStageMarked = false
             wifiJoinStageMarked = false
             text
@@ -265,22 +449,28 @@ object LiteLog {
         builder.append(" result=").append(if (failed) "failed" else "ok")
         builder.append(" failureClass=").append(sessionFailureClass ?: if (failed) "unknown" else "-")
         builder.append(" rendered=").append(if (rendered) "yes" else "no")
+        // vc250-05：凭据三态。full=入网前已下发新凭证且 TCP 到达；cached=未下发新凭证
+        // 但 TCP 到达（iPhone 用缓存凭证入网）；none=两者都不成立。
+        val credentialState = when {
+            airPlayTcpAcceptedOnce && credentialSentBeforeTcp -> "full"
+            airPlayTcpAcceptedOnce -> "cached"
+            else -> "none"
+        }
+        // vc252：`credential=none` 表示 0x5703 下发了但 iPhone 始终没来（没有任何 TCP），
+        // 这是「未入网」而不是「慢」——单独成类，避免现场把 credential-no-join 误读成
+        // slow-first-display。TCP 已到但没出画仍归 slow-first-display。
+        // vc253：`credential-no-auth` = 静默判据命中（连 0x5702 / 隧道鉴权 / 首 TCP 都没有，
+        // iPhone 压根没来），与「凭证已下发但没入网」的 credential-no-join 区分。
         builder.append(" failureKind=").append(
             when {
                 !failed -> "-"
                 rendered -> "long-outage"
+                credentialNoAuthSeen -> "credential-no-auth"
+                credentialState == "none" -> "credential-no-join"
                 else -> "slow-first-display"
             },
         )
-        // vc250-05：凭据三态。full=入网前已下发新凭证且 TCP 到达；cached=未下发新凭证
-        // 但 TCP 到达（iPhone 用缓存凭证入网）；none=两者都不成立。
-        builder.append(" credential=").append(
-            when {
-                airPlayTcpAcceptedOnce && credentialSentBeforeTcp -> "full"
-                airPlayTcpAcceptedOnce -> "cached"
-                else -> "none"
-            },
-        )
+        builder.append(" credential=").append(credentialState)
         // vc250-11：绝对锚——与 ANCHOR 行的 session=<进程短 id>、上传骨架标签同一口径。
         builder.append(" session=").append(AnchorLog.sessionId())
         return builder.toString()

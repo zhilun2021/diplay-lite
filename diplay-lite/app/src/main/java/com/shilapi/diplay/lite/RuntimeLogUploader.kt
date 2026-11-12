@@ -7,6 +7,8 @@ import android.util.Base64
 import com.shilapi.xcertplay.diag.AnchorLog
 import org.json.JSONObject
 import java.io.File
+import java.io.InputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -23,11 +25,16 @@ import javax.net.ssl.SSLContext
 /**
  * vc240：运行日志上传（含 dongle 链路）——四段式统一上传件。
  *
- * 文件结构（用户拍板 vc240-upload-merge）：
- * ① 头区：元信息 + 采集范围说明；
- * ② 骨架区：dongle/配对/锚点/总闸链路行（上限 160KB，含 -old.txt，old 在前）；
- * ③ 滚动区：最近 20 分钟（整段丢弃 `TRACE airplay`；`bulk read fail` 仅首尾取样+计数）；
- * ④ 尾区：最后 30 秒 + 收尾锚点 + 裁剪说明。
+ * 文件结构（用户拍板 vc240-upload-merge；vc254 扩为多会话）：
+ * ① 头区：元信息 + 会话清单 + 采集范围说明；
+ * ② 每份会话三段：骨架区（上限 160KB，含 -old.txt，old 在前）/
+ *    滚动区（**该会话自身**最后 20 分钟，整段丢弃 `TRACE airplay`，`bulk read fail` 仅首尾取样+计数）/
+ *    尾区（**该会话自身**最后 30 秒 + 收尾锚点 + 裁剪说明）。
+ *
+ * vc254：闪退现场往往落在上一个进程的日志文件里（重启后 currentFile 已换新），因此默认打包
+ * 最近 3 个进程会话（当前 + 上一次 + 再上一次）。每个会话的滚动/尾窗口以**该文件最后一条
+ * 日志行的时刻**为锚点，不再用"当前时间"——否则旧会话会得到空窗口。
+ * 崩溃/异常会话的尾区优先占该会话配额的 1/2（栈与最终状态都在末尾）。
  *
  * 体积上限 768KB；裁剪优先级：TRACE → bulk 噪声 → 非关键杂项 → 周期 stats 只留最近 2 分钟
  * → 骨架明细。骨架超 160KB 时按 gen 裁剪，但**每个出现过的 gen 至少保留一条关键锚点行**
@@ -46,6 +53,15 @@ object RuntimeLogUploader {
     private const val STATS_RECENT_MILLIS = 2 * 60_000L
     private const val TIMEOUT_MILLIS = 60_000L
     private const val RESERVE_BYTES = 2048
+    /** vc254：默认打包最近 3 个进程会话。 */
+    private const val SESSION_LIMIT = 3
+    /** 每个会话块自身的标题行（会话名/时段/体积/判决/版本）。 */
+    private const val BLOCK_TITLE_RESERVE = 512
+    /**
+     * vc255：flush 后到取快照边界之间的短暂兜底（300ms）。
+     * 只覆盖「其它线程刚写完、还没进文件」的极小窗口；在 worker 线程执行，不阻塞 UI。
+     */
+    private const val SNAPSHOT_SETTLE_MILLIS = 300L
 
     /** 骨架裁剪时给统计行/每段省略标记预留的字节。 */
     private const val SKELETON_NOTE_RESERVE = 2048
@@ -89,7 +105,16 @@ object RuntimeLogUploader {
     private val MISC_TAGS = setOf("statusbar", "cluster", "app", "service", "usbfx", "pcap", "vpn")
 
     /** 本地已备好的上传件。 */
-    class Prepared(val file: File, val fileName: String, val lineCount: Int, val sizeBytes: Long)
+    class Prepared(
+        val file: File,
+        val fileName: String,
+        val lineCount: Int,
+        val sizeBytes: Long,
+        /** vc254：包内会话份数（1 = 单会话，与旧行为一致）。 */
+        val sessions: Int = 1,
+        /** vc254：上一会话判决（crash/clean/abnormal/none），供界面提示复用。 */
+        val verdict: String? = null,
+    )
 
     /** 上传结果：ok=true 时 remoteName=仓库内真实文件名（409 冲突可能加 -1 后缀）。 */
     class Result(val ok: Boolean, val remoteName: String?, val error: String?)
@@ -117,8 +142,18 @@ object RuntimeLogUploader {
 
     /**
      * 组装四段式上传件；异常或为空时回落 [DongleLogUploader] 的 skeleton 模式。
+     *
+     * vc255：读取发生在组包阶段，所以落盘必须在这里、而不是只在上传返回时——否则
+     * 末尾几行仍在 8 条批量缓冲里，上传件永远缺最后一段；300ms 兜底后再取快照边界。
+     * 本方法在 worker 线程调用（见 SettingsPage.uploadLogToGitee）。
      */
     fun prepare(context: Context): Prepared? {
+        LiteLog.flushNow()
+        try {
+            Thread.sleep(SNAPSHOT_SETTLE_MILLIS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         val full = try {
             buildBundle(context)
         } catch (error: Exception) {
@@ -131,7 +166,14 @@ object RuntimeLogUploader {
         if (full != null) return full
         val skeleton = DongleLogUploader.prepare(context) ?: return null
         LiteLog.log("log", "运行日志上传：回落 skeleton 模式（${skeleton.fileName}）")
-        return Prepared(skeleton.file, skeleton.fileName, skeleton.lineCount, skeleton.file.length())
+        return Prepared(
+            skeleton.file,
+            skeleton.fileName,
+            skeleton.lineCount,
+            skeleton.file.length(),
+            sessions = 1,
+            verdict = LiteLog.previousVerdict().takeIf { it != "none" },
+        )
     }
 
     // ---------- 组装 ----------
@@ -139,129 +181,293 @@ object RuntimeLogUploader {
     private fun buildBundle(context: Context): Prepared? {
         val current = LiteLog.currentFile() ?: return null
         val directory = current.parentFile ?: return null
-        if (!current.isFile || current.length() == 0L) return null
-        val old = File(directory, current.nameWithoutExtension + "-old.txt")
 
-        val nowTod = todOfNow()
-        val rollingStart = nowTod - ROLLING_WINDOW_MILLIS
-        val tailStart = nowTod - TAIL_WINDOW_MILLIS
+        // vc254：最近 3 个进程会话（新 → 旧）。目录枚举失败时退回单会话，保持旧行为。
+        val sessions = LiteLog.recentSessions(SESSION_LIMIT).ifEmpty {
+            listOfNotNull(singleSession(current))
+        }
+        if (sessions.isEmpty()) return null
 
-        val skeletonEntries = ArrayList<Entry>()
-        val windowEntries = ArrayList<Entry>()
-        val noise = Noise()
+        // vc255：组包这一刻为每个文件取一次长度，之后所有读取都只到该位置——
+        // 上传过程中继续追加的日志不会混进本次上传件，也不会读到正在写的半行。
+        // 多会话共用一个快照时刻：各会话的 current/-old 各自记边界，互不影响。
+        val boundaries = HashMap<File, Long>(sessions.size * 2)
+        for (session in sessions) {
+            for (file in session.files) boundaries[file] = file.length()
+        }
 
-        // old 在前（时间更早），current 在后：骨架搜索天然跨轮转段。
-        if (old.isFile) scanSkeletonOnly(old, skeletonEntries)
-        val traceDropped = scanCurrent(current, nowTod, rollingStart, skeletonEntries, windowEntries, noise)
-
-        val skeletonFit = fitSkeleton(skeletonEntries, SKELETON_CAP_BYTES)
+        val previousVerdict = LiteLog.previousVerdict()
+        // 只有"紧邻当前进程的那一份"有启动判决；更早的会话判别不了（标"未知"）。
+        val verdictIndex = sessions.indexOfFirst { it.current != current }
+        val scans = ArrayList<SessionScan>(sessions.size)
+        for (index in sessions.indices) {
+            val session = sessions[index]
+            val verdict = if (index == verdictIndex) {
+                previousVerdict.takeIf { it != "none" }
+            } else {
+                null
+            }
+            scans.add(scanSession(session, verdict, boundaries))
+        }
 
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val deviceCode = DeviceCode.of()
-        val headerText = buildHeader(
-            context,
-            current,
-            old.isFile,
-            stamp,
-            rollingStart,
-            nowTod,
-            deviceCode,
-        )
-        val headerBytes = headerText.toByteArray(Charsets.UTF_8).size
-        val skeletonBytes = sectionBytes(skeletonFit.first)
+        val headerText = buildHeader(context, scans, stamp, deviceCode)
+        val headerBytes = sectionBytes(headerText)
+        val budget = (MAX_BYTES - headerBytes - RESERVE_BYTES).coerceAtLeast(64 * 1024)
+        // 每会话配额均分：3 份 ≈255KB、2 份 ≈382KB、1 份 ≈765KB（与旧的单会话上限接近）。
+        val share = budget / scans.size
 
-        val tailCap = (MAX_BYTES - headerBytes - skeletonBytes - RESERVE_BYTES - 1024)
-            .coerceIn(512, TAIL_CAP_BYTES)
-        val tailEntries = windowEntries.filter { it.tod != null && it.tod >= tailStart }
-        val anchorEntries = skeletonEntries
-            .filter { it.line.contains(ANCHOR_MARK, ignoreCase = true) }
-            .takeLast(8)
-        val tailFit = fitTail(tailEntries, anchorEntries, tailCap, tailStart)
-        val tailBytes = sectionBytes(tailFit.first)
+        var skeletonLines = 0
+        var rollingLines = 0
+        var tailLines = 0
+        val body = StringBuilder()
+        for (scan in scans) {
+            val block = buildSessionBlock(scan, share)
+            body.append(block.text).append('\n')
+            skeletonLines += block.skeletonLines
+            rollingLines += block.rollingLines
+            tailLines += block.tailLines
+        }
 
-        val rollingBudget = (MAX_BYTES - headerBytes - skeletonBytes - tailBytes - RESERVE_BYTES)
-            .coerceAtLeast(1024)
-        val rollingEntries = windowEntries.filter { it.tod != null && it.tod < tailStart }
-        val rollingFit = fitRolling(rollingEntries, rollingBudget, nowTod, traceDropped, noise)
-
-        val text = LogRedactor.redact(
-            buildString {
-                append(headerText)
-                append(SKELETON_SEP).append('\n')
-                append(skeletonFit.first).append('\n')
-                append(ROLLING_SEP).append('\n')
-                append(rollingFit.first).append('\n')
-                append(TAIL_SEP).append('\n')
-                append(tailFit.first)
-            },
-        )
+        val text = LogRedactor.redact(headerText + body.toString())
         val bytes = text.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_BYTES) {
             LiteLog.log("log", "运行日志上传件超出 768KB（${bytes.size} 字节），已拒绝落盘")
             return null
         }
         val totalLines = text.count { it == '\n' }
-        val fileName = buildFileName(context, stamp, deviceCode)
+        val fileName = buildFileName(context, stamp, deviceCode, scans.size)
         val target = File(directory, fileName)
         target.outputStream().use { it.write(bytes) }
         LiteLog.log(
             "log",
-            "运行日志上传件已生成：$fileName（${bytes.size} 字节，" +
-                "骨架 ${skeletonFit.second} 行 / 滚动 ${rollingFit.second} 行 / 尾区 ${tailFit.second} 行）",
+            "运行日志上传件已生成：$fileName（${bytes.size} 字节，${scans.size} 份会话，" +
+                "骨架 $skeletonLines 行 / 滚动 $rollingLines 行 / 尾区 $tailLines 行）",
         )
-        return Prepared(target, fileName, totalLines, bytes.size.toLong())
+        return Prepared(
+            target,
+            fileName,
+            totalLines,
+            bytes.size.toLong(),
+            sessions = scans.size,
+            verdict = previousVerdict.takeIf { it != "none" },
+        )
     }
 
-    /** old.txt 只取骨架行（滚动区只取 current）。 */
-    private fun scanSkeletonOnly(file: File, out: MutableList<Entry>) {
-        try {
-            file.bufferedReader().useLines { seq ->
-                seq.forEach { line ->
-                    if (line.isEmpty()) return@forEach
-                    val lower = line.lowercase(Locale.US)
-                    if (lower.contains(BULK_MARK)) return@forEach
-                    if (isSkeletonLine(lower)) out.add(Entry(line, null))
-                }
-            }
-        } catch (_: Exception) {
-        }
+    /** 目录枚举不可用时的单会话兜底（current + 其 -old）。 */
+    private fun singleSession(current: File): LiteLog.Session? {
+        if (!current.isFile || current.length() == 0L) return null
+        val old = File(current.parentFile, current.nameWithoutExtension + "-old.txt")
+        val files = ArrayList<File>(2)
+        if (old.isFile && old.length() > 0L) files.add(old)
+        files.add(current)
+        return LiteLog.Session(current.name, files)
     }
 
-    /** current：骨架 + 最近 20 分钟窗口；TRACE 整段丢弃，bulk 噪声只取样计数。返回丢弃的 TRACE 行数。 */
-    private fun scanCurrent(
-        file: File,
-        nowTod: Long,
-        rollingStart: Long,
-        skeleton: MutableList<Entry>,
-        window: MutableList<Entry>,
-        noise: Noise,
-    ): Int {
+    /** vc254：一个会话的扫描结果（骨架/窗口/噪声 + 元信息）。 */
+    private class SessionScan(
+        val session: LiteLog.Session,
+        val verdict: String?,
+        val anchorTod: Long,
+        val firstStamp: String,
+        val lastStamp: String,
+        val version: String,
+        val skeleton: List<Entry>,
+        val window: List<Entry>,
+        val noise: Noise,
+        val traceDropped: Int,
+    )
+
+    private class BlockResult(
+        val text: String,
+        val skeletonLines: Int,
+        val rollingLines: Int,
+        val tailLines: Int,
+    )
+
+    /**
+     * vc254：扫描单个会话（old 在前、本体在后）。
+     * 滚动/尾窗口以**该文件最后一条日志行的时刻**为锚点——旧会话跨天、跨重启同样成立。
+     */
+    private fun scanSession(
+        session: LiteLog.Session,
+        verdict: String?,
+        boundaries: Map<File, Long>,
+    ): SessionScan {
+        val anchorTod = findAnchorTod(session, boundaries)
+        val rollingStart = anchorTod - ROLLING_WINDOW_MILLIS
+        val skeleton = ArrayList<Entry>()
+        val window = ArrayList<Entry>()
+        val noise = Noise()
         var traceDropped = 0
-        try {
-            file.bufferedReader().useLines { seq ->
-                seq.forEach { line ->
-                    if (line.isEmpty()) return@forEach
-                    val tod = parseTod(line, nowTod)
-                    val inWindow = tod != null && tod >= rollingStart && tod <= nowTod
+        var firstStamp = "-"
+        var lastStamp = "-"
+        var version = "未记录"
+        for (file in session.files) {
+            val boundary = boundaries[file] ?: file.length()
+            try {
+                readLinesUpTo(file, boundary) { line ->
+                    if (line.isEmpty()) return@readLinesUpTo
+                    val match = TIME_REGEX.find(line)
+                    if (match != null) {
+                        val text = "${match.groupValues[1]}-${match.groupValues[2]} " +
+                            "${match.groupValues[3]}:${match.groupValues[4]}:${match.groupValues[5]}"
+                        if (firstStamp == "-") firstStamp = text
+                        lastStamp = text
+                    }
+                    if (version == "未记录" && line.contains("进程启动 versionName=")) {
+                        val parsed = line.substringAfter("进程启动 versionName=").trim()
+                        if (parsed.isNotEmpty()) version = parsed.take(24)
+                    }
+                    val tod = parseTod(line, anchorTod)
+                    val inWindow = tod != null && tod >= rollingStart && tod <= anchorTod
                     val lower = line.lowercase(Locale.US)
                     if (inWindow && lower.contains(TRACE_MARK.lowercase(Locale.US))) {
                         traceDropped++
-                        return@forEach
+                        return@readLinesUpTo
                     }
                     if (inWindow && lower.contains(BULK_MARK)) {
                         noise.add(line)
-                        return@forEach
+                        return@readLinesUpTo
                     }
                     if (isSkeletonLine(lower)) {
                         skeleton.add(Entry(line, tod))
-                        return@forEach
+                        return@readLinesUpTo
                     }
                     if (inWindow) window.add(Entry(line, tod))
                 }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
         }
-        return traceDropped
+        return SessionScan(
+            session,
+            verdict,
+            anchorTod,
+            firstStamp,
+            lastStamp,
+            version,
+            skeleton,
+            window,
+            noise,
+            traceDropped,
+        )
+    }
+
+    /** 会话时间锚点 = 该会话最后一条能解析出时刻的日志行（先本体、后 old；只到快照边界）。 */
+    private fun findAnchorTod(session: LiteLog.Session, boundaries: Map<File, Long>): Long {
+        val files = session.files
+        for (index in files.indices.reversed()) {
+            val file = files[index]
+            val lines = LiteLog.readTail(file, 64 * 1024, boundaries[file] ?: file.length())
+                .split('\n')
+            for (lineIndex in lines.indices.reversed()) {
+                val tod = rawTod(lines[lineIndex])
+                if (tod != null) return tod
+            }
+        }
+        return todOfNow()
+    }
+
+    /**
+     * vc255：按快照边界逐行读取（只读 [boundary] 之前的字节，流式不整文件载入）。
+     *
+     * 边界恰好落在半行上时丢弃最后一个不完整行：flush 之后仍可能有其它线程的写入
+     * 把缓冲区整块刷出，块尾可能切在行中间——读取侧不能把半行当成一条日志。
+     */
+    private fun readLinesUpTo(file: File, boundary: Long, action: (String) -> Unit) {
+        val length = minOf(boundary, runCatching { file.length() }.getOrDefault(0L))
+        if (length <= 0L) return
+        val endsWithNewline = runCatching {
+            RandomAccessFile(file, "r").use { raf ->
+                raf.seek(length - 1)
+                raf.read() == '\n'.code
+            }
+        }.getOrDefault(true)
+        BoundedInputStream(file.inputStream(), length).bufferedReader().use { reader ->
+            var line = reader.readLine() ?: return
+            while (true) {
+                val next = reader.readLine()
+                if (next == null) {
+                    if (endsWithNewline) action(line)
+                    return
+                }
+                action(line)
+                line = next
+            }
+        }
+    }
+
+    /** 只放行前 [limit] 字节的输入流包装（超出部分视为文件结束）。 */
+    private class BoundedInputStream(
+        private val inner: InputStream,
+        private var remaining: Long,
+    ) : InputStream() {
+        override fun read(): Int {
+            if (remaining <= 0L) return -1
+            val value = inner.read()
+            if (value >= 0) remaining--
+            return value
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (remaining <= 0L) return -1
+            val request = minOf(length.toLong(), remaining).toInt()
+            val read = inner.read(buffer, offset, request)
+            if (read > 0) remaining -= read
+            return read
+        }
+
+        override fun close() = inner.close()
+    }
+
+    /** 单个会话块：标题 + 骨架 / 滚动 / 尾 三段。 */
+    private fun buildSessionBlock(scan: SessionScan, shareBytes: Int): BlockResult {
+        val tailStart = scan.anchorTod - TAIL_WINDOW_MILLIS
+        val crashed = scan.verdict == "crash" || scan.verdict == "abnormal"
+        val title = buildSessionTitle(scan)
+        val usable = (shareBytes - sectionBytes(title) - BLOCK_TITLE_RESERVE).coerceAtLeast(2048)
+        val skeletonCap = minOf(SKELETON_CAP_BYTES, usable / 3)
+        // 崩溃/异常会话：尾区优先占 1/2（栈与最终状态在末尾），其余 1/3。
+        val tailCap = minOf(TAIL_CAP_BYTES, usable * (if (crashed) 3 else 2) / 6)
+            .coerceAtLeast(1024)
+        val skeletonFit = fitSkeleton(scan.skeleton, skeletonCap)
+        val skeletonBytes = sectionBytes(skeletonFit.first)
+        val tailEntries = scan.window.filter { it.tod != null && it.tod >= tailStart }
+        val anchorEntries = scan.skeleton
+            .filter { it.line.contains(ANCHOR_MARK, ignoreCase = true) }
+            .takeLast(6)
+        val tailFit = fitTail(tailEntries, anchorEntries, tailCap, tailStart)
+        val tailBytes = sectionBytes(tailFit.first)
+        val rollingBudget = (usable - skeletonBytes - tailBytes).coerceAtLeast(1024)
+        val rollingEntries = scan.window.filter { it.tod != null && it.tod < tailStart }
+        val rollingFit = fitRolling(
+            rollingEntries,
+            rollingBudget,
+            scan.anchorTod,
+            scan.traceDropped,
+            scan.noise,
+        )
+        val text = buildString {
+            append(title)
+            append(SKELETON_SEP).append('\n')
+            append(skeletonFit.first).append('\n')
+            append(ROLLING_SEP).append('\n')
+            append(rollingFit.first).append('\n')
+            append(TAIL_SEP).append('\n')
+            append(tailFit.first)
+        }
+        return BlockResult(text, skeletonFit.second, rollingFit.second, tailFit.second)
+    }
+
+    private fun buildSessionTitle(scan: SessionScan): String = buildString {
+        append("════ ").append(scan.session.name)
+        if (scan.session.hasOld) append("（含 -old.txt，old 在前）")
+        append("  ").append(scan.firstStamp).append(" ~ ").append(scan.lastStamp)
+        append("  ").append(kbText(scan.session.sizeBytes.toInt()))
+        append("  判决=").append(scan.verdict?.let { LiteLog.verdictLabel(it) } ?: "未知")
+        append("  版本=").append(scan.version)
+        append(" ════\n")
     }
 
     internal fun isSkeletonLine(lower: String): Boolean {
@@ -570,14 +776,11 @@ object RuntimeLogUploader {
 
     private fun buildHeader(
         context: Context,
-        current: File,
-        hasOld: Boolean,
+        scans: List<SessionScan>,
         stamp: String,
-        rollingStart: Long,
-        nowTod: Long,
         deviceCode: String,
     ): String = buildString {
-        append("运行日志（含 dongle 链路）\n\n")
+        append("运行日志（含 dongle 链路）— 最近 ").append(scans.size).append(" 份会话\n\n")
         append("设备：").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
         // 设备码是明文蓝牙 MAC + ROM 指纹（DeviceCode，VC250-02）：保留型号行之外，同 MAC 的不同车机靠指纹区分归机。
         // 上传脱敏只放行这一处「设备码」行（见 LogUploadPrivacy.DEVICE_CODE_MARK）。
@@ -593,24 +796,37 @@ object RuntimeLogUploader {
             .append("）\n")
         append("软件版本：").append(versionName(context)).append('\n')
         append("上传时间：").append(stamp).append('\n')
-        append("日志文件：").append(current.name)
-            .append(if (hasOld) "（含 -old.txt 轮转段，old 在前）" else "（无轮转段）")
-            .append('\n')
+        append("──── 会话清单（新 → 旧） ────\n")
+        scans.forEachIndexed { index, scan ->
+            append('[').append(index + 1).append("] ").append(scan.session.name)
+            if (scan.session.hasOld) append("（含 -old.txt）")
+            append("  ").append(scan.firstStamp).append(" ~ ").append(scan.lastStamp)
+            append("  ").append(kbText(scan.session.sizeBytes.toInt()))
+            append("  判决=").append(scan.verdict?.let { LiteLog.verdictLabel(it) } ?: "未知")
+            append("  版本=").append(scan.version)
+            append('\n')
+        }
         append("──── 采集范围 ────\n")
-        append("骨架区：dongle 检测/初始化/配对/锚点/总闸链路（上限 160KB，含 -old.txt；")
+        append("每份会话独立三段；时间锚点 = 该文件最后一条日志行的时刻（不按当前时间推算，旧会话同样成立）\n")
+        append("骨架区：dongle 检测/初始化/配对/锚点/总闸链路（每会话上限 160KB，含 -old.txt，old 在前；")
         append("超限时每个 gen 至少保留一条锚点行，优先省略 HCI 明细）\n")
-        append("滚动区：最近 20 分钟（").append(todText(rollingStart)).append(" ~ ")
-            .append(todText(nowTod - TAIL_WINDOW_MILLIS)).append("），整段丢弃 TRACE airplay\n")
-        append("尾区：最后 30 秒（").append(todText(nowTod - TAIL_WINDOW_MILLIS)).append(" ~ ")
-            .append(todText(nowTod)).append("）+ 收尾锚点\n")
+        append("滚动区：该会话最后 20 分钟，整段丢弃 TRACE airplay\n")
+        append("尾区：该会话最后 30 秒 + 收尾锚点；崩溃/异常会话尾区优先占该会话配额 1/2，其余 1/3\n")
         append("总上限：768KB；bulk read fail 仅首尾取样+计数\n")
     }
 
-    private fun buildFileName(context: Context, stamp: String, deviceCode: String): String {
+    private fun buildFileName(
+        context: Context,
+        stamp: String,
+        deviceCode: String,
+        sessions: Int,
+    ): String {
         val systemVersion = "Android${Build.VERSION.RELEASE}-api${Build.VERSION.SDK_INT}"
         val safeModel = Build.MODEL.trim().replace(Regex("[^0-9A-Za-z._-]"), "-")
+        // vc254：多会话批次标记 -s3（含 3 份会话）；单会话保持旧命名，便于历史检索不割裂。
+        val batch = if (sessions > 1) "-s$sessions" else ""
         // 设备码紧跟时间戳：仓库里同一秒上传的多台机器也能一眼区分归属。
-        return "diplay-$stamp-$deviceCode-$systemVersion-v${versionName(context)}-$safeModel.txt"
+        return "diplay-$stamp-$deviceCode-$systemVersion-v${versionName(context)}-$safeModel$batch.txt"
             .replace(Regex("[\\s]+"), "")
     }
 
@@ -633,15 +849,20 @@ object RuntimeLogUploader {
             lower.contains("microphone gain window")
     }
 
-    /** 解析 `MM-dd HH:mm:ss.SSS` → 当日毫秒（跨零点按 ±12h 归一）。 */
-    private fun parseTod(line: String, nowTod: Long): Long? {
+    /** 解析 `MM-dd HH:mm:ss.SSS` → 当日毫秒（跨零点按锚点 ±12h 归一）。 */
+    private fun parseTod(line: String, anchorTod: Long): Long? {
+        val tod = rawTod(line) ?: return null
+        return if (tod > anchorTod + 12 * 3_600_000L) tod - 24 * 3_600_000L else tod
+    }
+
+    /** 不做跨零点归一的当日毫秒（用于确定会话锚点）。 */
+    private fun rawTod(line: String): Long? {
         val m = TIME_REGEX.find(line) ?: return null
         val hour = m.groupValues[3].toIntOrNull() ?: return null
         val minute = m.groupValues[4].toIntOrNull() ?: return null
         val second = m.groupValues[5].toIntOrNull() ?: return null
         val millis = m.groupValues[6].toIntOrNull() ?: return null
-        val tod = hour * 3_600_000L + minute * 60_000L + second * 1_000L + millis
-        return if (tod > nowTod + 12 * 3_600_000L) tod - 24 * 3_600_000L else tod
+        return hour * 3_600_000L + minute * 60_000L + second * 1_000L + millis
     }
 
     private fun todOfNow(): Long {
@@ -699,7 +920,22 @@ object RuntimeLogUploader {
 
     // ---------- 上传（60s 总超时，409 同名加 -1 重试一次） ----------
 
+    /**
+     * vc255：上传流程收口必落盘。
+     *
+     * 现场反馈：上传本身成功，但「运行日志上传件已生成 / 运行日志上传成功」两行停在
+     * LiteLog 的 8 条批量缓冲里没写盘，日志恰好断在上传动作之前，无法取证。
+     * 这里只在流程结束时（成功/失败/提前返回）补一次 flush，不改 LiteLog 的常规节流。
+     */
     fun upload(prepared: Prepared): Result {
+        try {
+            return uploadInternal(prepared)
+        } finally {
+            LiteLog.flushNow()
+        }
+    }
+
+    private fun uploadInternal(prepared: Prepared): Result {
         val token = BuildConfig.GITEE_LOG_TOKEN
         if (token.isEmpty()) return Result(false, null, "GITEE_LOG_TOKEN 未配置")
         val encoded = try {
@@ -716,7 +952,15 @@ object RuntimeLogUploader {
             if (remaining <= 0) return Result(false, null, timeoutText())
             val timedOut = AtomicBoolean(false)
             val outcome = try {
-                postGiteeContents(token, attemptName, stamp, encoded, remaining, timedOut)
+                postGiteeContents(
+                    token,
+                    attemptName,
+                    stamp,
+                    prepared.sessions,
+                    encoded,
+                    remaining,
+                    timedOut,
+                )
             } catch (error: Exception) {
                 if (timedOut.get()) return Result(false, null, timeoutText())
                 val detail = UploadFailure.scrub(error.message.orEmpty(), token)
@@ -753,6 +997,7 @@ object RuntimeLogUploader {
         token: String,
         name: String,
         stamp: String,
+        sessions: Int,
         encoded: String,
         timeoutMs: Long,
         timedOut: AtomicBoolean,
@@ -765,7 +1010,7 @@ object RuntimeLogUploader {
         val body = JSONObject()
             .put("content", encoded)
             .put("branch", "master")
-            .put("message", "DiPlay Lite 运行日志（含 dongle 链路）$stamp")
+            .put("message", "DiPlay Lite 运行日志（含 dongle 链路，${sessions} 份会话）$stamp")
             .toString()
         val connection = url.openConnection() as HttpURLConnection
         val perCallTimeout = if (timeoutMs > Int.MAX_VALUE) Int.MAX_VALUE else timeoutMs.toInt()

@@ -421,9 +421,16 @@ class RelayClientManager(
         val frequencyMHz = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) info.frequency else 0
         // 1.0.13：观测信道同样吸附标准信道（2.4G→1/6/11，5G→36/44/149/157）后随 0x5703 下发，
         // iPhone 据此定向扫描；未知（0）时复用上次成功确认的信道，仍无则保持 0。
-        val channel = snapHotspotChannel(wifiFrequencyMhzToChannel(frequencyMHz) ?: 0)
+        val observedChannel = wifiFrequencyMhzToChannel(frequencyMHz) ?: 0
+        val channel = snapHotspotChannel(observedChannel)
             .takeIf { it > 0 }
             ?: ConfirmedChannelMemory.recall(appContext, ConfirmedChannelMemory.ROLE_RELAY)
+        // vc256：channel/frequency 来源标注（只影响诊断日志）。
+        val channelSource = when {
+            channel == 0 -> "unknown"
+            observedChannel > 0 -> "sta-connection"
+            else -> "memory"
+        }
         val bssid = info.bssid?.takeIf { it.isNotBlank() && it != "02:00:00:00:00:00" }
         return WirelessHotspotInfo(
             ssid = ssid,
@@ -444,6 +451,8 @@ class RelayClientManager(
                 else -> "relay"
             },
             backend = WirelessHotspotBackend.RELAY_CLIENT,
+            channelSource = channelSource,
+            frequencySource = if (frequencyMHz > 0) "sta-connection" else "unknown",
         )
     }
 

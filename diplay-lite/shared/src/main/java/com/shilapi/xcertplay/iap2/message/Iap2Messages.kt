@@ -79,7 +79,10 @@ object Iap2CarPlayMessages {
                 group(1) {
                     string(0, it.ssid)
                     string(1, it.passphrase)
-                    u8(2, it.channel)
+                    // vc256：channel=0 表示未知。0x4301 的无线组字段在 endpoint 目录里均非
+                    // required（iAP2 参数为 TLV，可缺省），未知时直接省略，让 iPhone 全信道扫描，
+                    // 不再下发猜测值（vc255 曾把 5GHz 热点谎报成 2.4G 信道 6）。
+                    optionalU8(2, it.channel.takeIf { channel -> channel > 0 })
                     it.ipAddresses.forEach { address -> string(3, address) }
                     u8(4, it.securityType)
                 }

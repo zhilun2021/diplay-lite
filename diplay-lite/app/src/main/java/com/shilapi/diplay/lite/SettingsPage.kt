@@ -1604,20 +1604,35 @@ class SettingsPage(private val activity: MainActivity) {
     /** 组装四段式上传件（失败回落 dongle skeleton 模式）→ worker 线程上传 Gitee（60s 总超时）。 */
     private fun uploadLogToGitee() {
         if (giteeUploading) return
-        val prepared = RuntimeLogUploader.prepare(activity)
-        if (prepared == null) {
-            toast("上传失败：日志为空")
-            return
-        }
         giteeUploading = true
         giteeUploadButton?.isEnabled = false
         Thread({
+            // vc255：组包先 flush + 300ms 兜底再取快照边界，必须在 worker 线程执行，
+            // 不能把延时压到主线程上。
+            val prepared = RuntimeLogUploader.prepare(activity)
+            if (prepared == null) {
+                // vc255：prepare 失败也属于上传流程结束，同样补一次落盘（否则拒绝原因停在缓冲里）。
+                LiteLog.flushNow()
+                activity.runOnUiThread {
+                    giteeUploading = false
+                    giteeUploadButton?.isEnabled = true
+                    toast("上传失败：日志为空")
+                }
+                return@Thread
+            }
             val result = RuntimeLogUploader.upload(prepared)
             activity.runOnUiThread {
                 giteeUploading = false
                 giteeUploadButton?.isEnabled = true
                 if (result.ok) {
-                    toast("上传成功：${result.remoteName ?: prepared.fileName}")
+                    // vc254：带上会话份数；上一会话异常退出时额外提示（闪退现场已随包上传）。
+                    val batch = if (prepared.sessions > 1) "（含 ${prepared.sessions} 份会话）" else ""
+                    val warn = when (prepared.verdict) {
+                        "crash", "abnormal" ->
+                            "；上次${LiteLog.verdictLabel(prepared.verdict)}，已一并上传"
+                        else -> ""
+                    }
+                    toast("上传成功：${result.remoteName ?: prepared.fileName}$batch$warn")
                 } else {
                     // 界面只给通用话术（不含仓名/token/URL）；状态码与响应摘要由
                     // RuntimeLogUploader 落到本地日志，用户导出即可见。

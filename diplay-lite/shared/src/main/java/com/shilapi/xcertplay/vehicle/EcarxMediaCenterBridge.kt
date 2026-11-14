@@ -368,11 +368,42 @@ class EcarxMediaCenterBridge(
             "getPlayingItemPositionInQueue" -> return -1
             "getLaunchIntent" -> return null
         }
-        // 若车机接口有歌词/副标题类查询：返回「两行」——第一行歌名、第二行艺人。
+        // 车机「音乐小窗」的歌词区：按接口返回类型给出两行（第一行歌名、第二行艺人）。
         val name = method.name.lowercase()
-        if (name.contains("lyric")) return CarPlayNowPlaying.twoLineText()
-        if (name.contains("subtitle") || name.contains("description")) {
-            return CarPlayNowPlaying.artist.ifEmpty { CarPlayNowPlaying.album }
+        val first = CarPlayNowPlaying.title
+        val second = CarPlayNowPlaying.artist.ifEmpty { CarPlayNowPlaying.album }
+        if (name.contains("lyric")) {
+            // 分行的取行接口：getLyric1/getFirstLyric/getLyricLine1 → 第一行；含 2/second/sub → 第二行。
+            val wantsSecond = name.contains("2") || name.contains("second") ||
+                name.contains("sub") || name.contains("bottom")
+            val wantsFirst = !wantsSecond && (name.contains("1") || name.contains("first") ||
+                name.contains("top"))
+            if (wantsSecond) return second
+            if (wantsFirst) return first
+            val two = listOf(first, second).filter { it.isNotEmpty() }
+            val joined = first + (if (second.isNotEmpty()) "\n" + second else "")
+            return when {
+                method.returnType == String::class.java -> joined
+                method.returnType.isArray &&
+                    method.returnType.componentType == String::class.java -> two.toTypedArray()
+                java.util.List::class.java.isAssignableFrom(method.returnType) -> two
+                method.returnType == Int::class.javaPrimitiveType -> two.size
+                else -> joined
+            }
+        }
+        if (name.contains("subtitle") || name.contains("description") ||
+            name.contains("second")) {
+            return second
+        }
+        if (name.contains("singer") || name.contains("performer")) return second
+        // 「小窗」歌词字号：若接口有字号查询，给偏小值以便两行都放得下。
+        if (name.contains("fontsize") || name.contains("textsize") ||
+            name.contains("fontsizeforlyric")) {
+            return when (method.returnType) {
+                java.lang.Float.TYPE -> 14f
+                java.lang.Double.TYPE -> 14.0
+                else -> 14
+            }
         }
         return defaultValue(method)
     }

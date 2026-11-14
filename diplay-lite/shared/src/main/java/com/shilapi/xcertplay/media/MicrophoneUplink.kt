@@ -519,6 +519,13 @@ internal class MicrophoneUplink(
     private fun attachAudioEffects(recorder: AudioRecord): String {
         val session = recorder.audioSessionId
         if (session <= 0) return "audioEffect=session-unavailable"
+        // 2026-11-14b（首次微信语音/通话无声）：平台 AEC/NS 在首次自适应期或存在音乐参考时
+        // 会把 VOICE_RECOGNITION 输入打成全零（实测「第一次按住说话没声，第二次才恢复」）。
+        // 车机 DSP 自带回声消除，这里对上行一律不挂平台效果，优先保证能录到声音。
+        if (config.audioType == "speechrecognition" || config.audioType == "telephony") {
+            releaseEffects()
+            return "audioEffect=disabled(speech/telephony; car-dsp-aec)"
+        }
         // vc178：换源时旧 AEC/NS 从不 release——每次静默自愈轮换都泄漏一对 AudioEffect
         // （AudioEffect 占 native 资源且受全局实例数限制，EU5 上多次轮换后可致后续
         // create 直接失败）。附加新实例前先释放上一轮。

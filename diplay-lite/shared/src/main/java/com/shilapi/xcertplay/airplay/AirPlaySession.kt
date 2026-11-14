@@ -819,14 +819,23 @@ class AirPlaySession(
                         // action 明示当前闸位：observe-only = 只记不拆；teardown = 已恢复完整动作。
                         val action =
                             if (KEEPALIVE_TIMEOUT_TEARDOWN_ENABLED) "teardown" else "observe-only"
-                        CarPlayStageLog.failure(
-                            "tunnel",
-                            "tunnel-timeout",
-                            "keepalive timeout no-packet ${silentMillis}ms" +
-                                " threshold=${KEEPALIVE_TIMEOUT_MILLIS}ms" +
-                                " period=${KEEPALIVE_PERIOD_MILLIS}ms" +
-                                " action=$action",
-                        )
+                        val detail = "keepalive timeout no-packet ${silentMillis}ms" +
+                            " threshold=${KEEPALIVE_TIMEOUT_MILLIS}ms" +
+                            " period=${KEEPALIVE_PERIOD_MILLIS}ms" +
+                            " action=$action"
+                        if (KEEPALIVE_TIMEOUT_TEARDOWN_ENABLED) {
+                            CarPlayStageLog.failure("tunnel", "tunnel-timeout", detail)
+                        } else {
+                            // vc275（TS7 实测误导项）：observe-only 本就不拆链，原先走 failure
+                            // 会把健康会话的日志判决刷成 failureClass=tunnel-timeout，看起来像
+                            // 故障。降级模式（实验 MFi 身份 → 无 type-130 隧道）下保活静默属预期，
+                            // 这里降级为 stage 诊断，不进判决。
+                            CarPlayStageLog.stage(
+                                "tunnel-observe",
+                                "$detail note=expected-in-degraded-mode" +
+                                    "(no type-130 tunnel; experimental MFi identity)",
+                            )
+                        }
                     }
                     if (KEEPALIVE_TIMEOUT_TEARDOWN_ENABLED) {
                         // 静默 teardown 回 Idle：不落 Failed、不弹失败卡；不接自动重连。

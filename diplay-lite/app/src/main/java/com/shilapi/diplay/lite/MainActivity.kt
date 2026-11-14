@@ -231,12 +231,8 @@ class MainActivity : Activity() {
         // vc101（at8317 用户反馈）：会话期系统栏常驻占用画面顶部（AC822X ROM 定制
         // 导航/状态合一栏，FLAG_FULLSCREEN 压不住）。挂 systemUiVisibility 三标志：
         // HIDE_NAVIGATION 收导航栏、FULLSCREEN 收状态栏、LOW_PROFILE 弱化残余控件。
-        // API 17 无 IMMERSIVE_STICKY（API 19+），触摸/焦点变化会唤回——监听变化 +
-        // onWindowFocusChanged 里 1.5s 后自动重藏。车机触摸少（方控为主），可接受。
-        window.decorView.setOnSystemUiVisibilityChangeListener { vis ->
-            val hidden = vis and View.SYSTEM_UI_FLAG_HIDE_NAVIGATION != 0
-            if (!hidden) handler.postDelayed(rehideSystemBars, 1_500)
-        }
+        // GS1/AC822X 实测 systemUiVisibility 无法隐藏顶栏；原“监听变化 + 1.5s 后自动
+        // 重藏”已移除（无效且形成无限重设循环），只保留一次性隐藏尝试。
         hideSystemBars()
         // M4l：车机屏绝不能休眠（API16 无 setOutputSurface，Surface 重建 = 解码器重配）。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -255,10 +251,8 @@ class MainActivity : Activity() {
         LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
         // vc102 副屏探测：仪表/HUD 投射路线判生死，默认日志检测（无按钮），结果写 LiteLog cluster 标签。
         ClusterDisplayProbe.probe(this)
-        // vc102 状态栏探针（AC822X 反馈 vc101 隐藏无效）：onCreate 立即 + t+3s 两次取证对比
-        // （systemUiVisibility 是否被 ROM 改回 + dumpsys window 看顶栏归属），结果写 statusbar 标签。
-        StatusBarProbe.probe(this, "onCreate")
-        handler.postDelayed({ StatusBarProbe.probe(this, "t+3s") }, 3_000)
+        // vc270：状态栏探针已摘除（VC270-02）——GS1 顶栏压不住已成定论，留它每次进页面都要
+        // spawn `sh -c dumpsys window`，低端车机上是纯开销。
         // vc148（启动阶段 VPN 状态检测）：先清理上次会话可能残留的 TUN fd/服务，
         // 再进入自动连接——残留的异常 VPN 连接若不清，establish 会在旧 fd 上叠新会话。
         ensureCleanVpnState()
@@ -426,19 +420,12 @@ class MainActivity : Activity() {
         super.onPause()
         LiteLog.log("ui", "onPause")
         handler.removeCallbacks(refreshTask)
-        handler.removeCallbacks(rehideSystemBars)
     }
 
     override fun onStop() {
         super.onStop()
         // vc247（V12）：切后台/被覆盖 —— 配对页若开着，必须落关窗（不能只靠 dismiss 回调）。
         ExternalBtPairingDialog.onHostBackgrounded()
-    }
-
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        super.onWindowFocusChanged(hasFocus)
-        // vc101（at8317）：焦点回归（弹窗关闭/权限对话框等）后系统栏会回来，重压。
-        if (hasFocus) hideSystemBars()
     }
 
     /** vc101（at8317）：API17 兼容的系统栏隐藏——HIDE_NAVIGATION+FULLSCREEN+LOW_PROFILE。 */
@@ -486,9 +473,6 @@ class MainActivity : Activity() {
             }
         }
     }
-
-    /** 系统栏被唤回后的自动重藏任务（监听器/postDelayed 复用，重复 post 无害需幂等）。 */
-    private val rehideSystemBars = Runnable { hideSystemBars() }
 
     override fun onDestroy() {
         LiteLog.log("ui", "onDestroy（Activity 被销毁，下一次进入会重建 Surface 与解码器）")

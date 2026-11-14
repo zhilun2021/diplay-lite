@@ -422,14 +422,18 @@ class RelayClientManager(
         // 1.0.13：观测信道同样吸附标准信道（2.4G→1/6/11，5G→36/44/149/157）后随 0x5703 下发，
         // iPhone 据此定向扫描；未知（0）时复用上次成功确认的信道，仍无则保持 0。
         val observedChannel = wifiFrequencyMhzToChannel(frequencyMHz) ?: 0
-        val channel = snapHotspotChannel(observedChannel)
+        // vc274：信道不许留 0——0x4301 的无线组缺 channel 时 iOS 不建链（TS7 实测），
+        // 且 0 本身也不是合法信道号。三档：观测吸附值 > 成功记忆 > 2.4G 常用默认 6，
+        // 全部标注来源，默认值不计入「已验证信道」。
+        val snappedChannel = snapHotspotChannel(observedChannel).takeIf { it > 0 }
+        val recalledChannel = ConfirmedChannelMemory.recall(appContext, ConfirmedChannelMemory.ROLE_RELAY)
             .takeIf { it > 0 }
-            ?: ConfirmedChannelMemory.recall(appContext, ConfirmedChannelMemory.ROLE_RELAY)
+        val channel = snappedChannel ?: recalledChannel ?: DEFAULT_RELAY_CHANNEL
         // vc256：channel/frequency 来源标注（只影响诊断日志）。
         val channelSource = when {
-            channel == 0 -> "unknown"
-            observedChannel > 0 -> "sta-connection"
-            else -> "memory"
+            snappedChannel != null -> "sta-connection"
+            recalledChannel != null -> "memory"
+            else -> "assumed-2.4g"
         }
         val bssid = info.bssid?.takeIf { it.isNotBlank() && it != "02:00:00:00:00:00" }
         return WirelessHotspotInfo(
@@ -485,6 +489,8 @@ class RelayClientManager(
         // AP 数据面有几秒到几十秒启动窗口，ICMP 不回属瞬时假阴性，2s×2（实际 ~4.3s
         // 全程）太短，用户被迫手动重试；放宽后覆盖窗口期，总上限 ~15s。
         private const val REACHABLE_TIMEOUT_MILLIS = 3_000
+        /** vc274：中继侧信道未知时的默认宣告值（0x5703/0x4301 必须带合法信道号）。 */
+        private const val DEFAULT_RELAY_CHANNEL = 6
         private const val REACHABLE_RETRY_DELAY_MILLIS = 1_000L
         private const val REACHABLE_ATTEMPTS = 4
         // vc174：ICMP 不通后的 TCP 补刀探测（DNS / HTTP / HTTPS），单端口超时。

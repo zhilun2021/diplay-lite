@@ -121,7 +121,12 @@ class ManualHotspotManager(
                     apFrequencyMHz = apConfiguration?.frequencyMHz,
                 )
                 // 1.0.15：观测/手填都没有时，优先复用上次会话成功确认过的信道
-                // （ConfirmedChannelMemory）；仍然没有就发 0（未知），由 0x4301 省略该字段。
+                // （ConfirmedChannelMemory）。
+                // vc274：记忆也没有时不再留 0——0x5703/0x4301 必须带信道，iOS 缺省该字段
+                // 直接不建链（2026-11-14 TS7 实测）。改为按热点频段给常用默认信道：
+                // 2.4G→6（1/6/11 中的居中非重叠信道，Android 软 AP 常见默认），
+                // 5G→149（中国区 UNII-3 非 DFS 频段，国产 ROM 自动选信道常落在此）。
+                // 仅在「完全无观测」时使用，日志标 assumed-* 以示非实测值。
                 // vc257：下发给 iPhone 的信道是「描述已有热点」，必须原样使用观测/配置值。
                 // 旧实现先过 snapHotspotChannel()（2.4G 就近吸附到 1/6/11），把实测 ch2 改写成
                 // ch1；K60 实测（vc256 日志 expectedChannel=2 → sendChannel=1，实际频点 2417MHz）
@@ -142,8 +147,21 @@ class ManualHotspotManager(
                         val recalled = ConfirmedChannelMemory
                             .recall(appContext, ConfirmedChannelMemory.ROLE_CAR)
                             .takeIf { it > 0 }
-                        channel = recalled ?: 0
-                        channelSource = if (recalled != null) "memory" else "unknown"
+                        if (recalled != null) {
+                            channel = recalled
+                            channelSource = "memory"
+                        } else {
+                            val fiveGhz = isFiveGhzHotspot(
+                                apBand = apConfiguration?.band,
+                                softApFrequencyMHz = softApFrequency,
+                                apFrequencyMHz = apConfiguration?.frequencyMHz,
+                                connectionFrequencyMHz = connectionFrequency,
+                                scanFrequencyMHz = scanFrequency,
+                                expected = expectedBand,
+                            )
+                            channel = if (fiveGhz) DEFAULT_5G_CHANNEL else DEFAULT_24G_CHANNEL
+                            channelSource = if (fiveGhz) "assumed-5g" else "assumed-2.4g"
+                        }
                     }
                 }
                 val frequencyMHz: Int?
@@ -593,8 +611,36 @@ class ManualHotspotManager(
     private fun remainingNanos(deadlineNanos: Long): Long =
         (deadlineNanos - System.nanoTime()).coerceAtLeast(0L)
 
-    /** 0 表示未知：日志显示 auto，0x4301 里直接省略该字段，不再输出猜测值。 */
+    /** 0 表示未知：日志显示 auto。vc274 起 0 不会再进 0x5703/0x4301（默认值在热点层兜底）。 */
     private fun channelText(value: Int): String = if (value > 0) value.toString() else "auto"
+
+    /**
+     * vc274：判定当前热点是否 5GHz，仅用于「信道完全未知时选默认值」。
+     *
+     * 优先级：AP 配置 band（1=2.4G/2=5G）> 任一频点观测（≥4900MHz 视为 5G）>
+     * 用户配置的 expectedBand > 全部未知按 2.4G（兼容性最好；本次出问题的 TS7 实测即 2.4G）。
+     */
+    private fun isFiveGhzHotspot(
+        apBand: Int?,
+        softApFrequencyMHz: Int?,
+        apFrequencyMHz: Int?,
+        connectionFrequencyMHz: Int?,
+        scanFrequencyMHz: Int?,
+        expected: ManualHotspotBand,
+    ): Boolean {
+        when (apBand) {
+            1 -> return false
+            2 -> return true
+        }
+        val frequency = listOfNotNull(
+            softApFrequencyMHz,
+            apFrequencyMHz,
+            connectionFrequencyMHz,
+            scanFrequencyMHz,
+        ).firstOrNull()
+        if (frequency != null) return frequency >= FIVE_GHZ_MIN_MHZ
+        return expected == ManualHotspotBand.GHZ_5
+    }
 
     /**
      * 等 SoftApCallback 的首个 onInfoChanged（最多 [maxMillis]）。
@@ -632,6 +678,11 @@ class ManualHotspotManager(
         const val NANOS_PER_MILLISECOND = 1_000_000L
         /** vc256：等待 SoftApCallback 首个频点的上限（热点已在运行、回调可能不重放时）。 */
         const val SOFT_AP_CALLBACK_WAIT_MILLIS = 600L
+        /** vc274：信道完全未知时的默认宣告值（0x5703/0x4301 必须带信道）。 */
+        const val DEFAULT_24G_CHANNEL = 6
+        const val DEFAULT_5G_CHANNEL = 149
+        /** vc274：频点判 5GHz 的下界（2.4G 最高约 2484MHz）。 */
+        const val FIVE_GHZ_MIN_MHZ = 4_900
         val INTERFACE_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(250)
         val SOFT_AP_CALLBACK_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(100)
         val EXCLUDED_INTERFACE_PREFIXES = listOf(

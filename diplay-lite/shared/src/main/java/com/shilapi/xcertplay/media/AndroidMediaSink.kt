@@ -583,6 +583,13 @@ private class VideoDecoder(
     // 1.1.3（绿线修复②）：恢复/重建/surface 重接后抑制渲染，直到下一个 IDR 真正喂进解码器，
     // 挡掉厂商 OMX flush 后吐出的残留脏缓冲（8815 短暂绿线的另一来源）。
     @Volatile private var renderHold = true
+    // vc277（TS7 切桌面回来花屏·二次定案）：SPRD OMX 输出缓冲**不打** BUFFER_FLAG_KEY_FRAME
+    //（vc276 实测：hold 只能靠 1.5s 兜底解除，解除瞬间把 IDR 之前的 P 帧放上屏 = 花屏）。
+    // 改为「抑制期只让 IDR 进解码器」：P 帧直接丢弃、不进 codec，输出队列因此不可能残留脏帧，
+    // IDR 入队即可安全解除抑制。不依赖任何厂商输出标志。
+    @Volatile private var renderHoldSinceNs = System.nanoTime()
+    /** vc277：抑制期被丢弃的非 IDR 帧计数（仅诊断，解除时随日志输出）。 */
+    private var holdSkippedFrames = 0
     // 1.1.3（绿线修复③·渲染节奏限流）：render-latest 只在单次 drain 内去重，burst 时解码线程
     // 每个 feed 调一次 drain、每次渲一帧，渲染速率仍跟着解码速度走（弱机瞬间 60~100fps），
     // 8815 实测绿线仍在。加最小渲染间隔（≈一帧显示周期）：间隔内的帧跳过不上屏，
@@ -678,7 +685,7 @@ private class VideoDecoder(
                     fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
                     referenceChain.reset()
-                    renderHold = true
+                    beginRenderHold("decoder error")
                     requestKeyFrameIfDue()
                 } catch (error: Throwable) {
                     // 码率/帧长突变时可能抛 Error（OutOfMemoryError 等），catch(Exception) 兜不住，
@@ -689,7 +696,7 @@ private class VideoDecoder(
                     fallBackFromSoftwareDecoder(error)
                     releaseDecoder()
                     referenceChain.reset()
-                    renderHold = true
+                    beginRenderHold("decoder crashed")
                     requestKeyFrameIfDue()
                 }
             }
@@ -721,6 +728,40 @@ private class VideoDecoder(
         recover("video render stall (frames arriving, none rendered)", rebuildDecoder = false)
     }
 
+    /**
+     * vc276：进入渲染抑制（等干净 IDR）。记录置位时刻与「IDR 已入队」标记，
+     * 供关键帧输出解除与超时兜底使用。
+     */
+    private fun beginRenderHold(reason: String) {
+        renderHold = true
+        renderHoldSinceNs = System.nanoTime()
+        holdSkippedFrames = 0
+        Log.i(TAG, "video render hold begin: $reason")
+    }
+
+    /** vc276：解除渲染抑制。幂等；每次解除落一行，便于对齐「花屏/黑屏窗口」。 */
+    private fun releaseRenderHold(reason: String) {
+        if (!renderHold) return
+        renderHold = false
+        renderHoldSinceNs = 0L
+        report("render hold released: $reason")
+    }
+
+    /**
+     * vc277：兜底。抑制期只放 IDR 进解码器，若迟迟等不到 IDR（iPhone 忽略关键帧请求、
+     * 或 GOP 很长）就不能一直黑屏——超时后退回「按普通帧续解」的旧行为并明确记日志。
+     */
+    private fun maybeReleaseStaleRenderHold() {
+        if (!renderHold) return
+        val since = renderHoldSinceNs
+        if (since == 0L) return
+        if (System.nanoTime() - since < RENDER_HOLD_FALLBACK_NS) return
+        releaseRenderHold(
+            "fallback timeout: no IDR within ${RENDER_HOLD_FALLBACK_NS / 1_000_000}ms " +
+                "(resume non-IDR decoding; picture may glitch)",
+        )
+    }
+
     private fun configureDecoder(config: VideoJob.Config) {
         val previous = lastConfig
         if (
@@ -738,7 +779,7 @@ private class VideoDecoder(
         duplicateConfigLogged = false
         releaseDecoder()
         referenceChain.reset()
-        renderHold = true
+        beginRenderHold("decoder reconfigured")
         val surface = outputSurface ?: return
         val codec = config.codec
         val codecData = config.codecData
@@ -900,7 +941,7 @@ private class VideoDecoder(
                     codec.setOutputSurface(surface)
                     Log.i(TAG, "video decoder output surface updated")
                     // 新 surface 上首帧必须来自干净 IDR（旧 surface 的在途帧到新 surface 上就是花屏/绿线）。
-                    renderHold = true
+                    beginRenderHold("surface swapped (setOutputSurface)")
                     // 1.0.29（AC8227 倒车闪屏）：surface 重新接线立即请求关键帧，
                     // 不等首帧 P 帧被拒才触发 —— 缩短倒车结束后的黑屏恢复期。
                     forceKeyFrameRequest("surface reattached")
@@ -911,6 +952,12 @@ private class VideoDecoder(
             }
         }
         releaseDecoder()
+        // vc272（方案 A·TS7 切桌面回来花屏）：重建解码器路径与上方 setOutputSurface
+        // 分支同样要 renderHold=true。缺这行时（TS7 api27 实测 17:44:02）surface 重接
+        // 走 reconfigure，renderHold 仍为 false，流中间的 P 帧无参考直接上屏 → 花屏
+        // 1~1.5s，直到 render stall 检测触发 flush 才自愈。置位后 P 帧只解码不渲染，
+        // 等下一个 IDR 放行——花屏变为一瞬黑屏。
+        beginRenderHold("surface reattached after reconfigure")
         lastConfig?.let(::configureDecoder)
         if (decoder != null) forceKeyFrameRequest("surface reattached after reconfigure")
     }
@@ -934,6 +981,16 @@ private class VideoDecoder(
         lastFrameKeyFrame = keyFrame
         if (!referenceChain.accepts(keyFrame)) {
             requestKeyFrameIfDue()
+            return
+        }
+        // vc277（TS7 花屏二次定案）：抑制期只让 IDR 进解码器。P 帧无参考、解出来就是脏画面；
+        // 只要它们不进 codec，输出队列就不可能有残留帧，IDR 入队即可安全解除抑制。
+        // 这样不依赖厂商 OMX 的 BUFFER_FLAG_KEY_FRAME（SPRD 实测不打该标志）。
+        if (renderHold && !keyFrame) {
+            holdSkippedFrames++
+            requestKeyFrameIfDue()
+            // 抑制期没有输出可 drain，兜底计时在这里心跳，防「永不等到 IDR」永久黑屏。
+            maybeReleaseStaleRenderHold()
             return
         }
         if (decoder == null) configureDecoder(config)
@@ -963,7 +1020,7 @@ private class VideoDecoder(
             )
             releaseDecoder()
             referenceChain.reset()
-            renderHold = true
+            beginRenderHold("input buffer unavailable")
             requestKeyFrameIfDue()
             return
         }
@@ -972,8 +1029,12 @@ private class VideoDecoder(
             input.put(annexB)
             codec.queueInputBuffer(index, 0, annexB.size, System.nanoTime() / 1000, 0)
             referenceChain.onQueued()
-            // IDR 已入解码器：解除渲染抑制（其后输出才是干净画面）。
-            if (keyFrame) renderHold = false
+            // vc277：抑制期唯一放行的就是 IDR，它一入队，后续输出必为干净帧，可解除抑制。
+            // 非抑制态下 releaseRenderHold 内部直接返回，零副作用。
+            if (keyFrame) {
+                releaseRenderHold("keyframe queued (skipped non-IDR=$holdSkippedFrames)")
+                holdSkippedFrames = 0
+            }
         } else {
             recover("video frame exceeded codec input capacity")
             return
@@ -1014,7 +1075,7 @@ private class VideoDecoder(
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
         report("recovery: $reason; waiting for keyframe" + if (rebuildDecoder) "" else " (flush decoder)")
-        renderHold = true
+        beginRenderHold("recover: $reason")
         if (rebuildDecoder) {
             // Recreate with codec-specific data: flush can discard CSD before the first output.
             releaseDecoder()
@@ -1070,6 +1131,8 @@ private class VideoDecoder(
         // vc239（VID-234-03）：合并模式下当前持有帧的入队时刻（纯观测）。
         var pendingSinceNs = 0L
         fun renderPending(): Boolean {
+            // vc276：OMX 不给关键帧输出打标志时的兜底解除（避免永久黑屏）。
+            maybeReleaseStaleRenderHold()
             // vc237（A1）：待渲帧先出队；未到节拍再放回队首。关开关仍走原 pendingIndex，
             // 合并/丢弃行为与 vc236 逐字节一致。加锁只为防 close/flush 线程并发清队。
             val queued = if (noCoalesce) {
@@ -1163,6 +1226,8 @@ private class VideoDecoder(
                     logOutputFormat(codec.outputFormat)
                 }
                 index >= 0 -> {
+                    // vc277：抑制期的干净性由「输入侧只放 IDR」保证，输出侧不再做关键帧标志判定
+                    //（SPRD OMX 不打 BUFFER_FLAG_KEY_FRAME，靠它会退化成 1.5s 兜底解除→花屏）。
                     if (noCoalesce) {
                         // vc237（A1）：不合并——后到帧不再挤掉待渲帧，按到达顺序入队。
                         // 恢复挂起期（renderHold，等干净 IDR）不积压旧流帧，直接归还。
@@ -1312,6 +1377,12 @@ private class VideoDecoder(
         // （来电/通话/Siri 流重建后只发 P 帧不补参数集），恢复后 10s 内不再重复触发。
         const val RENDER_STALL_THRESHOLD_NS = 3_000_000_000L
         const val RENDER_STALL_RECOVERY_INTERVAL_NS = 10_000_000_000L
+        // vc277：兜底时限。抑制期只放 IDR 进来，正常 1s 内就能拿到（surface 重接会立即要 IDR
+        // 且每 1s 重发请求）；超过该时限仍未见到 IDR 才退回「按普通帧续解」，避免永久黑屏。
+        // 取值依据（TS7 有线实测 19:26:57）：iPhone 对 forceKeyFrame 的响应并不及时，天然 IDR
+        // 在解码器创建后 ~5s 才到。因此兜底必须显著大于该窗口，否则会在 IDR 到达前就放行
+        // P 帧——那一段既不会出画（无参考），还可能让厂商解码器吐出脏缓冲。
+        const val RENDER_HOLD_FALLBACK_NS = 8_000_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }

@@ -129,6 +129,8 @@ class CarPlayBonjour(
     // vc258（B）：true 时进程内复用 JmDNS 实例（跨代只 unregister/register，不重开），
     // 把每代 ~7.5s 的 create 摊销掉；false = 现状（每代 create/close）。
     private val prewarmMdns: Boolean = false,
+    // vc269（MX6 取证）：广播地址诊断行（走宿主 debugLog 落文件日志）。
+    private val onDiagnostic: (String) -> Unit = {},
     private val onEvent: (CarPlayBonjourEvent) -> Unit = {},
 ) : Closeable {
     // API16 适配：NsdServiceInfo 的 getter（getServiceName/getServiceType/getPort/
@@ -315,6 +317,9 @@ class CarPlayBonjour(
                     )
                     dns.registerService(airPlayInfo)
                     registeredInfo = airPlayInfo
+                    // vc272：绑接口分支补挂广播地址探针（vc269 只挂在 API<21 分支，
+                    // K60/TS7/MX6 全走本分支，日志里才能看到 A 记录实际地址）。
+                    logAdvertisementAddresses(airPlayInfo)
                 } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
                     // API16 实测修正（10-02 20:26）：NsdManager 的 setAttribute 是 API 21+，
                     // 4.1 广播带不了 txt（CarPlay 必需）；JmDNS 绑热点接口 ENODEV，改无接口
@@ -337,6 +342,7 @@ class CarPlayBonjour(
                     )
                     dns.registerService(legacyInfo)
                     registeredInfo = legacyInfo
+                    logAdvertisementAddresses(legacyInfo)
                 } else {
                     val nsd = nsdManager ?: throw IOException(
                         "NsdManager 系统服务不可用（ROM 残废，广播降级非致命）: " +
@@ -528,6 +534,36 @@ class CarPlayBonjour(
             }
     } catch (_: Exception) {
         null
+    }
+
+    /**
+     * vc269（MX6 现场取证）：把「mDNS 广播最终用的是哪个地址」落进文件日志。
+     *
+     * 为什么需要：API<21 走的是 `JmDNS.create(name)`（不绑接口），A/AAAA 记录取
+     * `InetAddress.getLocalHost()`，多播出口由内核默认路由决定。多网卡车机（usb0 10.0.x.x
+     * + 热点 wlan0 192.168.43.1）上可能广播出 iPhone 根本到不了的地址——现场表现就是
+     * 「iPhone 已入网却永远 0 TCP」，而日志里只能看到被打码的 `192.168.*.*`，无从分辨。
+     * 只读日志，不参与任何连接判断。
+     */
+    private fun logAdvertisementAddresses(info: ServiceInfo) {
+        val localHost = runCatching { InetAddress.getLocalHost().hostAddress }.getOrNull()
+        val server = runCatching { info.server }.getOrNull()
+        onDiagnostic(
+            "mdns advertise localHost=${localHost ?: "unknown"} server=${server ?: "unknown"} " +
+                "port=${info.port} bound=${localAdvertisedAddress?.hostAddress ?: "wildcard"} " +
+                "api=${Build.VERSION.SDK_INT}",
+        )
+        runCatching {
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .filter { runCatching { it.isUp }.getOrDefault(false) && !it.isLoopback }
+                .forEach { nif ->
+                    val addresses = Collections.list(nif.inetAddresses)
+                        .joinToString(",") { it.hostAddress ?: "?" }
+                    onDiagnostic("mdns iface ${nif.name} addrs=$addresses")
+                }
+        }.onFailure {
+            onDiagnostic("mdns iface dump failed ${it.javaClass.simpleName}: ${it.message}")
+        }
     }
 
     /**

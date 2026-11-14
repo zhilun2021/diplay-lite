@@ -39,6 +39,8 @@ import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
 import com.shilapi.xcertplay.network.AirPlayTcpServer
 import com.shilapi.xcertplay.network.CarHotspotStatus
 import com.shilapi.xcertplay.network.CarPlayBonjour
+import com.shilapi.xcertplay.network.CarPlayBonjourProtocol
+import com.shilapi.xcertplay.network.WirelessMdnsAnnouncer
 import com.shilapi.xcertplay.network.ConfirmedChannelMemory
 import com.shilapi.xcertplay.network.Ipv6NcmBridge
 import com.shilapi.xcertplay.network.ManualHotspotManager
@@ -245,6 +247,15 @@ class CarPlayController(
     @Volatile private var retainedHotspot: Pair<WirelessHotspotManager, WirelessHotspotInfo>? = null
     @Volatile private var lastHotspotInfo: WirelessHotspotInfo? = null
     @Volatile private var bonjour: CarPlayBonjour? = null
+
+    /** vc272：热点模式 mDNS 单播通告器（软 AP 多播下行失效兜底），teardown 停止。 */
+    @Volatile private var wirelessMdnsAnnouncer: WirelessMdnsAnnouncer? = null
+
+    /**
+     * vc272：已关联 STA IP 注入回调（logHotspotStaArp 观测到新 iPhone IP 时调）。
+     * 由 announcer 启动时装载，teardown 置空。
+     */
+    @Volatile private var hotspotStaArpListener: ((InetAddress) -> Unit)? = null
     @Volatile private var bluetoothSocket: BluetoothSocket? = null
     @Volatile private var bluetoothStream: BlockingDuplexByteStream? = null
 
@@ -303,6 +314,9 @@ class CarPlayController(
     private val wiredRetryCount = AtomicInteger(0)
     // 1.0.15：本代 0x5703 实际下发的信道；SESSION_ACTIVE 后写入成功配置记忆。
     @Volatile private var lastAdvertisedHotspotChannel = 0
+    // vc274：本代信道是否为实测/配置值。默认值（assumed-2.4g / assumed-5g）不得写入
+    // ConfirmedChannelMemory——否则「下发猜测值 → 下次读回当已知」形成自证循环。
+    @Volatile private var lastAdvertisedChannelObserved = false
     private val wirelessGeneration = AtomicInteger(0)
     // vc250-06：控制面与媒体面拆成两条独立事实。活性判定（看门狗/降级/断流回收）
     // 只认无线媒体面；控制面（蓝牙 RFCOMM / type-130 隧道）死亡不再等同会话失败。
@@ -982,7 +996,9 @@ class CarPlayController(
                 ?: throw IOException("MFi coprocessor client is unavailable")
             val hotspotInfo = startWirelessHotspot(generation)
             // 1.0.15：记住本代实际下发的信道，供 SESSION_ACTIVE 后写入成功配置记忆。
+            // vc274：assumed-* 是默认值而非观测，不允许回灌记忆。
             lastAdvertisedHotspotChannel = hotspotInfo.channel
+            lastAdvertisedChannelObserved = !hotspotInfo.channelSource.startsWith("assumed")
             if (isStaleWirelessRun(generation)) {
                 closeWirelessStack()
                 return
@@ -1156,6 +1172,8 @@ class CarPlayController(
                 useInterfaceMdns = true,
                 // vc258（B）：模式 2 时复用进程内 JmDNS 实例，跨代只重注册服务。
                 prewarmMdns = config.mdnsConnectBoost >= MDNS_BOOST_PREWARM,
+                // vc269：广播地址诊断（A 记录/网卡地址）落文件日志。
+                onDiagnostic = { line -> debugLog("wireless $line") },
                 onEvent = { event -> debugLog("wireless bonjour: ${event.diagnosticSummary()}") },
             )
             bonjour = bonjourClient
@@ -1177,6 +1195,36 @@ class CarPlayController(
                                     "closed gen=$generation",
                             )
                             return@Thread
+                        }
+                        // vc272（TS7 软 AP 多播下行失效兜底）：热点模式下 JmDNS 多播 announce
+                        // 到不了已关联 iPhone（tcpdump 本地可见、iPhone 收不到、tcpAccepted=0），
+                        // 改用单播 announce 直发 STA 的 5353（iPhone mDNSResponder 接受单播
+                        // announce，收到即解析连 7100）。中继模式多播经上游路由器转发正常，不启用。
+                        if (hotspotInfo != null) {
+                            val announcer = WirelessMdnsAnnouncer(
+                                onDiagnostic = { line -> debugLog("wireless $line") },
+                            ).also { wirelessMdnsAnnouncer = it }
+                            announcer.attach(
+                                WirelessMdnsAnnouncer.Params(
+                                    bindAddress = hostAddress,
+                                    instanceName = effectiveWirelessAirPlayConfig.deviceName,
+                                    port = effectiveWirelessAirPlayConfig.port,
+                                    txtRecords = CarPlayBonjourProtocol.airPlayTxtRecords(
+                                        effectiveWirelessAirPlayConfig,
+                                        identity,
+                                    ),
+                                ),
+                            )
+                            hotspotStaArpListener = { address -> announcer.addTarget(address) }
+                            announcer.start()
+                            // vc272b：立刻读一次 ARP 播种目标——iPhone 通常在监听口就绪前
+                            // 就已入网（vc272 首测 18:20:57 associated=true），等下一次
+                            // sta-arp 观测会让前几轮通告空转（实测前 5 轮 sent=0）。
+                            logHotspotStaArp("mdns-announcer-start")
+                            debugLog(
+                                "wireless mdns unicast announcer started gen=$generation " +
+                                    "bind=$hostAddressText instance=${effectiveWirelessAirPlayConfig.deviceName}",
+                            )
                         }
                         debugLog(
                             "wireless Bonjour services started mode=interface (async) " +
@@ -1360,7 +1408,11 @@ class CarPlayController(
                     val clients = hotspot?.staClientCount() ?: -1
                     when {
                         clients > 0 -> true
-                        clients == 0 -> false
+                        // vc276（TS7 慢在 8s）：该 ROM 的 SoftAp 客户端数恒报 0（SoftApCallback
+                        // 不支持），vc264 把「明确 0」当未入网，于是每代 0x4301 前空等满额
+                        // 8.0s（实测 waitedMs=8034），而 /proc/net/arp 里 iPhone 早已关联。
+                        // 0 不能当权威否定：ARP 有 peer 即视为已入网，仅在 ARP 也空时才等。
+                        clients == 0 -> hasHotspotStaAssociated()
                         // vc266：SoftAp 客户端数不可用（MIUI SecurityException）时用时间启发式：
                         // 10 分钟内有过 AirPlay TCP = warm，直接放行；否则 cold，等 3.5s。
                         else -> recentlyConnectedOverAirPlay()
@@ -2015,15 +2067,23 @@ class CarPlayController(
         // M6k23：会话建立即清未建流 EOF 计数。
         preStreamEofCount = 0
         // 1.0.15：会话真建立 → 本代下发的信道记为「验证过能连上」，下次读不到信道时复用。
-        ConfirmedChannelMemory.remember(
-            context,
-            if (config.wirelessHotspotMode == WirelessHotspotMode.RELAY) {
-                ConfirmedChannelMemory.ROLE_RELAY
-            } else {
-                ConfirmedChannelMemory.ROLE_CAR
-            },
-            lastAdvertisedHotspotChannel,
-        )
+        // vc274：仅写入实测/配置信道；默认值不算验证（否则默认值会被反复自我确认）。
+        if (lastAdvertisedChannelObserved) {
+            ConfirmedChannelMemory.remember(
+                context,
+                if (config.wirelessHotspotMode == WirelessHotspotMode.RELAY) {
+                    ConfirmedChannelMemory.ROLE_RELAY
+                } else {
+                    ConfirmedChannelMemory.ROLE_CAR
+                },
+                lastAdvertisedHotspotChannel,
+            )
+        } else {
+            debugLog(
+                "wireless channel memory skipped: advertised=${lastAdvertisedHotspotChannel} " +
+                    "is a default (assumed), not an observed value",
+            )
+        }
         logWirelessSessionActive(generation, attempt)
         Thread(
             {
@@ -2241,7 +2301,10 @@ class CarPlayController(
         logWirelessSessionActive(generation, attempt, degraded = true, handoffReason = handoffReason)
         debugLog(
             "handoff degraded: keeping Bluetooth iAP2 + Wi-Fi A/V " +
-                "(hasRenderedFrame, no type-130 iAP2 tunnel, reason=$handoffReason)",
+                "(hasRenderedFrame, no type-130 iAP2 tunnel, reason=$handoffReason) " +
+                // vc275（误导项标注）：这是一条正常路径，不是故障——当前实验档使用 MFi 身份，
+                // 不建 type-130 隧道；A/V 与画面上屏不受影响，仅控制面留在蓝牙。
+                "note=expected(experimental-MFi-identity; control-on-BT, media-on-WiFi)",
         )
         onStatus(CarPlayStatus.WirelessActive)
     }
@@ -3168,6 +3231,10 @@ class CarPlayController(
         // iAP2 隧道/蓝牙断开，否则 iOS 把蓝牙掉线当瞬时抖动而保持 CarPlay（用户实测：
         // 必须手动关车机热点/蓝牙才退）。每步补文件日志，供下一轮无 adb 的实机日志定位。
         debugLog("wireless teardown step=1/5 unregistering Bonjour advertisement")
+        // vc272：单播通告器与 STA 注入回调随代次结束停止（先停通告再关监听，语义同上）。
+        hotspotStaArpListener = null
+        runCatching { wirelessMdnsAnnouncer?.stop() }
+        wirelessMdnsAnnouncer = null
         val activeBonjour = bonjour
         bonjour = null
         if (activeBonjour != null) {
@@ -4933,6 +5000,10 @@ class CarPlayController(
                 "count=${entries.size} " +
                 "ips=${if (entries.isEmpty()) "none" else entries.joinToString(",")}",
         )
+        // vc272：观测到新 STA IP 即喂给单播通告器（幂等去重，announcer 未启动时为 no-op）。
+        for (ip in entries) {
+            runCatching { hotspotStaArpListener?.invoke(InetAddress.getByName(ip)) }
+        }
     }
 
     /** vc258：iPhone（或任一 STA）是否已关联到本机热点网段（只读 /proc/net/arp）。 */

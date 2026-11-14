@@ -79,10 +79,13 @@ object Iap2CarPlayMessages {
                 group(1) {
                     string(0, it.ssid)
                     string(1, it.passphrase)
-                    // vc256：channel=0 表示未知。0x4301 的无线组字段在 endpoint 目录里均非
-                    // required（iAP2 参数为 TLV，可缺省），未知时直接省略，让 iPhone 全信道扫描，
-                    // 不再下发猜测值（vc255 曾把 5GHz 热点谎报成 2.4G 信道 6）。
-                    optionalU8(2, it.channel.takeIf { channel -> channel > 0 })
+                    // vc274：恢复为无条件发送。vc256 曾把未知信道改成省略该 TLV，2026-11-14
+                    // TS7 热点实测证否：channel 缺省时 0x4301 帧长 168B（含 channel 为 173B，
+                    // 差 4 字节 TLV 头 + 1 字节值），iPhone 收到后 36 秒零连接；同机 vc245 发
+                    // channel=6（默认值兜底）时 0.2 秒即建 TCP。默认值由热点层算好（见
+                    // ManualHotspotManager 的 assumed-2.4g / assumed-5g），本层不做兜底，
+                    // 保证 0x5703 与 0x4301 使用同一个信道值。
+                    u8(2, it.channel)
                     it.ipAddresses.forEach { address -> string(3, address) }
                     u8(4, it.securityType)
                 }

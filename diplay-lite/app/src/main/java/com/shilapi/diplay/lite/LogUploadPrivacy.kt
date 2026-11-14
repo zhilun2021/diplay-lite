@@ -3,6 +3,15 @@ package com.shilapi.diplay.lite
 import java.util.Locale
 
 /**
+ * vc277（1.5.5 发布）：恢复上传件脱敏。
+ *
+ * vc269 为 MX6 无线取证临时置 false（要看清 Bonjour 广播的 A 记录是哪个网卡的地址），
+ * 取证已于 2026-11-14 结束（结论：iPhone 不依赖广播，断点是 0x4301 缺 channel 字段），
+ * 发布包必须恢复打码。
+ */
+internal const val UPLOAD_REDACTION_ENABLED = true
+
+/**
  * vc248（VC248-02）：上传副本脱敏。
  *
  * 只作用于**上传件**（落入磁盘待上传的那一份）；本地运行日志与设置页导出保持原文。
@@ -71,6 +80,8 @@ internal object LogRedactor {
 
     /** 整体脱敏：对上传件正文调用一次即可。 */
     fun redact(text: String): String {
+        // vc269：取证包直接放行原文（见 UPLOAD_REDACTION_ENABLED 注释）。
+        if (!UPLOAD_REDACTION_ENABLED) return text
         // 先给「设备码」落点的整串（MAC + 可选 ROM 指纹）打上占位符，全量脱敏后再还原
         // （原因见 DEVICE_CODE_MARK 注释）。
         val deviceCodes = ArrayList<String>()
@@ -134,6 +145,7 @@ internal object LogRedactor {
 
     /** 逐行脱敏（dongle 上传件在截断前调用，保证 -old.txt 与裁剪段同样被覆盖）。 */
     fun redactLines(lines: MutableList<String>) {
+        if (!UPLOAD_REDACTION_ENABLED) return
         for (index in lines.indices) lines[index] = redact(lines[index])
     }
 

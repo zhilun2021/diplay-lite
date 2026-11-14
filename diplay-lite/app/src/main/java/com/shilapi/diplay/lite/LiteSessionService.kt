@@ -271,8 +271,9 @@ class LiteSessionService : Service() {
         WiredUsbForensics.start()
         // vc102 副屏探测：会话启动时再查一次（捕捉倒车屏/仪表投射屏等动态副屏），写日志无 UI。
         ClusterDisplayProbe.probe(this)
-        // vc102 状态栏探针：会话期顶栏占用正是用户报的场景，session-start 取全局窗口清单。
-        StatusBarProbe.probe(this, "session-start")
+        // vc271（T3-B 无线取证）：root 可用时，连接发起 10s 后抓一轮网络现场
+        // （ARP/IGMP/TCP 监听表 + tcpdump 5353/7100），结果写 t3probe 标签。正式包 ENABLED=false 即失效。
+        T3NetProbe.schedule(this, "session")
         // vc250-03：服务侧发起连接即开启本次计时会话（各阶段 t/dt 与汇总的起点），重复连接重置。
         LiteLog.beginSession()
         startController()
@@ -1075,18 +1076,29 @@ class LiteSessionService : Service() {
             val linkSpeed = info.linkSpeed
             val frequency =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) info.frequency else 0
+            // vc275（误导项标注）：热点模式下没有 STA 上行，getConnectionInfo() 返回
+            // ip=0.0.0.0 / rssi=-127 / freq=0，日志里看起来像链路故障。显式标注为「AP 模式
+            // 无 STA 统计」，避免被当成丢包/信号问题排查。
+            val ip = ipv4Text(info.ipAddress)
+            val apNote =
+                if (info.ipAddress == 0) " note=ap-mode(no-sta-uplink;values-unavailable)" else ""
             "rssi=${if (rssi in -120..0) "${rssi}dBm" else "?"} " +
                 "link=${if (linkSpeed > 0) "${linkSpeed}Mbps" else "?"} " +
                 "freq=${if (frequency > 0) "${frequency}MHz" else "?"} " +
-                "ip=${ipv4Text(info.ipAddress)}"
+                "ip=$ip$apNote"
         } catch (error: Throwable) {
             "wm-error=${error.javaClass.simpleName}"
         }
     }
 
+    /**
+     * vc270：修正 IP 字节序。`WifiInfo.getIpAddress()` 返回的是**小端** int
+     * （第一个八位在最低字节），此前按大端取，日志里打成 `ip=120.88.168.192`
+     * （真实值 192.168.88.120），四个段正好倒过来。现在按小端还原。
+     */
     private fun ipv4Text(value: Int): String =
-        "${(value shr 24) and 0xff}.${(value shr 16) and 0xff}." +
-            "${(value shr 8) and 0xff}.${value and 0xff}"
+        "${value and 0xff}.${(value shr 8) and 0xff}." +
+            "${(value shr 16) and 0xff}.${(value shr 24) and 0xff}"
 
     @Suppress("DEPRECATION")
     private fun screenMetrics(): Pair<Int, Int> {

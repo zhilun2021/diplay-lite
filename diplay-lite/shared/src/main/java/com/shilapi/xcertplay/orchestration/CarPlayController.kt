@@ -73,6 +73,7 @@ import com.shilapi.xcertplay.transport.Iap2WirelessControlTerminal
 import com.shilapi.xcertplay.transport.Iap2WirelessIdentification
 import com.shilapi.xcertplay.transport.Iap2WiredCarPlayEndpoint
 import com.shilapi.xcertplay.transport.Iap2WiredControlClient
+import com.shilapi.xcertplay.vehicle.CarPlayNowPlaying
 import com.shilapi.xcertplay.transport.Iap2WiredControlStage
 import com.shilapi.xcertplay.transport.IphoneCarPlayConfiguration
 import com.shilapi.xcertplay.transport.IphoneUsbException
@@ -869,6 +870,10 @@ class CarPlayController(
         // vc97③：记录控制面最近收帧时刻（心跳/应用帧均算）——Ipv6NcmBridge wedge
         // 判别器探针的数据源。无线路径同样更新，无副作用（探针仅有线桥使用）。
         wiredControlLastRxAtNanos = System.nanoTime()
+        // 2026-11-14：iAP2 NowPlayingUpdate(0x5001) → 车机媒体卡两行（歌名/艺人）。
+        if (frame.messageId == CarPlayNowPlaying.MESSAGE_NOW_PLAYING_UPDATE) {
+            CarPlayNowPlaying.onIap2NowPlayingUpdate(frame.payload)
+        }
         BydNavigationOutputs.onFrame(frame)
     }
 

@@ -372,6 +372,19 @@ class AndroidMediaSink(
 
     /** 1.1.4：上行启动 + 失败延时重试（800ms→2s），重试时全新建 uplink 走完整兜底矩阵。 */
     private fun startMicrophoneUplink(type: Int, config: MicrophoneConfig, retriesLeft: Int) {
+        // 2026-11-14b（首次使用麦克风无声）：必须在打开录音源「之前」清空输出占用。
+        // 否则 HAL 在「音乐仍在播」时给 AudioRecord 打上静音，首次上行全零；只有手动
+        // 暂停音乐后重开才恢复。这里先落媒体闸门（暂停 MEDIA 轨 + 独占音频焦点），
+        // 再等一小段让暂停真正生效，然后才 openRecorder。
+        val gateBecameActive = markUplinkActive(type, true)
+        if (gateBecameActive) {
+            // 80ms ≈ AudioTrack.pause + AudioFlinger 命令下发落定窗口，避免竞态。
+            try {
+                Thread.sleep(80L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
         // API16 适配：ConcurrentHashMap.computeIfAbsent 是 API 24+，改两段式 get + putIfAbsent。
         var uplink = microphoneUplinks[type]
         if (uplink == null) {
@@ -388,18 +401,18 @@ class AndroidMediaSink(
         }
         if (uplink.start()) {
             cancelMicrophoneRetries(type)
-            markUplinkActive(type, true)
             return
         }
         microphoneUplinks.remove(type, uplink)
-        markUplinkActive(type, false)
         if (retriesLeft <= 0) {
+            markUplinkActive(type, false)
             onAudioDiagnostic(
                 "Microphone uplink start failed after retries; " +
                     "uplink stays silent until iPhone re-SETUP. snapshot: ${microphoneSystemSnapshot()}",
             )
             return
         }
+        // 重试期间保持闸门不释放：否则音乐回闪一瞬又会在下一次 open 时把麦克风压住。
         val delay = if (retriesLeft == 2) 800L else 2000L
         // vc201：cancel(false) 拦不住 in-flight 任务体——已作废的延迟任务若已起跑，
         // 仍会执行 startMicrophoneUplink 造成孤儿 uplink（一路跑到 sink.close() 才被收）。
@@ -567,10 +580,11 @@ class AndroidMediaSink(
     /**
      * 2026-11-14（麦克风无声修复）：按「当前有几路上行」维护媒体闸门。
      * 多路上行（通话 + Siri）用集合计数，任何一个建立即闸门生效，全部结束才恢复。
+     * @return true 表示本次调用把闸门从「无」切到「有」（调用方据此决定是否等待落定）。
      */
-    private fun markUplinkActive(type: Int, active: Boolean) {
+    private fun markUplinkActive(type: Int, active: Boolean): Boolean {
         val changed = if (active) uplinkGateTypes.add(type) else uplinkGateTypes.remove(type)
-        if (!changed) return
+        if (!changed) return false
         val gate = synchronized(uplinkGateTypes) { uplinkGateTypes.isNotEmpty() }
         if (gate != uplinkMediaGate) uplinkMediaGate = gate
         synchronized(duckLock) { applyDuckLocked() }
@@ -581,6 +595,7 @@ class AndroidMediaSink(
                 (if (gate) "active → 暂停音乐(媒体闸门)" else "ended → 恢复音乐") +
                 " types=$types",
         )
+        return active
     }
 }
 

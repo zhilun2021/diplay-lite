@@ -91,6 +91,10 @@ class EcarxMediaCenterBridge(
             if (closed || active) return
             active = true
         }
+        // 2026-11-14：NowPlaying 元数据变化 → 重新发布到车机媒体卡（两行：歌名/艺人）。
+        CarPlayNowPlaying.listener = {
+            if (!closed && active) submit { publish(explicit = false) }
+        }
         submit { connectAndRegister() }
     }
 
@@ -106,6 +110,7 @@ class EcarxMediaCenterBridge(
             closed = true
             active = false
         }
+        CarPlayNowPlaying.listener = null
         submit {
             unregisterQuiet()
             ownedContext?.close()
@@ -331,20 +336,43 @@ class EcarxMediaCenterBridge(
             "getMediaSourceTypeList" -> return intArrayOf(SOURCE_ONLINE)
             "getPlaylist" -> return emptyList<Any>()
             "getCurrentProgress" -> return 0L
-            "getMusicPlaybackInfo" -> return null
+            "getMusicPlaybackInfo" -> return buildPlaybackInfoProxy()
         }
         return defaultValue(method)
     }
 
-    /** IMusicPlaybackInfo proxy：空元数据（无歌名），音源 ONLINE、播放中。 */
+    /** 生成 IMusicPlaybackInfo 代理，供 SDK 主动查询当前曲目（两行：标题/艺人）。 */
+    private fun buildPlaybackInfoProxy(): Any? {
+        val loader = apiClass?.classLoader ?: return null
+        return try {
+            val infoType = Class.forName(IMUSIC_PLAYBACK_INFO, true, loader)
+            Proxy.newProxyInstance(
+                loader,
+                arrayOf(infoType),
+                InvocationHandler { _, method, _ -> playbackInfoValue(method) },
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** IMusicPlaybackInfo proxy：CarPlay NowPlaying 元数据（歌名/艺人/专辑）。 */
     private fun playbackInfoValue(method: Method): Any? {
         when (method.name) {
-            "getTitle", "getArtist", "getAlbum" -> return ""
+            "getTitle" -> return CarPlayNowPlaying.title
+            "getArtist" -> return CarPlayNowPlaying.artist
+            "getAlbum" -> return CarPlayNowPlaying.album
             "getPlaybackStatus" -> return 1
             "getSourceType" -> return SOURCE_ONLINE
             "getDuration" -> return 0L
             "getPlayingItemPositionInQueue" -> return -1
             "getLaunchIntent" -> return null
+        }
+        // 若车机接口有歌词/副标题类查询：返回「两行」——第一行歌名、第二行艺人。
+        val name = method.name.lowercase()
+        if (name.contains("lyric")) return CarPlayNowPlaying.twoLineText()
+        if (name.contains("subtitle") || name.contains("description")) {
+            return CarPlayNowPlaying.artist.ifEmpty { CarPlayNowPlaying.album }
         }
         return defaultValue(method)
     }

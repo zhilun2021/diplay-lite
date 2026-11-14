@@ -151,6 +151,13 @@ class AndroidMediaSink(
      * 允许积压（靠既有 backlog/stalled 兜底）。默认 false；重连（重建 sink）后生效。
      */
     private val videoNoCoalesce: Boolean = false,
+    /**
+     * 2026-11-14（通话/发语音麦克风无声修复）：麦克风上行（telephony / speechrecognition）
+     * 建立或结束时回调 true/false。上行期间 App 侧申请独占音频焦点让系统暂停其它播放器，
+     * sink 侧同时把自家 MEDIA 轨暂停并丢弃在途媒体包——避免「音乐占用音频输出 → 车机
+     * HAL 把麦克风压成静音」。此前只有手动暂停音乐会恢复，即该闸门的用户侧证据。
+     */
+    private val onMicrophoneUplinkActive: ((Boolean) -> Unit)? = null,
 ) : MediaSink {
     /**
      * vc236：VSYNC 节拍器。Choreographer 自 API16 起可用；独立 HandlerThread 上持续
@@ -381,9 +388,11 @@ class AndroidMediaSink(
         }
         if (uplink.start()) {
             cancelMicrophoneRetries(type)
+            markUplinkActive(type, true)
             return
         }
         microphoneUplinks.remove(type, uplink)
+        markUplinkActive(type, false)
         if (retriesLeft <= 0) {
             onAudioDiagnostic(
                 "Microphone uplink start failed after retries; " +
@@ -416,6 +425,7 @@ class AndroidMediaSink(
     override fun onMicrophoneStopped(type: Int) {
         cancelMicrophoneRetries(type)
         microphoneUplinks.remove(type)?.close()
+        markUplinkActive(type, false)
     }
 
     fun close() {
@@ -437,6 +447,13 @@ class AndroidMediaSink(
         microphoneUplinks.clear()
         microphoneRetryFutures.clear()
         microphoneRetryExecutor.shutdownNow()
+        // 2026-11-14：会话结束兜底释放上行闸门（若仍有登记的上行类型）。
+        if (synchronized(uplinkGateTypes) { uplinkGateTypes.isNotEmpty() }) {
+            synchronized(uplinkGateTypes) { uplinkGateTypes.clear() }
+            uplinkMediaGate = false
+            synchronized(duckLock) { applyDuckLocked() }
+            onMicrophoneUplinkActive?.invoke(false)
+        }
         // vc173：mediaStallMonitor 是 `while(true)` 线程，**仅靠 InterruptedException 退出**，
         // 而 close() 此前从未 interrupt 它 ⇒ 每次重连新建一个 sink 就泄漏一个常驻线程，
         // 且该线程通过闭包持有 audioRenderers/videoDecoders 等 ⇒ **整个 sink 对象图都释放不掉**，
@@ -505,6 +522,9 @@ class AndroidMediaSink(
 
     private val duckLock = Any()
     @Volatile private var navigationActive = false
+    /** 2026-11-14：麦克风上行期间的媒体闸门——true 时暂停 MEDIA 轨并丢弃在途媒体包。 */
+    @Volatile private var uplinkMediaGate = false
+    private val uplinkGateTypes = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
 
     /**
      * 某条音频流的"通道活跃/结束"通知（由 AudioRenderer 在建/销毁输出轨时回调）。
@@ -528,15 +548,40 @@ class AndroidMediaSink(
         }
     }
 
-    /** 只在导航活跃时压低 MEDIA 轨（导航自身不受影响）。 */
+    /** 只在导航活跃时压低 MEDIA 轨（导航自身不受影响）；麦克风上行期间则整体静音+暂停。 */
     private fun applyDuckLocked() {
-        val factor = if (navigationActive) {
-            (navigationDuckPercent().coerceIn(0, 100)) / 100f
-        } else {
-            1f
+        val factor = when {
+            uplinkMediaGate -> 0f
+            navigationActive -> (navigationDuckPercent().coerceIn(0, 100)) / 100f
+            else -> 1f
         }
         audioRenderers.values.forEach { renderer ->
-            if (renderer.channel == AudioChannel.MEDIA) renderer.setPlaybackVolume(factor)
+            if (renderer.channel == AudioChannel.MEDIA) {
+                // 上行闸门优先：暂停轨 + 丢弃在途包，等价于「手动暂停音乐」。
+                renderer.setUplinkSuspended(uplinkMediaGate)
+                renderer.setPlaybackVolume(factor)
+            }
+        }
+    }
+
+    /**
+     * 2026-11-14（麦克风无声修复）：按「当前有几路上行」维护媒体闸门。
+     * 多路上行（通话 + Siri）用集合计数，任何一个建立即闸门生效，全部结束才恢复。
+     */
+    private fun markUplinkActive(type: Int, active: Boolean) {
+        val changed = if (active) uplinkGateTypes.add(type) else uplinkGateTypes.remove(type)
+        if (!changed) return
+        val gate = synchronized(uplinkGateTypes) { uplinkGateTypes.isNotEmpty() }
+        if (gate != uplinkMediaGate) uplinkMediaGate = gate
+        synchronized(duckLock) { applyDuckLocked() }
+        if (changed) {
+            val types = synchronized(uplinkGateTypes) { uplinkGateTypes.toList() }
+            onMicrophoneUplinkActive?.invoke(gate)
+            onAudioDiagnostic(
+                "Audio: microphone uplink " +
+                    (if (gate) "active → 暂停音乐(媒体闸门)" else "ended → 恢复音乐") +
+                    " types=$types",
+            )
         }
     }
 }
@@ -1431,6 +1476,8 @@ private class AudioRenderer(
     private var underrunsAtPlaybackStart = 0
     private var lastPcmWriteNs = 0L
     private var rebufferCount = 0
+    /** 2026-11-14：麦克风上行期间本轨暂停（见 [setUplinkSuspended]）。 */
+    @Volatile private var uplinkSuspended = false
     // P0: RTP frame-loss compensation state (see compensateMissingFrames).
     private var lastTimestampUs = -1L
     private var lastIncrementUs = 0L
@@ -1462,6 +1509,29 @@ private class AudioRenderer(
             runCatching { current.setStereoVolume(volume, volume) }
         }
     }
+    /**
+     * 2026-11-14（通话/发语音麦克风无声修复）：麦克风上行期间暂停本 MEDIA 轨并清空待播队列。
+     * 车机 HAL 在音频输出活跃时会把输入（麦克风）压成静音；暂停+丢弃在途包等价于用户
+     * 「手动暂停音乐」，从而让麦克风恢复。上行结束后由下一次音频包按起播阈值自然恢复。
+     */
+    fun setUplinkSuspended(suspend: Boolean) {
+        if (uplinkSuspended == suspend) return
+        uplinkSuspended = suspend
+        if (suspend) {
+            runCatching { track?.pause() }
+            // 暂停后 flush：丢弃已排队 PCM 并解除可能阻塞中的 write（暂停且满的轨会让 write 永久阻塞）。
+            runCatching { track?.flush() }
+            playbackStarted = false
+            prebufferBytes = 0
+            queue.clear()
+            report("Audio: media paused for microphone uplink type=${format.payloadType}")
+        } else {
+            runCatching { track?.flush() }
+            queue.clear()
+            report("Audio: media restored after microphone uplink type=${format.payloadType}")
+        }
+    }
+
     private val thread = Thread({
         // 音频解码 + 写轨：抬到 AUDIO —— 低于收包（URGENT_AUDIO），但高于视频/系统默认，
         // 避免它和视频解码抢 CPU 时被拖出 underrun。
@@ -1483,6 +1553,11 @@ private class AudioRenderer(
     }
 
     fun submit(rtp: ByteArray, sample: Int) {
+        // 2026-11-14：麦克风上行期间整条 MEDIA 轨暂停，直接丢弃在途媒体包（避免写阻塞/回放过期音频）。
+        if (uplinkSuspended) {
+            if (started) packetsDropped.incrementAndGet()
+            return
+        }
         if (started) {
             packetsReceived.incrementAndGet()
             BandwidthMonitor.onAudioBytes(rtp.size)

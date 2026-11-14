@@ -419,6 +419,8 @@ class LiteSessionService : Service() {
             preferSoftwareHevcDecoder = config.softwareVideoDecoder,
             onAudioDiagnostic = { LiteLog.log("media", it) },
             onPhoneChannelActive = ::onPhoneChannelActive,
+            // 2026-11-14（麦克风无声修复）：上行期间申请独占音频焦点，暂停车机其它播放器。
+            onMicrophoneUplinkActive = ::onMicrophoneUplinkActive,
             // M6d：导航播报时压低音乐。取值函数——改设置后下一次播报即生效，无需重连。
             navigationDuckPercent = { LiteConfig.load(this).navDuckPercent },
             // M6k19：音乐缓存（设置页 10-4000ms 可调）。
@@ -1016,6 +1018,49 @@ class LiteSessionService : Service() {
         "WPA3" -> ManualHotspotSecurity.WPA3
         "OPEN" -> ManualHotspotSecurity.OPEN
         else -> ManualHotspotSecurity.WPA2
+    }
+
+    /**
+     * 2026-11-14（通话/发语音麦克风无声修复）：麦克风上行建立/结束时申请/释放独占音频焦点。
+     *
+     * 现象：通话或发语音时麦克风无声，手动暂停音乐后恢复 —— 说明车机 HAL 在「有音频输出」
+     * 时把输入（麦克风）压成静音。自家 CarPlay 媒体轨由 sink 的媒体闸门暂停；这里再用
+     * AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE 让车机上的其它播放器（本地音乐/收音机等）暂停，
+     * 双管齐下把「输出占用」清空，上行结束后释放焦点恢复。
+     */
+    private var uplinkFocusHeld = false
+
+    private fun onMicrophoneUplinkActive(active: Boolean) {
+        val audio = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+        try {
+            if (active) {
+                if (uplinkFocusHeld) return
+                val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                    @Suppress("DEPRECATION")
+                    audio.requestAudioFocus(
+                        null,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE,
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    audio.requestAudioFocus(
+                        null,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+                    )
+                }
+                uplinkFocusHeld = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                LiteLog.log("media", "麦克风上行→请求独占音频焦点 granted=$uplinkFocusHeld")
+            } else if (uplinkFocusHeld) {
+                @Suppress("DEPRECATION")
+                audio.abandonAudioFocus(null)
+                uplinkFocusHeld = false
+                LiteLog.log("media", "麦克风上行结束→释放音频焦点")
+            }
+        } catch (error: Exception) {
+            LiteLog.log("media", "麦克风上行音频焦点操作失败 active=$active ${error.message}")
+        }
     }
 
     /**

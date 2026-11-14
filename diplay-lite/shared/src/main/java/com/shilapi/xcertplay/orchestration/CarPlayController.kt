@@ -3737,7 +3737,9 @@ class CarPlayController(
                     target = current
                 }
                 debugLog("ncm open retry #$attempt after claim failure")
-                Thread.sleep(500L)
+                // 2026-11-14（有线提速）：500 → 300 → 200。上一轮已经关连接重开，claim 失败是
+                // 端点表问题而非「没落定」，没必要多等。
+                Thread.sleep(200L)
             }
             try {
                 return openNcmOnce(target, attempt, usbSession)
@@ -5122,9 +5124,13 @@ class CarPlayController(
         @Volatile private var cachedLocalBtMac: String? = null
         // —— USB 有线（U3）——
         private const val PAIR_TIMEOUT_MILLIS = 5 * 60_000L
-        private const val PERMISSION_POLL_INTERVAL_MILLIS = 500L
+        // 2026-11-14（有线提速）：200 → 120。权限轮询纯属本地状态查询，加密有线链路稳定，
+        // 收紧到 120ms 让授权后立刻推进建链。
+        private const val PERMISSION_POLL_INTERVAL_MILLIS = 120L
         private const val PERMISSION_POLL_TIMEOUT_MILLIS = 120_000L
-        private const val DEVICE_AVAILABILITY_POLL_INTERVAL_MILLIS = 2_000L
+        // 2026-11-14（有线提速）：2s → 800ms → 500ms。插线后 iPhone 由 USB 图库模式切到
+        // CarPlay 组态是固定 1~3s 的事，轮询越密越早动起来。
+        private const val DEVICE_AVAILABILITY_POLL_INTERVAL_MILLIS = 500L
         // vc96（FE-6 实测 94s 黑等）：WaitingForIphone 超此时长提示用户拔插 USB 线。
         private const val IPHONE_WAIT_PROMPT_MILLIS = 10_000L
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
@@ -5171,9 +5177,9 @@ class CarPlayController(
         // 1.0.1：重枚举阶段看门狗（15s 显性失败）与轮询兜底（1.1.4 起 500ms）
         // /样本日志节拍（polls%8，约 4s 一打）。
         private const val REENUMERATION_WATCHDOG_MILLIS = 15_000L
-        // 1.1.4：2s→500ms（对齐上游 400ms）——重枚举通常 1~3s，2s 轮询白耗时间且
-        // 与看门狗窗口不匹配；500ms 让重枚举完成后尽快进入权限请求。
-        private const val REENUMERATION_POLL_INTERVAL_MILLIS = 500L
+        // 2026-11-14（有线提速）：500ms → 200ms → 120ms——重枚举完成后尽快进入权限请求，
+        // 纯 listDevices 遍历，成本可忽略。
+        private const val REENUMERATION_POLL_INTERVAL_MILLIS = 120L
         // M6k23：未建流阶段控制流 peer EOF 触发整代重启的阈值（连续次数）。
         private const val PRE_STREAM_EOF_RESTART_THRESHOLD = 2
         // vc152：对端优雅结束会话后的 0x4301 邀请节奏——3s 首轮，30s 补轮，2 次封顶。

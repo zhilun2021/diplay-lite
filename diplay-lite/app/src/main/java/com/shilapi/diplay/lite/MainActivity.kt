@@ -1422,11 +1422,14 @@ class MainActivity : Activity() {
         if (width <= 0 || height <= 0) return false
         // 只有 ACTION_MOVE 是可合并的中间态；DOWN/UP/POINTER_*/CANCEL 都必须逐条送达。
         val sticky = event.actionMasked != MotionEvent.ACTION_MOVE
-        // 1.0.7：MOVE 按 30fps 节流——手指按屏抖动会以 60Hz 洪灌 HID 通道
+        // 1.0.7：MOVE 节流——手指按屏抖动会以 60Hz 洪灌 HID 通道
         // （3e 实测 15 秒 310 条 POST），DOWN/UP 不受影响。
+        // 2026-11-14（跟手度）：16ms → 8ms。sendTouch 已用「MOVE 队尾就地覆盖 + 单泵串行
+        // 排空」兜住洪灌（合并后真正上 USB 的条数与采样率无关），这里再放宽到 ~120Hz 采样，
+        // 让滑动中间态更完整、画面更跟手。
         if (!sticky) {
             val now = System.currentTimeMillis()
-            if (now - lastMoveForwardMs < 33) return true
+            if (now - lastMoveForwardMs < 8) return true
             lastMoveForwardMs = now
         }
         return service.sendTouch(CarPlayTouchMapper.contacts(event, width, height), sticky)

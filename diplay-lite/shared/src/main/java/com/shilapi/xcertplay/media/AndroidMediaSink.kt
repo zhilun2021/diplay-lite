@@ -47,12 +47,11 @@ class AndroidMediaSink(
     onScreenStreamActiveChanged: ((Int, Boolean) -> Unit)? = null,
     private val mediaBufferMillis: Int = MediaAudioBuffer.DEFAULT_MILLIS,
     /**
-     * vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲语义）：媒体流预缓冲开关。
-     * true 时媒体（音乐）流的起播/复播水位抬到约 1s（PREBUFFER_LEAD_MILLIS，上游
-     * LEAD_MILLIS），让 AudioTrack 队列天然吸收 ≤1s 的 Wi-Fi 断流；关闭则维持
-     * [mediaBufferMillis] 原阈值（起播更快）。仅 media 生效，通话/Siri 等低延迟流不受影响。
+     * vc156 媒体流预缓冲开关（2026-11-14 有线默认关闭）：有线 USB 链路稳定，不再用预缓冲
+     * 换抗抖能力——PREBUFFER_LEAD_MILLIS 已归零，打开也不再加水位；起播/复播一律按
+     * [mediaBufferMillis] 原阈值即出。仅 media 生效，通话/Siri 等低延迟流不受影响。
      */
-    private val audioPrebufferEnabled: Boolean = true,
+    private val audioPrebufferEnabled: Boolean = false,
     private val onAudioDiagnostic: (String) -> Unit = {},
     /**
      * M6c：CarPlay 电话流（[AudioChannel.PHONE]）出现/消失时回调 true/false。
@@ -1171,9 +1170,27 @@ private class VideoDecoder(
                         } else {
                             // vc239（VID-234-03）：入队即记时刻，并在入队后采样队列深度峰值。
                             val pending = PendingOutput(index, System.nanoTime())
+                            // 2026-11-14（跟手度）：队列封顶。不合并模式是「一个 VSYNC 上屏一帧」，
+                            // 出队速率被面板刷新率卡死在 ≤60fps；一旦链路突发把队列灌深，积压
+                            // **永远排不空**（入队速率同为 60fps）→ 画面长期比手指慢几十~上百毫秒，
+                            // 主观就是「连上后操作画面不跟手」。只保留 MAX_PENDING_OUTPUT_FRAMES 帧
+                            // 上屏余量，超出就把最旧的待渲帧直接归还（render=false）：丢掉的只是
+                            // 「已解码帧的显示机会」，不触碰参考链、不影响后续解码；稳态永不触发。
+                            var droppedIndex = -1
                             val depth = synchronized(pendingOutputs) {
+                                while (pendingOutputs.size >= MAX_PENDING_OUTPUT_FRAMES) {
+                                    droppedIndex = pendingOutputs.removeFirst().index
+                                }
                                 pendingOutputs.addLast(pending)
                                 pendingOutputs.size
+                            }
+                            if (droppedIndex >= 0) {
+                                try {
+                                    codec.releaseOutputBuffer(droppedIndex, false)
+                                } catch (_: Exception) {
+                                    // close/flush 竞态：组件正在拆除，best effort。
+                                }
+                                stats.onSuperseded()
                             }
                             stats.onPendingDepth(depth)
                         }
@@ -1308,6 +1325,10 @@ private class VideoDecoder(
         // 1.1.3（绿线修复③）：最小渲染间隔 ≈ 一帧显示周期（60Hz→16.7ms）。
         // burst 期间解码速度可到 60~100fps，超频渲染在老显示管线上出 scanout 异常（绿线）。
         const val RENDER_MIN_INTERVAL_NS = 16_000_000L
+        // 2026-11-14（连接后画面流畅度/跟手度）：不合并模式下待渲队列硬上限 3 → 2 帧。
+        // 出队被 VSYNC 卡在 ≤60fps，链路突发后队列只会越来越深且不会自愈；封顶 2 帧把稳态
+        // 显示延迟再压 ~16ms，操作画面更跟手，代价是极端突发时丢弃最旧的显示机会。
+        const val MAX_PENDING_OUTPUT_FRAMES = 2
         // vc150（T3 来电假死）：静默渲染看门狗阈值/限频——3s 零渲染且流在来即判假死
         // （来电/通话/Siri 流重建后只发 P 帧不补参数集），恢复后 10s 内不再重复触发。
         const val RENDER_STALL_THRESHOLD_NS = 3_000_000_000L
@@ -1687,12 +1708,10 @@ private class AudioRenderer(
             plan.trackBufferBytes
         }
         startThresholdBytes = MediaAudioBuffer.startBytesFor(plan.startBytes, capacityBytes, PREBUFFER_WRITE_CHUNK_BYTES)
-        // vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲语义，LEAD_MILLIS=1000ms）：
-        // 仅媒体流且开关开启时，把起播/复播水位抬到 max(配置阈值, ~1s)。**不新增第二层缓冲**：
-        // 预缓冲的就是 AudioTrack 这一条 MODE_STREAM 队列本身，容量仍由 MediaAudioBuffer.plan
-        // 规划（媒体池 ≥ MEDIA_MIN_CAPACITY_MILLIS=1500ms，1s 水位放得下）；水位抬高后
-        // 低水位 rebuffer（lowWatermarkMs）按同一条 startThresholdBytes 派生，语义自动对齐。
-        // 再过一次 startBytesFor 钳制：保证 start ≤ capacity-写块，暂停态 blocking write 不卡死。
+        // vc156 预缓冲语义（2026-11-14 有线调整）：仅媒体流且开关开启时才把起播/复播水位
+        // 抬到 max(配置阈值, PREBUFFER_LEAD_MILLIS)；现 LEAD=0 且默认关，实际不再抬水位，
+        // 起播即按配置阈值出声。缓冲容量仍由 MediaAudioBuffer.plan 规划（媒体池下限=起播阈值
+        // 300ms，无额外余量）。再过一次 startBytesFor 钳制：保证 start ≤ capacity-写块。
         if (prebufferEnabled && format.audioType == "media") {
             val leadBytes = (bytesPerSecond.toLong() * PREBUFFER_LEAD_MILLIS / 1000L).toInt()
             if (leadBytes > startThresholdBytes) {
@@ -2387,12 +2406,13 @@ private class AudioRenderer(
         const val BUFFER_TAIL_WAIT_NS = 500_000_000L
         // M6v：低水位 pause 后等补缓冲的最长时长（「一小段」）；超时放行残量，防止流尾被永久卡住。
         const val WATERMARK_PAUSE_MAX_NS = 1_000_000_000L
-        // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
-        const val MAX_QUEUED_PACKETS = 192
+        // 2026-11-14（有线）：不再保留抗 Wi-Fi 抖动余量——解码包队列由 ~4s 收到 ~1s，
+        // 只吸收解码抖动，不作为无线断流蓄水池。
+        const val MAX_QUEUED_PACKETS = 48
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
-        // vc156：媒体预缓冲水位（移植自上游 0.2.21 BufferedAudioStream.LEAD_MILLIS）——
-        // 播放时保持约 1s 音频领先于实时，盖住无线链路常见数百 ms~1s 的断流。
-        const val PREBUFFER_LEAD_MILLIS = 1000L
+        // 2026-11-14（声音延迟修复）：300 → 0。预缓冲水位归零，按播放即出声，
+        // 不再为空等抗抖水位付出固定起播延迟（有线链路无需）。
+        const val PREBUFFER_LEAD_MILLIS = 0L
         // vc156（#814）：积压恢复诊断限报次数（防持续积压刷爆日志）。
         const val MAX_LAG_RECOVERY_REPORTS = 5
         const val STATS_TAG = "DiPlay-AudioStats"

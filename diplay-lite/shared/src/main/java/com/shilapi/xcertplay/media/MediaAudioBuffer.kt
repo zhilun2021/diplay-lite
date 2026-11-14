@@ -6,17 +6,17 @@ package com.shilapi.xcertplay.media
  * outlasts them. Calls, Siri and navigation prompts keep the small low-latency buffer.
  */
 object MediaAudioBuffer {
-    // 2026-10-03（T29，C8815/API16 实测）：无线抖动可达 ~1.3s（`maxGapMs=1310`、累计补偿 `gapCompMs=1450`），
-    // 而起播阈值 300ms + 200ms 余量只有 500ms 容量，盖不住突发。
-    // 做法：**起播阈值保持不变**（切歌起播仍快），单独把**媒体缓冲池**加厚到 MEDIA_MIN_CAPACITY_MILLIS，
-    // 让 play() 后持续写入把池子填满，用池深吸收突发抖动（MODE_STREAM 满时 write 阻塞，不会丢数据）。
+    // 2026-11-14（声音延迟优化 / 有线）：池深 = 稳态延迟。有线 USB 链路稳定，按需求
+    // **不再保留任何抗 Wi-Fi 抖动余量**：池下限直接等于起播阈值（300ms），HEADROOM 归零，
+    // 稳态音乐延迟 ≈ 0.3s；偶发突发仍由「MODE_STREAM 满时 write 阻塞」+ 解码侧欠载统计
+    // 兜住（不丢数据），不再用加厚缓冲池换抗抖。
     const val DEFAULT_MILLIS = 300
     val presets = listOf(DEFAULT_MILLIS, 500, 1000)
 
-    /** 媒体（音乐）缓冲池下限：须大于实测最大抖动（~1.3s），否则突发期必然 underrun。 */
-    private const val MEDIA_MIN_CAPACITY_MILLIS = 1500
+    /** 媒体（音乐）缓冲池下限：与起播阈值对齐，不再额外加抗抖动余量（有线链路无需）。 */
+    private const val MEDIA_MIN_CAPACITY_MILLIS = 300
 
-    private const val HEADROOM_MILLIS = 200 // room above the start level so bursts after a gap fit
+    private const val HEADROOM_MILLIS = 0 // 有线：不留抗抖动余量
     private const val MIN_TRACK_BUFFER_BYTES = 16 * 1024
     private const val MIN_START_BUFFER_BYTES = 4 * 1024
     // P0: raise the low-latency start level for non-media streams (speech/Siri/nav).

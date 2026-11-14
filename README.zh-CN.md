@@ -61,18 +61,21 @@ CarPlay 配件身份，可直接安装使用；源码仓与源码包不包含任
 | K60 | Redmi K60 | 手机 |
 | C8815 | 华为 C8815 | 手机 |
 | ONEPLUS A5000 | 一加 5 | 手机 |
-| T3 | 鼎微 T3 | 车机 |
-| TS7 | 鼎微 TS7 | 车机 |
+| T3 | 鼎微 T3（T3-A/B/C/D；近期 dongle 实测 T3-B） | 车机 |
+| TS7 | 鼎微 TS7（sprd sp7731e / Mazda 2） | 车机 |
 | EU5 | 北汽 19 款 EU5 | 车机 |
 | FE-6 | 吉利 20 款缤瑞 | 车机 |
 | AC822X | 飞歌 GS1 | 车机 |
 | at8317 | 糯玉米 | 车机 |
+| AC8217 | 掌讯 AC8217 | 车机 |
+
+**平台与功能范围**：
 
 | 项目 | 范围 / 结果 |
 |---|---|
-| 已验证平台 | K60（Redmi K60，Android 14 / API34，无线 + 有线 + 外置 dongle 主力实测）、C8815（华为 C8815，Android 4.1.2 / API16，minSdk 基准）、T3（鼎微 T3，Android 4.4.2 / API19，仅支持有线）、TS7（鼎微 TS7，历史无线/有线主力）、EU5（北汽 19 款 EU5，Android 6.0.1 / API23）、FE-6（吉利 20 款缤瑞，Android 5.1 / API22）、AC822X（飞歌 GS1，Android 4.2.2 / API17）、at8317（糯玉米，1920×720）、ONEPLUS A5000（一加 5，Android 10，有线全功能长跑） |
+| 已验证平台 | K60（Redmi K60，Android 14 / API34，无线 + 有线 + 外置 dongle 主力实测）、C8815（华为 C8815，Android 4.1.2 / API16，minSdk 基准）、T3（鼎微 T3，Android 4.4.2 / API19；T3-A/B/C/D 四台，近期 dongle 实测为 T3-B；内置蓝牙不可用，外置 dongle 可走蓝牙链路）、TS7（鼎微 TS7，历史无线/有线主力）、EU5（北汽 19 款 EU5，Android 6.0.1 / API23）、FE-6（吉利 20 款缤瑞，Android 5.1 / API22）、AC822X（飞歌 GS1，Android 4.2.2 / API17）、at8317（糯玉米，1920×720）、ONEPLUS A5000（一加 5，Android 10，有线全功能长跑） |
 | 已确认可用 | 无线 CarPlay（车机热点）：K60 全流程通过；C8815 可连（首次入网受 iOS 对「无外网热点」评估影响，实测 76.5 s）。有线 CarPlay 全功能（显示/触摸/音频/Siri/电话）：TS7、ONEPLUS A5000、K60 实测。外置 USB 蓝牙 dongle：CSR8510（片内固件，即插即用）、CM390 / RTL8761BUV（App 侧灌固件，T3 真机已验证）。通话收音：EU5（e5t1）。方控：FE-6（学习绑定 + 派发）。 |
-| 已知限制 / 攻坚中（截至 2026-11） | T3：无线硬件级不可行（SoC 蓝牙物理废弃），仅支持有线；渲染约 25 fps 瓶颈。AC822X：内核无 `/dev/tun`，有线链路不可用。at8317：切页卡顿（渲染端），暂以 `videoScalePercent`≈67% 等比缩放缓解。FE-6：Siri 后无声、root 麦克风直采失效；无线受 ECARX 蓝牙架构限制。PATEO C40DB-EHU（博泰，Android 6.0.1 / API23）：有线约 17 min 后 iAP2 TLS 断链（疑 USB 物理/驱动），且无麦克风上行。K60：横向切页存在 ≥125 ms 静止顿挫（2026-11 录屏分析，定位中）。 |
+| 已知限制 / 攻坚中（截至 2026-11-14） | **已定案/已缓解**：无线冷启动 35 s 已定案为 iOS 16 早期 Wi-Fi 链路重建，vc268 实测冷 18.6 s / 热 10.4 s（iOS 18 同链路 2~3 s），不再作为阻塞项；T3 内置 SoC 蓝牙物理不可用，但外置 CSR8510 dongle 可建立 HCI/ACL 链路，不再表述为「T3 只能有线」。<br>**仍在攻坚**：T3 外置 dongle 在拔插/异常退出后可能因旧 fd 未释放进入 USB D 态，表现为 `open 超时` / `OPEN_TIMEOUT`，需重启车机；1.5.0-vc249 与 1.5.3-vc268 均可复现，不是单一版本回归。T3 渲染约 25 fps 瓶颈。AC822X：内核无 `/dev/tun`，有线链路不可用。at8317：切页卡顿（渲染端），暂以 `videoScalePercent`≈67% 等比缩放缓解。FE-6：Siri 后无声、root 麦克风直采失效；无线受 ECARX 蓝牙架构限制。PATEO C40DB-EHU（博泰，Android 6.0.1 / API23）：单次样本约 17 min 后 iAP2 TLS 断链（疑 USB 物理/驱动），且无麦克风上行，待复测。K60：横向切页存在 ≥125 ms 静止帧顿挫（2026-11 录屏分析，定位中）。<br>**新平台待验证**：AC8217（掌讯 AC8217 / Generic Android on ac8317，Android 4.4.2 / API17，1024×600）首个样本无线 CarPlay 未入网（`credential-no-join`），JmDNS 在 `ap0` 绑定失败，尚未验证可用性。Android 14 重插 dongle 会重新弹 USB 授权；T3/KK 通常不弹授权，但可能卡在 open。 |
 | 尚未承诺 | 其他年份、芯片和固件的实车兼容性；Android 4.4.2 等老内核（KK）的 NCM/组播行为差异显著，兼容性不承诺；未来 iOS 版本的持续可用性；Siri/通话等功能的完整车型覆盖；日志中不可归因的机型（无 `ROM版本` 字段）不作结论。 |
 
 "已适配/已验证"仅指上述具体平台和已验证功能，不表示所有车型、固件和每项功能

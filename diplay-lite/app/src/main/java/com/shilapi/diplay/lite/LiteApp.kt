@@ -4,6 +4,7 @@ import android.app.Application
 import android.os.Environment
 import com.shilapi.xcertplay.diag.CarPlayStageLog
 import com.shilapi.xcertplay.diag.boundedTrace
+import com.shilapi.xcertplay.network.NetworkFamilyGuard
 import java.io.File
 
 /**
@@ -52,6 +53,8 @@ class LiteApp : Application() {
         // 本地日志也带归机码：用户直接拷日志时同样能分辨来自哪台机器。
         // 设备码是明文蓝牙 MAC + ROM 指纹（VC250-02）；describe 在取不到 MAC 时写明 unknown 的具体原因。
         LiteLog.log("app", "设备码 ${DeviceCode.describe()}")
+        // vc262：启动自检一次「本机地址族能力」，后续选址/广播只查缓存结论。
+        LiteLog.log("app", "网络族自检 ${NetworkFamilyGuard.selfCheckAtStartup().describe()}")
         // vc254：上一会话退出方式（crash/clean/abnormal/none），上传时据此提示"上次异常"。
         LiteLog.log("app", "上会话判决：${LiteLog.verdictLabel(previousVerdict)}（$previousVerdict）")
     }

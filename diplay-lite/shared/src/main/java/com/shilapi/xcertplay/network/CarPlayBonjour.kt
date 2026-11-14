@@ -126,6 +126,9 @@ class CarPlayBonjour(
     private val identity: AirPlayIdentity,
     private val advertisedHost: String? = null,
     useInterfaceMdns: Boolean = false,
+    // vc258（B）：true 时进程内复用 JmDNS 实例（跨代只 unregister/register，不重开），
+    // 把每代 ~7.5s 的 create 摊销掉；false = 现状（每代 create/close）。
+    private val prewarmMdns: Boolean = false,
     private val onEvent: (CarPlayBonjourEvent) -> Unit = {},
 ) : Closeable {
     // API16 适配：NsdServiceInfo 的 getter（getServiceName/getServiceType/getPort/
@@ -167,6 +170,13 @@ class CarPlayBonjour(
     @Volatile
     private var activeSocket: Socket? = null
     private var interfaceMdns: JmDNS? = null
+    // vc258（A）：广播就绪信号。凭证闸门（CarPlayController）等它，最多等 MDNS_ADVERTISE_WAIT；
+    // 失败/超时也 countDown，保证任何情况下都不会把连接堵死。
+    private val advertiseLatch = CountDownLatch(1)
+    @Volatile
+    private var advertised = false
+    /** vc258（B）：本代注册进 JmDNS 的 ServiceInfo，预热模式下 close 时用它对冲注册。 */
+    private var registeredInfo: ServiceInfo? = null
 
     private val interfaceListener = object : ServiceListener {
         override fun serviceAdded(event: ServiceEvent) {
@@ -268,7 +278,7 @@ class CarPlayBonjour(
             if (started) return
             started = true
             try {
-                multicastLock.acquire()
+                acquireMulticastLock()
                 if (useInterfaceMdns) {
                     val address = requireNotNull(localAdvertisedAddress ?: fallbackLocalAddress()) {
                         "Interface mDNS requires a local advertised address"
@@ -277,7 +287,8 @@ class CarPlayBonjour(
                     // 接口绑定失败（ENODEV/ENODEV 类）时回落无接口模式（内核选默认多播出口），
                     // 而不是直接放弃广播。全部失败才向上抛（controller 侧仍有非致命降级）。
                     val dns = try {
-                        JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}")
+                        // vc258（B）：预热模式复用进程内实例，跨代只重注册服务。
+                        obtainMdns(address, "carplay-${config.deviceId.replace(":", "")}")
                     } catch (error: Exception) {
                         // 实测坑：报错需可区分 mDNS(5353) 与 AirPlay(7000) 的端口占用。
                         // 山海车机实测（10-06）：JmDNS 枚举畸形网卡时抛 NPE 而非 IOException，
@@ -298,10 +309,12 @@ class CarPlayBonjour(
                     }
                     interfaceMdns = dns
                     dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
-                    dns.registerService(ServiceInfo.create(
+                    val airPlayInfo = ServiceInfo.create(
                         "$AIRPLAY_SERVICE_TYPE.local.", config.deviceName, config.port,
                         0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
-                    ))
+                    )
+                    dns.registerService(airPlayInfo)
+                    registeredInfo = airPlayInfo
                 } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
                     // API16 实测修正（10-02 20:26）：NsdManager 的 setAttribute 是 API 21+，
                     // 4.1 广播带不了 txt（CarPlay 必需）；JmDNS 绑热点接口 ENODEV，改无接口
@@ -318,10 +331,12 @@ class CarPlayBonjour(
                     }
                     interfaceMdns = dns
                     dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
-                    dns.registerService(ServiceInfo.create(
+                    val legacyInfo = ServiceInfo.create(
                         "$AIRPLAY_SERVICE_TYPE.local.", config.deviceName, config.port,
                         0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
-                    ))
+                    )
+                    dns.registerService(legacyInfo)
+                    registeredInfo = legacyInfo
                 } else {
                     val nsd = nsdManager ?: throw IOException(
                         "NsdManager 系统服务不可用（ROM 残废，广播降级非致命）: " +
@@ -340,6 +355,9 @@ class CarPlayBonjour(
                     isDaemon = true
                     start()
                 }
+                // vc258（A）：广播路径已走完（JmDNS 已注册 / NSD 已提交），放行凭证闸门。
+                advertised = true
+                advertiseLatch.countDown()
             } catch (error: Exception) {
                 closed = true
                 if (registrationRequested) {
@@ -352,9 +370,12 @@ class CarPlayBonjour(
                 }
                 worker?.interrupt()
                 worker = null
-                runCatching { interfaceMdns?.close() }
+                releaseMdns(interfaceMdns, registeredInfo)
                 interfaceMdns = null
-                if (multicastLock.isHeld) multicastLock.release()
+                registeredInfo = null
+                releaseMulticastLock()
+                // 广播失败不能把凭证闸门堵死：一律放行（controller 已有非致命降级）。
+                advertiseLatch.countDown()
                 throw error
             }
         }
@@ -384,10 +405,73 @@ class CarPlayBonjour(
             workerToJoin = worker
             worker = null
             workerToJoin?.interrupt()
-            if (multicastLock.isHeld) multicastLock.release()
+            // vc258（B）：预热模式下 JmDNS 实例与多播锁保留到下一次连接，不在此释放。
+            releaseMulticastLock()
         }
-        runCatching { dnsToClose?.close() }
+        releaseMdns(dnsToClose, registeredInfo)
+        registeredInfo = null
         workerToJoin?.let(::joinWorker)
+    }
+
+    /**
+     * vc258（A）：等待 AirPlay 广播真正就绪。返回 false 表示失败或超时——调用方必须照常放行
+     * （广播不是连接的前提；宁可不提速，也不能把凭证卡死）。
+     */
+    fun awaitAdvertising(timeoutMillis: Long): Boolean {
+        if (advertised) return true
+        val completed = runCatching {
+            advertiseLatch.await(timeoutMillis.coerceAtLeast(0), TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        return completed && advertised
+    }
+
+    private fun acquireMulticastLock() {
+        if (!prewarmMdns) {
+            multicastLock.acquire()
+            return
+        }
+        synchronized(MdnsCache.lock) {
+            if (MdnsCache.multicast == null) {
+                runCatching { multicastLock.acquire() }
+                MdnsCache.multicast = multicastLock
+            }
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        val keptByCache = prewarmMdns && MdnsCache.multicast === multicastLock
+        if (!keptByCache && multicastLock.isHeld) runCatching { multicastLock.release() }
+    }
+
+    /** vc258（B）：取 JmDNS 实例；预热模式下按「地址+名字」复用，地址变了才重建。 */
+    private fun obtainMdns(address: InetAddress, name: String): JmDNS {
+        if (!prewarmMdns) return JmDNS.create(address, name)
+        val key = "${address.hostAddress}|$name"
+        synchronized(MdnsCache.lock) {
+            val cached = MdnsCache.dns
+            if (cached != null && MdnsCache.key == key) return cached
+            MdnsCache.dns?.let { runCatching { it.close() } }
+            MdnsCache.dns = null
+            MdnsCache.key = null
+            val created = JmDNS.create(address, name)
+            MdnsCache.dns = created
+            MdnsCache.key = key
+            return created
+        }
+    }
+
+    /** vc258（B）：预热模式只对冲本代服务注册并保留实例；非预热模式维持原 close 语义。 */
+    private fun releaseMdns(dns: JmDNS?, info: ServiceInfo?) {
+        if (dns == null) return
+        if (!prewarmMdns) {
+            runCatching { dns.close() }
+            return
+        }
+        synchronized(MdnsCache.lock) {
+            runCatching { info?.let { dns.unregisterService(it) } }
+            if (MdnsCache.dns === dns) return
+        }
+        runCatching { dns.close() }
     }
 
     @Suppress("DEPRECATION")
@@ -716,5 +800,19 @@ class CarPlayBonjour(
         const val READ_TIMEOUT_MILLIS = 3_000
         const val JOIN_TIMEOUT_MILLIS = 2_000L
         const val FAILURE_NONE = -1
+
+        /** vc258（B）：进程内 JmDNS 实例缓存（预热模式下跨连接复用）。 */
+        private object MdnsCache {
+            val lock = Any()
+
+            @Volatile
+            var dns: JmDNS? = null
+
+            @Volatile
+            var key: String? = null
+
+            @Volatile
+            var multicast: WifiManager.MulticastLock? = null
+        }
     }
 }

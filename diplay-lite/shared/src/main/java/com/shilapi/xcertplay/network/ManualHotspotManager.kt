@@ -63,6 +63,8 @@ class ManualHotspotManager(
     /** vc256：SoftApCallback 探针（API30+ 反射注册；不可用时 status 记原因，不影响连接）。 */
     private var softApProbe: SoftApCallbackProbe? = null
 
+    override fun staClientCount(): Int = softApProbe?.clientCount ?: -1
+
     init {
         require(expectedSsid.isNotBlank()) { "ssid must not be blank" }
         require('\u0000' !in expectedSsid) { "ssid must not contain U+0000" }
@@ -120,22 +122,27 @@ class ManualHotspotManager(
                 )
                 // 1.0.15：观测/手填都没有时，优先复用上次会话成功确认过的信道
                 // （ConfirmedChannelMemory）；仍然没有就发 0（未知），由 0x4301 省略该字段。
+                // vc257：下发给 iPhone 的信道是「描述已有热点」，必须原样使用观测/配置值。
+                // 旧实现先过 snapHotspotChannel()（2.4G 就近吸附到 1/6/11），把实测 ch2 改写成
+                // ch1；K60 实测（vc256 日志 expectedChannel=2 → sendChannel=1，实际频点 2417MHz）
+                // 导致 0x5703 宣告信道与真实 AP 不符，iPhone 全新入网时要退回全信道扫描
+                // （cred→wifi-join 固定 31~37s）。吸附只适用于「配置热点」，不适用于宣告。
                 val channel: Int
                 val channelSource: String
                 when {
                     observation.channel > 0 -> {
-                        channel = snapHotspotChannel(observation.channel)
+                        channel = observation.channel
                         channelSource = observation.source
                     }
                     expectedChannel > 0 -> {
-                        channel = snapHotspotChannel(expectedChannel)
+                        channel = expectedChannel
                         channelSource = "user-config"
                     }
                     else -> {
                         val recalled = ConfirmedChannelMemory
                             .recall(appContext, ConfirmedChannelMemory.ROLE_CAR)
                             .takeIf { it > 0 }
-                        channel = if (recalled != null) snapHotspotChannel(recalled) else 0
+                        channel = recalled ?: 0
                         channelSource = if (recalled != null) "memory" else "unknown"
                     }
                 }
@@ -664,6 +671,11 @@ private class SoftApCallbackProbe(
     var frequencyMHz: Int? = null
         private set
 
+    /** vc264：SoftApCallback 报告的已关联客户端数；-1 = 尚未收到回调。 */
+    @Volatile
+    var clientCount: Int = -1
+        private set
+
     /** unsupported（API<30）/ not-registered / registered / failed:<异常类名>。 */
     @Volatile
     var status: String = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -686,7 +698,31 @@ private class SoftApCallbackProbe(
             callbackType = type
             val created = Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { _, method, args ->
                 when (method.name) {
-                    "onInfoChanged", "onConnected", "onDisconnected" ->
+                    "onConnectedClientsChanged" -> {
+                        // 参数顺序在不同 ROM 上不一致：取第一个集合参数作为客户端列表。
+                        val clients = args?.firstOrNull { it is Collection<*> } as? Collection<*>
+                        if (clients != null) {
+                            updateClientCount(clients.size, method.name)
+                        } else {
+                            onDiagnostic(
+                                "SoftApCallback onConnectedClientsChanged args=" +
+                                    (args?.joinToString { it?.javaClass?.simpleName ?: "null" } ?: "null"),
+                            )
+                        }
+                        args?.firstOrNull { it?.javaClass?.name == "android.net.wifi.SoftApInfo" }
+                            ?.let(::readFrequency)
+                    }
+                    "onConnected" -> {
+                        updateClientCount(if (clientCount < 0) 1 else clientCount + 1, method.name)
+                        args?.firstOrNull { it?.javaClass?.name == "android.net.wifi.SoftApInfo" }
+                            ?.let(::readFrequency)
+                    }
+                    "onDisconnected" -> {
+                        updateClientCount((clientCount - 1).coerceAtLeast(0), method.name)
+                        args?.firstOrNull { it?.javaClass?.name == "android.net.wifi.SoftApInfo" }
+                            ?.let(::readFrequency)
+                    }
+                    "onInfoChanged" ->
                         args?.firstOrNull { it?.javaClass?.name == "android.net.wifi.SoftApInfo" }
                             ?.let(::readFrequency)
                     else -> Unit
@@ -721,6 +757,14 @@ private class SoftApCallbackProbe(
             WifiManager::class.java.getMethod("unregisterSoftApCallback", type)
                 .invoke(wifiManager, created)
         } catch (_: Throwable) {
+        }
+    }
+
+    private fun updateClientCount(value: Int, source: String) {
+        val normalized = value.coerceAtLeast(0)
+        if (normalized != clientCount) {
+            clientCount = normalized
+            onDiagnostic("SoftApCallback $source clients=$normalized")
         }
     }
 

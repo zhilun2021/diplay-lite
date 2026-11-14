@@ -68,6 +68,9 @@ class Iap2WirelessControlClient(
         // vc250-05：真凭证 0x5703 成功写出时回调，携带「发送瞬间 iPhone 是否还没有
         // AirPlay TCP」快照，只供 summary 判定 credential=full|cached|none，不参与控制流。
         onCredentialSent: ((beforeAirPlayTcp: Boolean) -> Unit)? = null,
+        // vc258（A）：首个真凭证写出前的一次性回调（上层用来等 mDNS 广播就绪）。
+        // 只调一次；异常/超时按放行处理，绝不让凭证发不出去。
+        beforeFirstCredential: (() -> Unit)? = null,
         // [RELAY-TEST] 1.0.28-中继test 实验参数：(假SSID, 随机密码)。null = 实验关闭。
         relayTestFakeCredential: Pair<String, String>? = null,
         // vc83 中继踢出（攻「iPhone 提前连到中继 WiFi 后 CarPlay 永远连不上」）：
@@ -78,6 +81,9 @@ class Iap2WirelessControlClient(
         // 用户在恢复前就放弃（082530 日志 tap7：+47s 踢出、+53s 用户断开，恢复永远没到）。
         // 踢出越早、踢出后立即补真凭证，给 iPhone 留足重扫描入网窗口。-1/0 = 实验旧行为。
         relayKickAfterResends: Int = -1,
+        // vc264：0x4301 前等 iPhone 真正入网。实测 iOS 16：0x4301 早于关联 → 35s；
+        // 晚于关联 → 0.2~1s。默认 true=放行（历史行为），上层用热点客户端数判断。
+        staAssociated: () -> Boolean = { true },
     ): Iap2WirelessControlResult {
         require(identification.wireless != null || identification.usbWirelessUpgradeSsid != null) {
             "Wireless control requires wireless (Bluetooth) or usbWirelessUpgradeSsid (USB bootstrap) transport"
@@ -102,6 +108,25 @@ class Iap2WirelessControlClient(
         val silenceDeadlineNanos =
             if (silenceEnabled) deadlineAfter(authSilenceTimeoutMillis) else Long.MAX_VALUE
         var stage = Iap2WirelessControlStage.IDENTIFIED
+
+        // vc264：0x4301 前等 iPhone 入网（仅当上层明确报告热点 0 客户端时才等；
+        // 已关联 / 未知一律直接放行，避免 warm 场景被无谓延迟）。
+        fun awaitStaAssociationBeforeStart() {
+            if (staAssociated()) return
+            val startedAt = System.nanoTime()
+            val limitNanos = startedAt + START_SESSION_STA_WAIT_NANOS
+            while (!staAssociated() && System.nanoTime() < limitNanos) {
+                try {
+                    Thread.sleep(200L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+            onProgress(
+                "wireless start-session gate: associated=${staAssociated()} " +
+                    "waitedMs=${(System.nanoTime() - startedAt) / 1_000_000}",
+            )
+        }
         try {
             val bringUpDeadlineNanos = min(deadlineNanos, silenceDeadlineNanos)
             Iap2IdentificationClient(session).identify(identification, requireRemaining(bringUpDeadlineNanos))
@@ -154,8 +179,15 @@ class Iap2WirelessControlClient(
         var credentialSentAtNanos: Long? = null
         // vc250-05：所有「真凭证」0x5703 的唯一出口（relay 恢复 / 凭证重发 / iPhone 请求 /
         // post-transport）。发送成功才回调；快照必须在 send 之前取，否则会被本轮 TCP 污染。
+        var credentialGateDone = false
         fun sendRealCredential() {
             val beforeAirPlayTcp = !phoneOnAirPlay()
+            // vc258（A）：首个真凭证前给上层一次等待机会（等 mDNS 广播就绪）。
+            // 只在「iPhone 还没上 AirPlay」时等；已缓存/已建流不浪费任何时间。
+            if (!credentialGateDone && beforeAirPlayTcp) {
+                credentialGateDone = true
+                runCatching { beforeFirstCredential?.invoke() }
+            }
             send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
             if (beforeAirPlayTcp && credentialSentAtNanos == null) {
                 credentialSentAtNanos = System.nanoTime()
@@ -399,6 +431,8 @@ class Iap2WirelessControlClient(
                     ) {
                         sendRealCredential()
                         wifiConfigurationsSent++
+                        // vc267：重发路径不再等待入网——闸门只作用于第一次 0x4301，
+                        // 否则每 5s 重发都被拖成 3.6s，反而把节奏打乱。
                         send(carPlayStartSession(endpoint), deadlineNanos)
                         carPlayStartSessionsSent++
                         credentialResendsSent++
@@ -474,6 +508,7 @@ class Iap2WirelessControlClient(
                             onProgress("[RELAY-TEST] cancelled: iPhone sent 0x4300")
                         }
                         onProgress("iap2 rx=0x4300 carplay-availability")
+                        awaitStaAssociationBeforeStart()
                         send(carPlayStartSession(endpoint), deadlineNanos)
                         stage = later(stage, Iap2WirelessControlStage.CARPLAY_START_SENT)
                         carPlayStartSessionsSent++
@@ -588,6 +623,9 @@ class Iap2WirelessControlClient(
     companion object {
         private const val REQUEST_ACCESSORY_WIFI_CONFIGURATION = 0x5702
         private const val ACCESSORY_WIFI_CONFIGURATION = 0x5703
+
+        /** vc264：0x4301 前等待 iPhone 关联的上限。 */
+        private const val START_SESSION_STA_WAIT_NANOS = 8_000_000_000L
         private const val CARPLAY_AVAILABILITY = 0x4300
         private const val CARPLAY_START_SESSION = 0x4301
         private const val WIRELESS_CARPLAY_UPDATE = 0x4e0d

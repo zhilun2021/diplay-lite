@@ -61,7 +61,7 @@ data class LiteConfig(
     val usbBtDongle: Boolean = false,
     // vc184：外置 USB 蓝牙 dongle 自定义蓝牙名称（写进 HCI 本地名称，iPhone 蓝牙列表显示）。
     // 空串/超 HCI 名上限(248 字节)回落默认 "DiPlay CarPlay"。
-    val usbBtDongleName: String = "DiPlay CarPlay",
+    val usbBtDongleName: String = "DiPlay Lite",
     // 2026-11-07：有线实验 —— 内核 NCM 数据面（老车机专用，默认关）。
     // 开：有线会话只走内核 cdc_ncm，不建 TUN/VPN、不让用户态 NCM 抢接口；
     // 失败即结束本次会话并明确报错，不回落 TUN。关：维持现有用户态 NCM + TUN 路径。
@@ -109,7 +109,16 @@ data class LiteConfig(
     val relayIpv4Channel: Int = 0,
     // 1.0.17：CarPlay 显示名称（/info name + Bonjour 服务名）。自定义返回图标页可改，
     // 选厂家预置图标时自动替换为厂家名；空串回落 "DiPlay"。
-    val carIconName: String = "DiPlay",
+    val carIconName: String = "DiPlay Lite",
+    // vc258（A+B 连接提速实验，三态）：
+    //   0 = 关闭（现状：凭证先发，mDNS 广告随后慢慢就绪）
+    //   1 = 仅等待：首个 0x5703 前等 Bonjour 广播就绪（≤10s，失败/超时直接放行；
+    //       iPhone 已在热点/已有 TCP 时不等）——消除「广告晚于 iPhone 入网 → iOS 下次
+    //       服务发现要等 ~35s」的固定慢轮
+    //   2 = 等待 + 预热：在此之上进程内复用 JmDNS 实例（跨代只 register/unregister），
+    //       把每代 ~7.5s 的 create 摊销掉
+    //   3 = IPv6 广播（实验）：选址/监听/mDNS 全长走 fe80 link-local，对齐 CatPlay 地址族
+    val mdnsConnectBoost: Int = 0,
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
@@ -306,9 +315,9 @@ data class LiteConfig(
                 // vc166：外置 USB 蓝牙实验开关（仅探测显示）。
                 usbBtDongle = prefs.getBoolean("usb_bt_dongle", false),
                 // vc184：外置蓝牙自定义名称（空/超长回落默认 "DiPlay CarPlay"）。
-                usbBtDongleName = prefs.getString("usb_bt_dongle_name", "DiPlay CarPlay")
-                    .orEmpty().ifBlank { "DiPlay CarPlay" }
-                    .let { if (it.toByteArray(Charsets.UTF_8).size > MAX_USB_BT_NAME_BYTES) "DiPlay CarPlay" else it },
+                usbBtDongleName = prefs.getString("usb_bt_dongle_name", "DiPlay Lite")
+                    .orEmpty().ifBlank { "DiPlay Lite" }
+                    .let { if (it.toByteArray(Charsets.UTF_8).size > MAX_USB_BT_NAME_BYTES) "DiPlay Lite" else it },
                 // 2026-11-07：有线实验 —— 内核 NCM 数据面（默认关）。
                 wiredKernelNcmExperiment = prefs.getBoolean("wired_kernel_ncm_experiment", false),
                 // vc109（T3 触摸屏下沿物理失灵）：0=关闭；>0=底部失灵区占比‰（154≈1/6.5）。
@@ -335,7 +344,8 @@ data class LiteConfig(
                 carIpv4Channel = prefs.getInt("car_ipv4_channel", 0),
                 relayIpv6Channel = prefs.getInt("relay_ipv6_channel", 0),
                 relayIpv4Channel = prefs.getInt("relay_ipv4_channel", 0),
-                carIconName = prefs.getString("car_icon_name", "DiPlay").orEmpty().ifBlank { "DiPlay" },
+                carIconName = prefs.getString("car_icon_name", "DiPlay Lite").orEmpty().ifBlank { "DiPlay Lite" },
+                mdnsConnectBoost = prefs.getInt("mdns_connect_boost", 0).coerceIn(0, 3),
             )
         }
 
@@ -391,6 +401,8 @@ data class LiteConfig(
                 .putInt("relay_ipv6_channel", config.relayIpv6Channel)
                 .putInt("relay_ipv4_channel", config.relayIpv4Channel)
                 .putString("car_icon_name", config.carIconName)
+                // vc258：mDNS 连接提速实验三态（0/1/2，重连生效）。
+                .putInt("mdns_connect_boost", config.mdnsConnectBoost)
                 // 注意：applied_video_key 故意不在这里写 —— 它只由 saveAppliedVideoKey() 维护，
                 // 否则表单保存（每次勾选都会触发）会用默认值把它冲掉。
                 //

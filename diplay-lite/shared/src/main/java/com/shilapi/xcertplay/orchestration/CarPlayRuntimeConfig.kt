@@ -107,6 +107,8 @@ class CarPlayRuntimeConfig(
     // RELAY（本机就是中继 client，断开=自断）与 WIFI_P2P 一律跳过。失败只记日志不阻断。
     // 默认 true；false = 完全不动 STA。
     val wirelessStaKickFor5g: Boolean = true,
+    // vc258（A+B 连接提速实验）：0=关闭 / 1=凭证等 Bonjour 广播就绪 / 2=等待+JmDNS 预热。
+    val mdnsConnectBoost: Int = 0,
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }

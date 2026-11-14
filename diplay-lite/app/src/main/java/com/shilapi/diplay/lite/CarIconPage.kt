@@ -187,7 +187,7 @@ class CarIconPage(private val activity: MainActivity) {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
         ))
         column.addView(outlineButton("保存名称") {
-            val name = nameInput.text.toString().trim().ifBlank { "DiPlay" }
+            val name = nameInput.text.toString().trim().ifBlank { "DiPlay Lite" }
             val cfg = LiteConfig.load(activity)
             LiteConfig.save(activity, cfg.copy(carIconName = name))
             nameInput.setText(name)

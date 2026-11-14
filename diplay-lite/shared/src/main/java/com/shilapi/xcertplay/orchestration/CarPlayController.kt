@@ -42,6 +42,8 @@ import com.shilapi.xcertplay.network.CarPlayBonjour
 import com.shilapi.xcertplay.network.ConfirmedChannelMemory
 import com.shilapi.xcertplay.network.Ipv6NcmBridge
 import com.shilapi.xcertplay.network.ManualHotspotManager
+import com.shilapi.xcertplay.network.NetworkFamilyClass
+import com.shilapi.xcertplay.network.NetworkFamilyGuard
 import com.shilapi.xcertplay.network.RelayClientManager
 import com.shilapi.xcertplay.network.WifiP2pGroupManager
 import com.shilapi.xcertplay.network.WiredBonjourAdvertiser
@@ -92,6 +94,9 @@ import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.UUID
@@ -253,6 +258,14 @@ class CarPlayController(
     @Volatile private var wirelessIdentification: Iap2IdentificationConfig? = null
     @Volatile private var wirelessAirPlayEndpoint: Iap2WirelessCarPlayEndpoint? = null
     @Volatile private var airPlayServer: AirPlayTcpServer? = null
+    // vc260/vc261：诊断用连接探针（主监听之外的另一地址族 + 7000 端口），只记录 iPhone 的
+    // TCP 目标，不参与会话。
+    @Volatile private var probeSockets: List<ServerSocket> = emptyList()
+
+    /** vc267：10 分钟内有 TCP → 视为 warm，跳过 0x4301 入网闸门。 */
+    private fun recentlyConnectedOverAirPlay(): Boolean =
+        lastAirPlayTcpAtElapsedMillisShared > 0L &&
+            SystemClock.elapsedRealtime() - lastAirPlayTcpAtElapsedMillisShared < 10 * 60_000L
     private val wirelessHandoffRequested = AtomicBoolean(false)
     private val wirelessTunnelReady = AtomicBoolean(false)
     private val wirelessActiveReported = AtomicBoolean(false)
@@ -1104,6 +1117,18 @@ class CarPlayController(
                 "wireless AirPlay listener attached bind=$hostAddressText " +
                     "port=${effectiveWirelessAirPlayConfig.port} (Bonjour advertisement uses the same port)",
             )
+            // vc260（诊断）：主监听只覆盖一个地址族。实验档启用时，在另一族同一端口补一个
+            // 只记日志的监听，用于判定 iPhone 的 TCP 究竟发往 IPv4 A 记录还是 fe80 AAAA
+            //（用来解释「同样广告已就绪，有时 1.5s、有时 35s」）。不参与会话，accept 即关。
+            if (config.mdnsConnectBoost >= MDNS_BOOST_WAIT) {
+                // vc262：2 类（仅 IPv4）机器上不再开另一族探针——v6 路径必然失败，只会刷日志。
+                val probeGuard = NetworkFamilyGuard.effectiveVerdict(lastHotspotInfo?.interfaceName)
+                if (probeGuard.familyClass == NetworkFamilyClass.IPV4_ONLY) {
+                    debugLog("wireless probe: skipped by family guard ${probeGuard.describe()}")
+                } else {
+                    startDualStackProbe(generation, hostAddress, effectiveWirelessAirPlayConfig.port)
+                }
+            }
             // M6k20（移植自上游 FirstTcpWatchdog 语义，适配 Lite 架构）：
             // 热点+监听口就绪后，若 FIRST_TCP_TIMEOUT_MILLIS 内 iPhone 从未发起任何 TCP
             // 连接（陈旧 mDNS 缓存、Wi-Fi 未入网、AP 隔离），显性失败并走重连状态机，
@@ -1129,6 +1154,8 @@ class CarPlayController(
                 // The car hotspot previously used system NSD, which could resolve another interface
                 // or IPv6 while the listener/probe was bound to the AP's IPv4 address.
                 useInterfaceMdns = true,
+                // vc258（B）：模式 2 时复用进程内 JmDNS 实例，跨代只重注册服务。
+                prewarmMdns = config.mdnsConnectBoost >= MDNS_BOOST_PREWARM,
                 onEvent = { event -> debugLog("wireless bonjour: ${event.diagnosticSummary()}") },
             )
             bonjour = bonjourClient
@@ -1308,10 +1335,37 @@ class CarPlayController(
                     // vc253：凭据下发瞬间的热点 STA 关联快照（只读诊断）。
                     logHotspotStaArp("credential-issued")
                 },
+                // vc258（A）：首个 0x5703 前等 mDNS 广播就绪（最多 10s）。
+                // K60 实测：凭证发出后 iPhone 约 +1s 入网，而 JmDNS 广播要 7.5s 才起；
+                // 广告晚于入网 → iOS 下一次服务发现要等 ~35s（0x4301→TCP 35.6s，
+                // 同条件 CatPlay 只要 1.95s）。iPhone 已在热点（ARP 有 peer）时不等。
+                beforeFirstCredential = {
+                    if (config.mdnsConnectBoost >= MDNS_BOOST_WAIT && !hasHotspotStaAssociated()) {
+                        val waitStartedAt = SystemClock.elapsedRealtime()
+                        val ready = bonjour?.awaitAdvertising(MDNS_ADVERTISE_WAIT_MILLIS) ?: false
+                        debugLog(
+                            "mdns boost: advertising ready=$ready " +
+                                "waitedMs=${SystemClock.elapsedRealtime() - waitStartedAt} " +
+                                "mode=${config.mdnsConnectBoost} gen=$generation",
+                        )
+                    }
+                },
                 relayTestFakeCredential = relayTestFakeCredential,
                 // vc83：中继模式 2 次重发（~10s）仍 0 TCP 即进入假凭证踢出，
                 // 踢出后 1.5s 恢复真凭证并持续重发（详见 Iap2WirelessControlClient 注释）。
                 relayKickAfterResends = if (relayTestFakeCredential != null) 2 else -1,
+                // vc264：热点明确报告 0 客户端时，0x4301 前等 iPhone 入网；
+                // 已关联或未知一律放行（warm 路径零延迟）。
+                staAssociated = {
+                    val clients = hotspot?.staClientCount() ?: -1
+                    when {
+                        clients > 0 -> true
+                        clients == 0 -> false
+                        // vc266：SoftAp 客户端数不可用（MIUI SecurityException）时用时间启发式：
+                        // 10 分钟内有过 AirPlay TCP = warm，直接放行；否则 cold，等 3.5s。
+                        else -> recentlyConnectedOverAirPlay()
+                    }
+                },
             )
             // vc152：控制环退出（RFCOMM 断/terminal 返回）后邀请通道失效，清引用。
             wirelessControlClient = null
@@ -1745,6 +1799,8 @@ class CarPlayController(
                 if (isStaleWirelessRun(generation)) return
                 // vc250-05：TCP 到达事实（含缓存凭证入网），供 summary credential 三态。
                 CarPlayStageLog.airPlayTcpAccepted()
+                // vc267：记录 warm 判据时刻（进程级，下一次连接 10 分钟内跳过入网闸门）。
+                lastAirPlayTcpAtElapsedMillisShared = SystemClock.elapsedRealtime()
                 debugLog(
                     "wireless AirPlay TCP accepted; handoff anchor armed " +
                         "timeout=${WIRELESS_TCP_ANCHOR_TIMEOUT_MILLIS}ms gen=$generation",
@@ -2387,6 +2443,11 @@ class CarPlayController(
             // 车机热点路径（MANUAL/MANUAL_IPV4）启动前主动断开 STA，让热点自由落 5G。
             // RELAY（本机就是 STA，断开=自断中继）与 WIFI_P2P 不走这里；失败只记日志不阻断。
             maybeKickTwoPointFourStation()
+            // vc262：地址族守卫——启动自检判 2 类（仅 IPv4）时，强制 IPv4 选址，
+            // 不再走 IPv6 广播/监听分支（IPv6 栈不可用的 ROM 上那套必然失败）。
+            val familyVerdict = NetworkFamilyGuard.effectiveVerdict()
+            val ipv6Forbidden = familyVerdict.familyClass == NetworkFamilyClass.IPV4_ONLY
+            debugLog("wireless family guard ${familyVerdict.describe()}")
             ManualHotspotManager(
                 context = appContext,
                 ssid = config.manualHotspotSsid
@@ -2395,13 +2456,22 @@ class CarPlayController(
                 band = config.manualHotspotBand,
                 channel = config.manualHotspotChannel,
                 security = config.manualHotspotSecurity,
-                preferIpv4 = hotspotMode == WirelessHotspotMode.MANUAL_IPV4,
+                // vc259（实验 3 档）：IPv6 广播 —— 不再优先 IPv4，让选址落到 fe80 link-local
+                // （带 scope id），AirPlay 监听与 mDNS 广播都走 IPv6，对齐 CatPlay 的地址族。
+                preferIpv4 = ipv6Forbidden ||
+                    (hotspotMode == WirelessHotspotMode.MANUAL_IPV4 &&
+                        config.mdnsConnectBoost < MDNS_BOOST_IPV6),
                 onDiagnostic = ::debugLog,
             )
         }
         hotspot = manager
         return try {
             var info = manager.start(HOTSPOT_START_TIMEOUT_MILLIS)
+            // vc262：热点接口已就绪，按实际接口复核地址族（启动自检只反映栈能力）。
+            debugLog(
+                "wireless family guard iface " +
+                    NetworkFamilyGuard.classifyInterface(info.interfaceName).describe(),
+            )
             // 1.0.29：凭证下发热稳定窗——RELAY 场景（车机为 STA）在 0x5703 下发前对关联信道
             // 二次复核：manager.start() 内已观测一次，这里再读一次，两次一致才信观测值；
             // 抖动 → 信道改 0 让 iPhone 全频段扫描（宁全扫不定向错）。
@@ -2972,7 +3042,121 @@ class CarPlayController(
         -1
     }
 
+    /**
+     * vc260/vc261（诊断）：连接探针。
+     * 主监听只覆盖一个地址族时，在另一族再开「只记日志」的监听；vc261 起同时盯 7000 端口
+     *（CatPlay 用 7000，且本项目注释已记载「监听已死而广报仍在，iPhone 先撞死端口、
+     * 等缓存过期 ~40s」的先例），用来实测 iPhone 的 SYN 究竟发往哪个地址+端口。
+     * 仅诊断：accept 后立即关闭，不参与会话；绑定失败不影响主链路。
+     */
+    @Synchronized
+    private fun startDualStackProbe(generation: Int, primary: InetAddress, port: Int) {
+        stopDualStackProbeLocked()
+        val alternate = alternateFamilyAddress(primary)
+        val ports = linkedSetOf(port)
+        if (port != 7000) ports.add(7000)
+        val targets = LinkedHashSet<Pair<InetAddress, Int>>()
+        for (candidatePort in ports) {
+            if (alternate != null) targets.add(alternate to candidatePort)
+            if (candidatePort != port) targets.add(primary to candidatePort)
+        }
+        if (targets.isEmpty()) {
+            debugLog(
+                "wireless probe: skipped (no alternate address family) primary=${primary.hostAddress}",
+            )
+            return
+        }
+        val bound = mutableListOf<ServerSocket>()
+        for ((address, candidatePort) in targets) {
+            probeListen(generation, address, candidatePort)?.let(bound::add)
+        }
+        probeSockets = bound
+    }
+
+    private fun probeListen(generation: Int, address: InetAddress, port: Int): ServerSocket? {
+        val socket = try {
+            ServerSocket().apply {
+                reuseAddress = true
+                bind(InetSocketAddress(address, port), 4)
+            }
+        } catch (error: Throwable) {
+            debugLog("wireless probe: bind failed ${address.hostAddress}:$port ${error.message}")
+            return null
+        }
+        debugLog(
+            "wireless probe: listening ${address.hostAddress}:$port " +
+                "family=${if (address is Inet6Address) "IPv6" else "IPv4"} gen=$generation (diagnostic)",
+        )
+        Thread(
+            {
+                while (!socket.isClosed) {
+                    try {
+                        val connection = socket.accept()
+                        debugLog(
+                            "wireless probe: TCP accepted from ${connection.inetAddress.hostAddress} " +
+                                "to ${address.hostAddress}:$port gen=$generation",
+                        )
+                        try {
+                            connection.close()
+                        } catch (_: Throwable) {
+                        }
+                    } catch (error: Throwable) {
+                        if (!socket.isClosed) {
+                            debugLog("wireless probe: accept ended ${address.hostAddress}:$port ${error.message}")
+                        }
+                        break
+                    }
+                }
+            },
+            "xcertplay-connect-probe-$port",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+        return socket
+    }
+
+    private fun alternateFamilyAddress(primary: InetAddress): InetAddress? = try {
+        if (primary is Inet6Address) {
+            NetworkInterface.getByInetAddress(primary)?.inetAddresses?.let { addresses ->
+                java.util.Collections.list(addresses).filterIsInstance<Inet4Address>().firstOrNull()
+            }
+        } else {
+            NetworkInterface.getNetworkInterfaces()?.let { interfaces ->
+                java.util.Collections.list(interfaces)
+                    .firstOrNull { nif ->
+                        java.util.Collections.list(nif.inetAddresses).any { it == primary }
+                    }
+                    ?.inetAddresses
+                    ?.let { addresses ->
+                        java.util.Collections.list(addresses)
+                            .filterIsInstance<Inet6Address>()
+                            .firstOrNull { it.isLinkLocalAddress && it.scopeId != 0 }
+                    }
+            }
+        }
+    } catch (error: Throwable) {
+        null
+    }
+
+    @Synchronized
+    private fun stopDualStackProbe() {
+        stopDualStackProbeLocked()
+    }
+
+    private fun stopDualStackProbeLocked() {
+        val sockets = probeSockets
+        probeSockets = emptyList()
+        for (socket in sockets) {
+            try {
+                socket.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     private fun closeWirelessStack(keepHotspotForReuse: Boolean = false) {
+        stopDualStackProbe()
         wirelessControlProof.clear()
         wirelessMediaProof.clear()
         wirelessLinkOpenedAtMs = 0L
@@ -4751,6 +4935,23 @@ class CarPlayController(
         )
     }
 
+    /** vc258：iPhone（或任一 STA）是否已关联到本机热点网段（只读 /proc/net/arp）。 */
+    private fun hasHotspotStaAssociated(): Boolean {
+        val prefix = hotspotStaSubnetPrefix
+        return try {
+            val file = File("/proc/net/arp")
+            if (!file.exists()) return false
+            file.useLines { lines ->
+                lines.drop(1).any { line ->
+                    val columns = line.trim().split(Regex("\\s+"))
+                    columns.firstOrNull()?.startsWith(prefix) == true
+                }
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     /** vc253：由热点自身 IPv4 推导 STA 观测网段前缀；IPv6/异常时回落约定网段。 */
     private fun hotspotStaSubnetPrefixOf(address: InetAddress): String {
         if (address !is Inet4Address) return DEFAULT_HOTSPOT_STA_SUBNET_PREFIX
@@ -4912,6 +5113,10 @@ class CarPlayController(
     private class PendingTouch(val contacts: List<AirPlayContact>, val sticky: Boolean)
 
     companion object {
+        /** vc267：进程级 warm 时刻（每次连接会新建 controller，实例字段跨会话会丢）。 */
+        @Volatile
+        private var lastAirPlayTcpAtElapsedMillisShared: Long = 0L
+
         private const val IAP2_IPHONE_UUID = "00000000-deca-fade-deca-deafdecacafe"
         // M6k24（D' 方案）：本机蓝牙地址进程级缓存（accessoryBluetoothMac 写入/消费）。
         @Volatile private var cachedLocalBtMac: String? = null
@@ -4944,6 +5149,15 @@ class CarPlayController(
         // 实际入网 39s（0x5703 首发→pair-setup），30s 判死差 9s；60s 覆盖慢入网，
         // fire 后仍有 35s 宽限复查兜底（总上限 60+35=95s）。
         private const val FIRST_TCP_TIMEOUT_MILLIS = 60_000L
+
+        // vc258（A+B）mDNS 连接提速实验：0=关闭 / 1=凭证等广播 / 2=等待+JmDNS 预热。
+        private const val MDNS_BOOST_WAIT = 1
+        private const val MDNS_BOOST_PREWARM = 2
+        /** vc259（实验 3 档）：IPv6 广播 —— 选址/Lisener/mDNS 全部走 fe80，对齐竞品地址族。 */
+        private const val MDNS_BOOST_IPV6 = 3
+        /** 凭证闸门等广播的上限；超时按失败处理并照常放行。 */
+        private const val MDNS_ADVERTISE_WAIT_MILLIS = 10_000L
+
         /**
          * 1.1.5（提速）：first-TCP 看门狗宽限复查窗口。10-12 实机三样本：iPhone 实际入网
          * 距 0x5703 首发需 25~35s（第 3 轮才成），而 0x5703 重发预算为 12×5s=60s；

@@ -494,7 +494,7 @@ class LiteSessionService : Service() {
                 config = CarPlayRuntimeConfig(
                     hostMac = deviceId.split(":").map { it.toInt(16).toByte() }.toByteArray(),
                     identification = Iap2IdentificationConfig(
-                        name = "DiPlay",
+                        name = "DiPlay Lite",
                         modelIdentifier = "DiPlay",
                         manufacturer = "DiPlay",
                         serialNumber = "DIPLAY-" + deviceId.replace(":", ""),
@@ -502,7 +502,7 @@ class LiteSessionService : Service() {
                         hardwareVersion = "1.0",
                         carPlayUsbInterfaceNumber = 3,
                     ),
-                    label = "DiPlay",
+                    label = "DiPlay Lite",
                     hostName = "diplay-" + deviceId.replace(":", "").lowercase(),
                     // U4 USB 有线：channel=usb 走 WIRED（USBMUX/lockdown + NCM），热点/蓝牙字段不参与校验。
                     transport = if (usb) CarPlayTransport.WIRED else CarPlayTransport.WIRELESS,
@@ -549,10 +549,12 @@ class LiteSessionService : Service() {
                     videoVsyncPacing = true,
                     // vc237（VID-234-01 / A1）：视频待渲帧不合并（vc238 默认开）。
                     videoNoCoalesce = config.videoNoCoalesce,
+                    // vc258：mDNS 连接提速实验（0/1/2，设置页体验优化区）。
+                    mdnsConnectBoost = config.mdnsConnectBoost,
                 ),
                 airPlayConfig = AirPlayConfig(
                     // 1.0.17：显示名称可自定义（自定义返回图标页），默认 DiPlay；流向 /info name + Bonjour 服务名。
-                    deviceName = config.carIconName.ifBlank { "DiPlay" },
+                    deviceName = config.carIconName.ifBlank { "DiPlay Lite" },
                     deviceId = deviceId,
                     btMac = btMac,
                     sourceVersion = "950.7.1",
@@ -567,7 +569,7 @@ class LiteSessionService : Service() {
                     // "xcertplay"，此前只覆写了 manufacturer/model 导致"图标换了名字没换"。
                     // 1.0.18：oemLabel 与 deviceName 同源吃 carIconName——1.0.17 只改了
                     // deviceName，但 CarPlay 桌面图标标签走的是 oemLabel，实测仍显示 DiPlay。
-                    oemLabel = config.carIconName.ifBlank { "DiPlay" },
+                    oemLabel = config.carIconName.ifBlank { "DiPlay Lite" },
                     // /info 必须声明 audioInputFormats，否则 iPhone 不建立 CarPlay 音频流
                     // （原先走默认 microphone=false，会话里连基础 type=100 都没有）。
                     microphone = true,

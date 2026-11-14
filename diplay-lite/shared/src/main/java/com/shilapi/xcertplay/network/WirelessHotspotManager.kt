@@ -41,6 +41,8 @@ class WirelessHotspotInfo(
 
 /** Owns one Android Wi-Fi group and all resources needed to keep it alive. */
 interface WirelessHotspotManager : Closeable {
+    /** vc264：热点侧 STA 客户端数；-1 = 未知（不支持/未注册回调）。 */
+    fun staClientCount(): Int = -1
     /**
      * Starts a hotspot and waits up to [timeoutMillis] for its live configuration and AP
      * interface. Implementations must not be called on the main thread.

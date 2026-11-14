@@ -352,6 +352,11 @@ class IphoneUsbHost(
             if (attempt > 0) {
                 report("usbmux open retry #$attempt after claim failure")
                 Thread.sleep(RETRY_DELAY_MILLIS)
+            } else if (assumeAlreadyConfigured) {
+                // 2026-11-14（有线提速）：自愈重试走的是同一台 iPhone、同一个已建立过的
+                // 组态（调用方已确认此前跑过流），不存在「刚重枚举、组态没落定」的情况，
+                // 这一步纯白等可以省掉，整段连接少 ~0.35s。
+                report("usbmux open settle skipped (configuration already live)")
             } else {
                 Thread.sleep(CONFIG_SETTLE_DELAY_MILLIS)
             }
@@ -605,7 +610,9 @@ class IphoneUsbHost(
         // 1.0.2：USBMUX 会话打开的落定等待与重试——重枚举 attach 后立即
         // setConfiguration/claim 在 MIUI 上会失败（claim 返回 false）。
         private const val OPEN_IAP2_ATTEMPTS = 2
-        private const val CONFIG_SETTLE_DELAY_MILLIS = 800L
+        // 2026-11-14（有线提速）：800 → 350 → 200。这是每次连接都要付的纯 sleep；万一不够，
+        // attempt#1 会在 RETRY_DELAY_MILLIS(300ms) 后再试一次，最坏仍不超过旧的 800ms。
+        private const val CONFIG_SETTLE_DELAY_MILLIS = 200L
         private const val RETRY_DELAY_MILLIS = 300L
     }
 

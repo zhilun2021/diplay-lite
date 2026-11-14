@@ -47,12 +47,11 @@ class AndroidMediaSink(
     onScreenStreamActiveChanged: ((Int, Boolean) -> Unit)? = null,
     private val mediaBufferMillis: Int = MediaAudioBuffer.DEFAULT_MILLIS,
     /**
-     * vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲语义）：媒体流预缓冲开关。
-     * true 时媒体（音乐）流的起播/复播水位抬到约 1s（PREBUFFER_LEAD_MILLIS，上游
-     * LEAD_MILLIS），让 AudioTrack 队列天然吸收 ≤1s 的 Wi-Fi 断流；关闭则维持
-     * [mediaBufferMillis] 原阈值（起播更快）。仅 media 生效，通话/Siri 等低延迟流不受影响。
+     * vc156 媒体流预缓冲开关（2026-11-14 有线默认关闭）：有线 USB 链路稳定，不再用预缓冲
+     * 换抗抖能力——PREBUFFER_LEAD_MILLIS 已归零，打开也不再加水位；起播/复播一律按
+     * [mediaBufferMillis] 原阈值即出。仅 media 生效，通话/Siri 等低延迟流不受影响。
      */
-    private val audioPrebufferEnabled: Boolean = true,
+    private val audioPrebufferEnabled: Boolean = false,
     private val onAudioDiagnostic: (String) -> Unit = {},
     /**
      * M6c：CarPlay 电话流（[AudioChannel.PHONE]）出现/消失时回调 true/false。
@@ -152,6 +151,13 @@ class AndroidMediaSink(
      * 允许积压（靠既有 backlog/stalled 兜底）。默认 false；重连（重建 sink）后生效。
      */
     private val videoNoCoalesce: Boolean = false,
+    /**
+     * 2026-11-14（通话/发语音麦克风无声修复）：麦克风上行（telephony / speechrecognition）
+     * 建立或结束时回调 true/false。上行期间 App 侧申请独占音频焦点让系统暂停其它播放器，
+     * sink 侧同时把自家 MEDIA 轨暂停并丢弃在途媒体包——避免「音乐占用音频输出 → 车机
+     * HAL 把麦克风压成静音」。此前只有手动暂停音乐会恢复，即该闸门的用户侧证据。
+     */
+    private val onMicrophoneUplinkActive: ((Boolean) -> Unit)? = null,
 ) : MediaSink {
     /**
      * vc236：VSYNC 节拍器。Choreographer 自 API16 起可用；独立 HandlerThread 上持续
@@ -382,9 +388,11 @@ class AndroidMediaSink(
         }
         if (uplink.start()) {
             cancelMicrophoneRetries(type)
+            markUplinkActive(type, true)
             return
         }
         microphoneUplinks.remove(type, uplink)
+        markUplinkActive(type, false)
         if (retriesLeft <= 0) {
             onAudioDiagnostic(
                 "Microphone uplink start failed after retries; " +
@@ -417,6 +425,7 @@ class AndroidMediaSink(
     override fun onMicrophoneStopped(type: Int) {
         cancelMicrophoneRetries(type)
         microphoneUplinks.remove(type)?.close()
+        markUplinkActive(type, false)
     }
 
     fun close() {
@@ -438,6 +447,13 @@ class AndroidMediaSink(
         microphoneUplinks.clear()
         microphoneRetryFutures.clear()
         microphoneRetryExecutor.shutdownNow()
+        // 2026-11-14：会话结束兜底释放上行闸门（若仍有登记的上行类型）。
+        if (synchronized(uplinkGateTypes) { uplinkGateTypes.isNotEmpty() }) {
+            synchronized(uplinkGateTypes) { uplinkGateTypes.clear() }
+            uplinkMediaGate = false
+            synchronized(duckLock) { applyDuckLocked() }
+            onMicrophoneUplinkActive?.invoke(false)
+        }
         // vc173：mediaStallMonitor 是 `while(true)` 线程，**仅靠 InterruptedException 退出**，
         // 而 close() 此前从未 interrupt 它 ⇒ 每次重连新建一个 sink 就泄漏一个常驻线程，
         // 且该线程通过闭包持有 audioRenderers/videoDecoders 等 ⇒ **整个 sink 对象图都释放不掉**，
@@ -506,6 +522,9 @@ class AndroidMediaSink(
 
     private val duckLock = Any()
     @Volatile private var navigationActive = false
+    /** 2026-11-14：麦克风上行期间的媒体闸门——true 时暂停 MEDIA 轨并丢弃在途媒体包。 */
+    @Volatile private var uplinkMediaGate = false
+    private val uplinkGateTypes = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
 
     /**
      * 某条音频流的"通道活跃/结束"通知（由 AudioRenderer 在建/销毁输出轨时回调）。
@@ -529,16 +548,39 @@ class AndroidMediaSink(
         }
     }
 
-    /** 只在导航活跃时压低 MEDIA 轨（导航自身不受影响）。 */
+    /** 只在导航活跃时压低 MEDIA 轨（导航自身不受影响）；麦克风上行期间则整体静音+暂停。 */
     private fun applyDuckLocked() {
-        val factor = if (navigationActive) {
-            (navigationDuckPercent().coerceIn(0, 100)) / 100f
-        } else {
-            1f
+        val factor = when {
+            uplinkMediaGate -> 0f
+            navigationActive -> (navigationDuckPercent().coerceIn(0, 100)) / 100f
+            else -> 1f
         }
         audioRenderers.values.forEach { renderer ->
-            if (renderer.channel == AudioChannel.MEDIA) renderer.setPlaybackVolume(factor)
+            if (renderer.channel == AudioChannel.MEDIA) {
+                // 上行闸门优先：暂停轨 + 丢弃在途包，等价于「手动暂停音乐」。
+                renderer.setUplinkSuspended(uplinkMediaGate)
+                renderer.setPlaybackVolume(factor)
+            }
         }
+    }
+
+    /**
+     * 2026-11-14（麦克风无声修复）：按「当前有几路上行」维护媒体闸门。
+     * 多路上行（通话 + Siri）用集合计数，任何一个建立即闸门生效，全部结束才恢复。
+     */
+    private fun markUplinkActive(type: Int, active: Boolean) {
+        val changed = if (active) uplinkGateTypes.add(type) else uplinkGateTypes.remove(type)
+        if (!changed) return
+        val gate = synchronized(uplinkGateTypes) { uplinkGateTypes.isNotEmpty() }
+        if (gate != uplinkMediaGate) uplinkMediaGate = gate
+        synchronized(duckLock) { applyDuckLocked() }
+        val types = synchronized(uplinkGateTypes) { uplinkGateTypes.toList() }
+        onMicrophoneUplinkActive?.invoke(gate)
+        onAudioDiagnostic(
+            "Audio: microphone uplink " +
+                (if (gate) "active → 暂停音乐(媒体闸门)" else "ended → 恢复音乐") +
+                " types=$types",
+        )
     }
 }
 
@@ -1236,9 +1278,24 @@ private class VideoDecoder(
                         } else {
                             // vc239（VID-234-03）：入队即记时刻，并在入队后采样队列深度峰值。
                             val pending = PendingOutput(index, System.nanoTime())
+                            // 2026-11-14（跟手度）：队列封顶。出队速率被面板刷新率卡死在 ≤60fps，
+                            // 链路突发把队列灌深后永远排不空 → 画面长期比手指慢。只保留
+                            // MAX_PENDING_OUTPUT_FRAMES 帧上屏余量，超出就把最旧的待渲帧归还
+                            // （render=false），不触碰参考链、不影响后续解码；稳态永不触发。
+                            var droppedIndex = -1
                             val depth = synchronized(pendingOutputs) {
+                                while (pendingOutputs.size >= MAX_PENDING_OUTPUT_FRAMES) {
+                                    droppedIndex = pendingOutputs.removeFirst().index
+                                }
                                 pendingOutputs.addLast(pending)
                                 pendingOutputs.size
+                            }
+                            if (droppedIndex >= 0) {
+                                try {
+                                    codec.releaseOutputBuffer(droppedIndex, false)
+                                } catch (_: Exception) {
+                                }
+                                stats.onSuperseded()
                             }
                             stats.onPendingDepth(depth)
                         }
@@ -1373,6 +1430,10 @@ private class VideoDecoder(
         // 1.1.3（绿线修复③）：最小渲染间隔 ≈ 一帧显示周期（60Hz→16.7ms）。
         // burst 期间解码速度可到 60~100fps，超频渲染在老显示管线上出 scanout 异常（绿线）。
         const val RENDER_MIN_INTERVAL_NS = 16_000_000L
+        // 2026-11-14（连接后画面流畅度/跟手度）：不合并模式下待渲队列硬上限 2 帧。
+        // 出队被 VSYNC 卡在 ≤60fps，链路突发后队列只会越来越深且不会自愈；封顶 2 帧把稳态
+        // 显示延迟再压 ~16ms，操作画面更跟手，代价是极端突发时丢弃最旧的显示机会。
+        const val MAX_PENDING_OUTPUT_FRAMES = 2
         // vc150（T3 来电假死）：静默渲染看门狗阈值/限频——3s 零渲染且流在来即判假死
         // （来电/通话/Siri 流重建后只发 P 帧不补参数集），恢复后 10s 内不再重复触发。
         const val RENDER_STALL_THRESHOLD_NS = 3_000_000_000L
@@ -1481,6 +1542,8 @@ private class AudioRenderer(
     private var underrunsAtPlaybackStart = 0
     private var lastPcmWriteNs = 0L
     private var rebufferCount = 0
+    /** 2026-11-14：麦克风上行期间本轨暂停（见 [setUplinkSuspended]）。 */
+    @Volatile private var uplinkSuspended = false
     // P0: RTP frame-loss compensation state (see compensateMissingFrames).
     private var lastTimestampUs = -1L
     private var lastIncrementUs = 0L
@@ -1512,6 +1575,29 @@ private class AudioRenderer(
             runCatching { current.setStereoVolume(volume, volume) }
         }
     }
+
+    /**
+     * 2026-11-14（通话/发语音麦克风无声修复）：麦克风上行期间暂停本 MEDIA 轨并清空待播队列。
+     * 车机 HAL 在音频输出活跃时会把输入（麦克风）压成静音；暂停+丢弃在途包等价于用户
+     * 「手动暂停音乐」，从而让麦克风恢复。上行结束后由下一次音频包按起播阈值自然恢复。
+     */
+    fun setUplinkSuspended(suspend: Boolean) {
+        if (uplinkSuspended == suspend) return
+        uplinkSuspended = suspend
+        if (suspend) {
+            runCatching { track?.pause() }
+            runCatching { track?.flush() }
+            playbackStarted = false
+            prebufferBytes = 0
+            queue.clear()
+            report("Audio: media paused for microphone uplink type=${format.payloadType}")
+        } else {
+            runCatching { track?.flush() }
+            queue.clear()
+            report("Audio: media restored after microphone uplink type=${format.payloadType}")
+        }
+    }
+
     private val thread = Thread({
         // 音频解码 + 写轨：抬到 AUDIO —— 低于收包（URGENT_AUDIO），但高于视频/系统默认，
         // 避免它和视频解码抢 CPU 时被拖出 underrun。
@@ -1533,6 +1619,11 @@ private class AudioRenderer(
     }
 
     fun submit(rtp: ByteArray, sample: Int) {
+        // 2026-11-14：麦克风上行期间整条 MEDIA 轨暂停，直接丢弃在途媒体包。
+        if (uplinkSuspended) {
+            if (started) packetsDropped.incrementAndGet()
+            return
+        }
         if (started) {
             packetsReceived.incrementAndGet()
             BandwidthMonitor.onAudioBytes(rtp.size)
@@ -2459,11 +2550,11 @@ private class AudioRenderer(
         // M6v：低水位 pause 后等补缓冲的最长时长（「一小段」）；超时放行残量，防止流尾被永久卡住。
         const val WATERMARK_PAUSE_MAX_NS = 1_000_000_000L
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
-        const val MAX_QUEUED_PACKETS = 192
+        // 2026-11-14（有线）：不再保留抗 Wi-Fi 抖动余量——解码包队列由 ~4s 收到 ~1s。
+        const val MAX_QUEUED_PACKETS = 48
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
-        // vc156：媒体预缓冲水位（移植自上游 0.2.21 BufferedAudioStream.LEAD_MILLIS）——
-        // 播放时保持约 1s 音频领先于实时，盖住无线链路常见数百 ms~1s 的断流。
-        const val PREBUFFER_LEAD_MILLIS = 1000L
+        // 2026-11-14（声音延迟修复）：300 → 0。预缓冲水位归零，按播放即出声。
+        const val PREBUFFER_LEAD_MILLIS = 0L
         // vc156（#814）：积压恢复诊断限报次数（防持续积压刷爆日志）。
         const val MAX_LAG_RECOVERY_REPORTS = 5
         const val STATS_TAG = "DiPlay-AudioStats"

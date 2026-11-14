@@ -37,20 +37,36 @@ Only those two filenames are accepted; a missing one is an error. Keep them safe
 
 **Compatibility scope and verification status**: compatibility has only been verified on the tested platform/firmware/iOS combinations below; nothing else is promised.
 
-**Model mapping** (project short name ↔ retail device; HU = head unit, Phone = smartphone):
+**Current on-device tested model comparison** (project short name ↔ retail device; HU = head unit, Phone = smartphone, Tablet = tablet):
 
 | Short name | Retail device | Type |
 |---|---|---|
 | K60 | Redmi K60 | Phone |
 | C8815 | Huawei C8815 | Phone |
 | ONEPLUS A5000 | OnePlus 5 | Phone |
+| S8 | Samsung Galaxy S8 (CN) | Phone |
+| S9+ | Samsung Galaxy S9+ (CN) | Phone |
+| Tab3-7 | Samsung Galaxy Tab 3 7.0 | Tablet |
+| ANE-AL00 | Huawei nova 3e | Phone |
+| Pad5 | Xiaomi Pad 5 (11-inch Wi-Fi; pending official check) | Tablet |
+| Redmi14C | Redmi 14C (4G; pending official check) | Phone |
+| A72-5G | OPPO A72 5G | Phone |
 | T3 | Dingwei T3 (T3-A/B/C/D; recent dongle test on T3-B) | HU |
 | TS7 | Dingwei TS7 (sprd sp7731e / Mazda 2) | HU |
 | EU5 | BAIC EU5 (2019) | HU |
 | FE-6 | Geely Binrui (2020) | HU |
 | AC822X | FlyAudio GS1 | HU |
+| AC8227 | ATC AC8227 generic | HU |
 | at8317 | Nuoyumi | HU |
 | AC8217 | Zhangxun AC8217 | HU |
+| C40DB | PATEO C40DB-EHU (BAIC C40 platform; inferred) | HU |
+| MX6DQ | Freescale SABRESD-MX6DQ (generic) | HU |
+| MX9 | Freescale MX9 (generic) | HU |
+| 8227L | MediaTek 8227L demo (generic) | HU |
+| BEP10A | Coocaa BEP10A (pending verification) | HU/box |
+| E17 | GM E17 | HU |
+
+> Includes on-device tested, historical, and pending-verification entries; "inferred / generic / pending" does not imply full feature validation.
 
 **Platform and feature scope**:
 

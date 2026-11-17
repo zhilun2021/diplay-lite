@@ -18,7 +18,9 @@ import android.os.Build
 import android.util.Log
 import android.os.Bundle
 import android.os.Handler
+import android.os.SystemClock
 import android.text.TextUtils
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -61,7 +63,8 @@ import kotlin.math.abs
  * - USB 通道连接路径：USB 设备探测（Apple VID）→ VpnService.prepare 授权 → startSession；
  * - 视频层：SurfaceView 铺满 + forwardTouch 触摸转发，ACTIVE 时面板收起、悬浮球唤回；
  * - 悬浮球：初始右对齐上下居中，拖拽后吸附最近左/右边（attachBallDrag）；
- * - errorCard：FAILED 态居中小卡片（≤300dp，标题 + 3 行省略 + 重试）；
+ * - errorCard：FAILED 态居中小卡片（≤300dp，标题 + 3 行省略 + 重试）；vc300 起热点未开
+ *   等待态也复用该卡片，额外给出「去打开热点」直达键（不停会话）。
  * - 旋转：onConfigurationChanged 分屏处理；布局方向用 Display 实际宽高判定
  *   （isLandscapeDisplay，勿信 configuration.orientation）；ACTIVE/CONNECTING 仅换面板
  *   不动 SurfaceView；空闲态 render() 整页重建。
@@ -115,6 +118,11 @@ class MainActivity : Activity() {
     // FAILED 态的居中小卡片（标题 + 3 行省略 + 结束）。
     private lateinit var errorCard: View
     private lateinit var errorTextView: TextView
+    private lateinit var errorTitleView: TextView
+    // vc300：等待热点态（CONNECTING + 「热点未开启」）的直达按钮——只跳系统热点页，不停会话。
+    private lateinit var hotspotJumpButton: Button
+    /** vc314（INV-308-01）：失败卡的可执行动作按钮（文案与行为按 failureClass 决定）。 */
+    private lateinit var errorActionButton: Button
     // M6k24：状态卡三键 —— 立即连接（常驻，连接中置灰）/ 选择 iPhone（常驻）/ 断开连接（仅连接中出现）。
     // 大状态卡主按钮不再做 0/1 状态切换（对齐原版交互）。
     private lateinit var primaryActionButton: Button
@@ -131,14 +139,21 @@ class MainActivity : Activity() {
     private var lastActive = false
     // 与设置页同步：记录当前渲染出的默认通道，tick 里比对 LiteConfig.activeChannel
     private var shownActiveChannel: String? = null
-    // vc206：门槛态变化哨兵（灰化/描边只在状态翻转时重建背景，不在 500ms tick 里反复建）。
-    private var shownGateVisual: Boolean? = null
+    /** vc310：外置蓝牙三态哨兵（三态互切但文案需刷新时用）。 */
+    private var shownExtBtState: ExtBtState? = null
     // vc145（C8815 实测 23:54 定案）：refreshTask 每 500ms 全量重绘，dalvik 低端机
     // 每 tick 主线程 ~11ms 且持续制造分配——状态未变时短路全部 UI 写，降低空闲
     // 主线程负载与 GC 压力（未连接期按钮响应的 app 侧放大器）。
     private var shownPhase: LiteState.Phase? = null
     private var shownRunning: Boolean? = null
     private var shownStatus: String? = null
+    // vc308 INV-1：C-3（已连接）后锁定粗状态，晚到的 C-2 不得把界面打回「连接中」。
+    // 解锁集合 = 会话终态七码（S-01/S-02/S-12/S-14/S-15/S-16/S-27），见 renderState()。
+    private var coarseLocked = false
+    // vc308 INV-2：进入 C-2 的时刻（elapsedRealtime；0 = 当前不在 C-2）。
+    private var c2SinceElapsed = 0L
+    // vc308 INV-2：状态行实际显示文本的哨兵（含「· 已等待 N 秒」后缀）。
+    private var shownDisplayText: String? = null
     // 自动连接一个进程生命周期只发起一次，避免用户断开后再被拉起
     private var autoConnectTried = false
     // vc245：手动重连的退避状态（运行中 = 已在重试链里，防重复点击叠加）。
@@ -148,6 +163,19 @@ class MainActivity : Activity() {
     private var userDisconnected = false
     // vc247（V3）：用户主动「停止外置蓝牙」后抑制回前台/重连自动拉起，重新打开配对页才恢复。
     private var usbBtUserStopped = false
+
+    // vc279（ac8317「点下去没反应」取证）：UI 侧最小埋点，只打日志、不改交互逻辑。
+    // ① 触摸排队 = uptime - ev.eventTime（主线程被占时输入事件在队列里积压）
+    // ② dispatchTouchEvent 分发耗时（含点击回调同步执行）
+    // ③ render() 整页重建耗时
+    // ④ Choreographer 帧间隔（主线程掉帧）
+    // 阈值以下不打日志：LiteLog 是同步写盘，高频记录会反过来拖慢主线程。
+    private val slowTouchQueueMs = 100L
+    private val slowTouchDispatchMs = 50L
+    private val slowRenderMs = 120L
+    private val slowFrameGapMs = 200L
+    private var lastUiFrameNs = 0L
+    private var lastFrameLogNs = 0L
 
     // 1.0.16（方案四②）：开机自启等待弹窗——上电后等勾选的蓝牙/热点就绪并稳定 10s 再自动连接。
     private var autostartWaitActive = false
@@ -194,8 +222,15 @@ class MainActivity : Activity() {
                 LiteLog.log("ui", "自启等待：超时 ${AUTOSTART_WAIT_TIMEOUT_MILLIS / 1000}s，自动连接已取消")
                 autostartWaitActive = false
                 autostartDialog?.apply {
-                    setMessage("等待超时：勾选的蓝牙/热点未就绪，自动连接已取消")
-                    setPositiveButton("确定")
+                    // vc303（BOOT-303-01）：ROM 拦截 BOOT_COMPLETED 或拒绝静默开启时不再静默失败，
+                    // 给可执行出口（直达热点/网络共享页；系统自启动白名单需用户在本机设置里放行）。
+                    setMessage(
+                        "等待超时：勾选的蓝牙/热点未就绪，自动连接已取消。" +
+                            "若每次开机都如此，请在系统「自启动管理」中允许本应用，或手动打开热点/蓝牙后重试。",
+                    )
+                    setPositiveButton("去打开热点") {
+                        SystemSettingsJumps.openHotspotSettings(this@MainActivity)
+                    }
                     show()
                 }
                 autostartDialog = null
@@ -249,6 +284,7 @@ class MainActivity : Activity() {
             runOnUiThread { applyVideoFit(width, height) }
         }
         LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
+        installUiFrameMonitor()
         // vc102 副屏探测：仪表/HUD 投射路线判生死，默认日志检测（无按钮），结果写 LiteLog cluster 标签。
         ClusterDisplayProbe.probe(this)
         // vc270：状态栏探针已摘除（VC270-02）——GS1 顶栏压不住已成定论，留它每次进页面都要
@@ -322,9 +358,21 @@ class MainActivity : Activity() {
                 // vc245：外置蓝牙（0a12）此前被完全忽略——掉线/拔插后 App 零感知，
                 // 这是 T3「重新拔插没反应」的直接原因之一。这里置为待重连并上屏提示。
                 if (device.vendorId == UsbDongleGuard.VENDOR_ID) {
+                    // vc310：拔出即让在场缓存失效，三态立刻从「就绪/未配对」翻到「未检测到」。
+                    UsbDongleGuard.invalidatePresence()
                     LiteLog.log("usbdongle", "USB 拔出：外置蓝牙 detach ${device.deviceName}，进入掉线重连")
-                    usbSixFields("usb", "detach", "receiver", "reconnect-after-1.0s")
                     autoConnectTried = false
+                    // vc311（BT-310-04）：设备已物理不在总线上，重试必然全 ABSENT；会话活着时
+                    // 只会把 failStreak 推到 5（→ extBtState 判 NOT_READY）并弹一条误报 Toast。
+                    if (LiteSessionService.current?.isWirelessSessionAlive() == true) {
+                        usbSixFields("usb", "detach", "receiver", "session-alive-skip-retry")
+                        LiteLog.log("bt", "B-101 running=${UsbBtStandby.isRunning} | 拔出：会话存活，跳过重连")
+                        // vc245 的教训：旧句柄必须释放（已交出的流归控制器所有，stop 不拆会话）
+                        runCatching { UsbBtStandby.stop() }
+                        return
+                    }
+                    // ↓ 以下为无活会话时的既有逻辑，原样保留（Toast + 1s 后 5 次退避）
+                    usbSixFields("usb", "detach", "receiver", "reconnect-after-1.0s")
                     Toast.makeText(
                         this@MainActivity,
                         "外置蓝牙已掉线：正在释放旧句柄并自动重连（失败 5 次后停止）",
@@ -370,10 +418,23 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        // vc310：插入即让在场缓存失效，三态立刻重判（否则最长 2s 仍显示「未检测到」）。
+        UsbDongleGuard.invalidatePresence()
         // vc250：USB 插入侧直接落 usb-enum，不依赖会话服务是否已起。
         logUsbAttach(intent)
         autoConnectTried = false
         usbSixFields("usb", "attach-settle", "receiver", "auto-connect-after-1.5s")
+        // vc311（BT-310-04）：物理插拔不推翻用户手动「停止外置蓝牙」的决定；force 会绕过
+        // syncUsbBtStandby 内部的 usbBtUserStopped 抑制，所以必须先判。
+        // 蓝牙来源=车机蓝牙时不碰外置（syncUsbBtStandby 会自行 stop 并返回，不该打「恢复广播」）。
+        if (LiteConfig.usbBtDongleOf(this)) {
+            if (usbBtUserStopped) {
+                LiteLog.log("bt", "B-103 running=${UsbBtStandby.isRunning} | 插回：用户已停止外置蓝牙，不拉起")
+            } else {
+                syncUsbBtStandby(force = true)
+                LiteLog.log("bt", "B-102 running=${UsbBtStandby.isRunning} | 插回：恢复常驻广播")
+            }
+        }
         // vc246（USB-246-03）：ATTACHED 后 1.5s 静默期（与 DETACHED 后 1.0s 对称）。
         handler.postDelayed({ maybeAutoConnect() }, 1_500)
     }
@@ -410,10 +471,21 @@ class MainActivity : Activity() {
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
         syncUsbBtStandby()
+        // vc311：回前台重算在场（事件驱动的兜底刷新点，覆盖后台插拔/广播丢失）。
+        UsbDongleGuard.invalidatePresence()
         usbSixFields("bt", "resume", if (UsbBtStandby.isRunning) "standby-running" else "standby-stopped", "auto-connect")
         maybeAutoConnect()
         // 1.1.4 系统诊断：新装无检测记录时，主界面就绪后延迟 5 秒触发首启快检（可跳过）。
         Diagnostics.quickCheckIfDue(this)
+        // vc297：车机「汽车」键是系统 HOME（实测 mResumedActivity 直接变 huawei Launcher，
+        // 窗口收不到任何 KeyEvent，拦不住）。退而求其次：从桌面点图标回到前台时，若仍在
+        // 激活态且面板收起，直接亮出面板——「断开连接」必须始终可达。
+        if (LiteState.phase == LiteState.Phase.ACTIVE && page == "home" && !panelVisible &&
+            ::ballRoot.isInitialized
+        ) {
+            setPanelVisible(true)
+            LiteLog.log("ui", "回前台：激活态自动亮面板（汽车键兜底）")
+        }
     }
 
     override fun onPause() {
@@ -647,6 +719,12 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
+            // vc297：激活态视频铺满整屏、C8815 上悬浮球被视频层吞掉（层级里在、画面上不显示），
+            // 用户没有任何"断开"入口。返回键先亮面板，再按一次才走原有层级（含退出确认）。
+            LiteState.phase == LiteState.Phase.ACTIVE && page == "home" && !panelVisible -> {
+                setPanelVisible(true)
+                LiteLog.log("ui", "返回键：激活态亮面板（断开入口）")
+            }
             page == "caricon" && carIconPage?.onBackKey() == true -> return
             page != "home" && page != "settings" -> setPage("settings")
             page == "settings" -> goHome()
@@ -689,6 +767,31 @@ class MainActivity : Activity() {
                 root.removeView(panel)
                 panel = homePanel()
                 root.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                // vc298：面板是新实例，statusLine/disconnectButton 等字段全部指向新控件，必须清掉
+                // renderState() 的变更哨兵；否则 phase/running/statusText 未变 → 直接短路，新面板
+                // 停在默认态。C8815 实测（17:19 回前台触发一次配置变化）表现为「状态写着已激活、
+                // 主按钮还是立即连接、没有断开连接」。
+                shownPhase = null
+                shownRunning = null
+                shownStatus = null
+                shownDisplayText = null
+                shownExtBtState = null
+                // vc297/vc298：面板被追加到 root 末尾，同层 z 序会盖住悬浮球（球在 render() 里先加）；
+                // 若球已被摘掉（parent 为空）按上次边距补回，避免重建后面板在、球没了。
+                if (::ballRoot.isInitialized) {
+                    if (ballRoot.parent == null) {
+                        val size = dip(46)
+                        val lp = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.END)
+                        val dmH = resources.displayMetrics.heightPixels
+                        lp.topMargin = ballTopMargin ?: (dmH - size - dip(28))
+                        lp.rightMargin = ballRightMargin ?: dip(12)
+                        ballRoot.layoutParams = lp
+                        root.addView(ballRoot, lp)
+                        LiteLog.log("ui", "旋转：悬浮球已摘掉，按边距补回")
+                    } else {
+                        ballRoot.bringToFront()
+                    }
+                }
                 // 旋转后让视频 SurfaceView 跟随新窗口尺寸重排（MediaCodec 输出自动缩放到 Surface）。
                 video.requestLayout()
                 setPanelVisible(panelVisible)
@@ -808,10 +911,60 @@ class MainActivity : Activity() {
     }
 
     /**
+     * vc279（ac8317 取证）：触摸排队与分发耗时。
+     *
+     * `ev.eventTime` 是手指按下的系统时刻，当前 uptime 与它之差就是事件在 InputDispatcher
+     * 队列里等主线程的时长。主线程被占死时该值会明显抬升——这正是用户感知的「点下去没反应」；
+     * 该延迟只在事件真正分发到 App 时才可测，所以必须在这一层取。
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        val queueMs = SystemClock.uptimeMillis() - ev.eventTime
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN && queueMs >= slowTouchQueueMs) {
+            LiteLog.log("ui", "触摸排队: ${queueMs}ms page=$page at=(${ev.x.toInt()},${ev.y.toInt()})")
+        }
+        val startedNs = System.nanoTime()
+        val handled = super.dispatchTouchEvent(ev)
+        val costMs = (System.nanoTime() - startedNs) / 1_000_000
+        if (costMs >= slowTouchDispatchMs) {
+            LiteLog.log("ui", "触摸分发: ${costMs}ms action=${ev.actionMasked} page=$page")
+        }
+        return handled
+    }
+
+    /** vc279：主线程帧间隔监控。超过阈值并已冷却 3 秒以上才记一条，避免日志风暴。 */
+    private fun installUiFrameMonitor() {
+        val choreographer = runCatching { Choreographer.getInstance() }.getOrNull() ?: return
+        choreographer.postFrameCallback(object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                val now = System.nanoTime()
+                if (lastUiFrameNs != 0L) {
+                    val gapMs = (now - lastUiFrameNs) / 1_000_000
+                    if (gapMs >= slowFrameGapMs && now - lastFrameLogNs >= 3_000_000_000L) {
+                        lastFrameLogNs = now
+                        LiteLog.log("ui", "主线程掉帧: gap=${gapMs}ms page=$page")
+                    }
+                }
+                lastUiFrameNs = now
+                runCatching { choreographer.postFrameCallback(this) }
+            }
+        })
+    }
+
+    /**
      * 根视图：Surface 铺满 → home 面板 → 悬浮球 → errorCard。
      * 面板布局方向用 Display 实际宽高判定（isLandscapeDisplay），勿信 configuration.orientation。
      */
     internal fun render() {
+        val startedNs = System.nanoTime()
+        try {
+            renderPanel()
+        } finally {
+            val costMs = (System.nanoTime() - startedNs) / 1_000_000
+            if (costMs >= slowRenderMs) LiteLog.log("ui", "整页重建: ${costMs}ms page=$page")
+        }
+    }
+
+    private fun renderPanel() {
         val root = ensureRenderRoot()
 
         // vc250（VC248-07）：切页只换面板/悬浮球/失败卡，SurfaceView 常驻不重建——
@@ -917,7 +1070,8 @@ class MainActivity : Activity() {
             setPadding(dip(18), dip(14), dip(18), dip(16))
         }
         val errorColumn = column()
-        errorColumn.addView(label("连接失败", 14, Ui.WARNING, true))
+        errorTitleView = label("连接失败", 14, Ui.WARNING, true)
+        errorColumn.addView(errorTitleView)
         errorTextView = label("", 13, Ui.TEXT).apply {
             maxWidth = dip(264)
             maxLines = 3
@@ -928,12 +1082,33 @@ class MainActivity : Activity() {
             errorTextView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dip(6) },
         )
+        // vc300：热点未开等待态提供直达入口（不停会话）；失败态隐藏。
+        hotspotJumpButton = button("去打开热点", true, height = 40) {
+            SystemSettingsJumps.openHotspotSettings(this@MainActivity)
+        }.apply { visibility = View.GONE }
+        errorColumn.addView(hotspotJumpButton, matchButton(top = 12, height = 40))
+        // vc314（INV-308-01）：C-4 的可执行动作。文案与点击行为都在 renderState 里按
+        // LiteState.failureClass 决定，见下方分型表。
+        errorActionButton = button("重试", true, height = 40) {
+            errorCard.visibility = View.GONE
+            when (LiteState.failureClass) {
+                LiteLog.FailureClass.CredTimeout -> SystemSettingsJumps.openHotspotSettings(this@MainActivity)
+                LiteLog.FailureClass.BtNoResponse, LiteLog.FailureClass.Iap2Timeout ->
+                    if (LiteConfig.usbBtDongleOf(this@MainActivity)) {
+                        ExternalBtPairingDialog.show(this@MainActivity)
+                    } else {
+                        retryFromFailedCard()
+                    }
+                else -> retryFromFailedCard()
+            }
+        }.apply { visibility = View.GONE }
+        errorColumn.addView(errorActionButton, matchButton(top = 8, height = 40))
         errorColumn.addView(
             button("结束", false, height = 40) {
                 errorCardView.visibility = View.GONE
                 disconnect()
             },
-            matchButton(top = 12, height = 40),
+            matchButton(top = 8, height = 40),
         )
         errorCardView.addView(errorColumn, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         errorCard = errorCardView
@@ -959,7 +1134,9 @@ class MainActivity : Activity() {
         shownPhase = null
         shownRunning = null
         shownStatus = null
+        shownDisplayText = null
         shownActiveChannel = null
+        shownExtBtState = null
         renderState()
     }
 
@@ -1105,7 +1282,8 @@ class MainActivity : Activity() {
         card.addView(primaryActionButton, matchButton())
 
         // vc206：门槛警示行（warnline：WARN 色 12sp，贴主按钮下方，设计稿 §04 G1）。
-        pairGateLabel = label("未配对，请先在弹出窗口完成配对", 12, Ui.WARNING).apply {
+        // vc310：初始文案留空，真值由 renderState() 按外置蓝牙三态写入。
+        pairGateLabel = label("", 12, Ui.WARNING).apply {
             setPadding(0, dip(8), 0, 0)
             visibility = View.GONE
         }
@@ -1165,21 +1343,84 @@ class MainActivity : Activity() {
         "当前蓝牙：车机蓝牙"
     }
 
-    /** vc206：外置蓝牙未配对门槛 —— 外置来源 + 无线通道（USB 直连不经蓝牙，不拦）+ 未配对。 */
-    private fun externalBtGateBlocked(): Boolean =
-        LiteConfig.usbBtDongleOf(this) &&
-            LiteConfig.activeChannelOf(this) != "usb" &&
-            !UsbBtStandby.isUsable
+    /** vc310：外置蓝牙五态（NONE=内置蓝牙，不参与门槛）。 */
+    private enum class ExtBtState { NONE, DONGLE_ABSENT, NOT_READY, UNPAIRED, USER_STOPPED, READY }
+
+    /**
+     * vc310：外置蓝牙三态的唯一判定出口。
+     *
+     * 顺序不可换：① 先看在场（不在场时 isRunning 仍可能为 true，重试循环还在跑）；
+     * ② 再看失败（failStreak>0 = 插了但连不上，不是未配对）；③ 最后看配对。
+     * 已知过渡态：刚插入、常驻广播初始化窗口内（failStreak==0 && !isUsable）会短暂显示
+     * 「未配对」，与 vc309 现状一致，不新增第四句文案。
+     */
+    private fun extBtState(): ExtBtState {
+        // NONE = 内置蓝牙，不参与门槛（与现状一致）
+        if (!LiteConfig.usbBtDongleOf(this)) return ExtBtState.NONE
+        if (!UsbDongleGuard.isPresent(this)) return ExtBtState.DONGLE_ABSENT
+        // vc314（UI-311-01）：用户主动「停止外置蓝牙」后，dongle 仍在总线上 ⇒ isPresent 为真、
+        // isUsable 为假，会落到 UNPAIRED 报「未配对」。先判这个抑制位，落第 4 态。
+        if (usbBtUserStopped) return ExtBtState.USER_STOPPED
+        if (UsbBtStandby.failStreak > 0) return ExtBtState.NOT_READY
+        if (!UsbBtStandby.isUsable) return ExtBtState.UNPAIRED
+        return ExtBtState.READY
+    }
+
+    /** vc310：外置蓝牙门槛 —— 外置来源 + 无线通道（USB 直连不经蓝牙，不拦）+ 未就绪。 */
+    private fun externalBtGateBlocked(): Boolean {
+        if (LiteConfig.activeChannelOf(this) == "usb") return false
+        val state = extBtState()
+        return state != ExtBtState.NONE && state != ExtBtState.READY
+    }
+
+    /** vc314：失败卡的「重试」——与主按钮走同一门槛出口，不允许绕过。 */
+    private fun retryFromFailedCard() {
+        if (externalBtGateBlocked()) {
+            showExternalBtPairGateDialog()
+            return
+        }
+        connect(LiteConfig.load(this).activeChannel)
+    }
 
     /** vc206：门槛引导层（设计稿 §04 G1 可选「去配对」跳转；配对窗内完成配对后自动解锁）。 */
     private fun showExternalBtPairGateDialog() {
-        AppDialog.Builder(this)
-            .setTitle("先完成配对")
-            // vc247（V11）：单台语义文案 —— 同一时间只服务一台，配对新手机会顶替旧设备。
-            .setMessage("外置蓝牙还没和 iPhone 配对。同一时间只服务一台设备，配对新手机会顶替旧设备。点「去配对」打开配对窗口，完成后再回来连接。")
-            .setNegativeButton("取消", null)
-            .setPositiveButton("去配对") { _, _ -> ExternalBtPairingDialog.show(this) }
-            .show()
+        when (extBtState()) {
+            ExtBtState.DONGLE_ABSENT -> AppDialog.Builder(this)
+                .setTitle("未检测到外置蓝牙")
+                .setMessage("请把 USB 蓝牙 dongle 插到车机 USB 口。插入后会自动重连，无需手动操作。")
+                .setPositiveButton("知道了", null)
+                .show()
+
+            ExtBtState.NOT_READY -> AppDialog.Builder(this)
+                .setTitle("外置蓝牙连接失败")
+                .setMessage("${UsbBtStandby.describe()}。可尝试拔插 dongle，或重启车机后再连。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("重试") { _, _ -> reconnectDongle() }
+                .show()
+
+            ExtBtState.USER_STOPPED -> AppDialog.Builder(this)
+                .setTitle("外置蓝牙已停止")
+                .setMessage("你手动停止了外置蓝牙。车机热点连接不受影响，只是外置蓝牙的配对与常驻广播暂停了。点「去开启」会重新启动广播并打开配对窗口。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("去开启") { _, _ ->
+                    // vc315（UI-314-01）：stopExternalBt() 会把档位写成 USB_BT_MODE_OFF，而
+                    // ensureUsbBtStandby() 的第一道门就是「档位=关闭则不拉起」（vc248 的
+                    // 「关闭 > 页面临时升档」优先级）⇒ 只开页面不会恢复，usbBtUserStopped 也
+                    // 不会被清。用户既然点了「去开启」，就先把档位拨回可被发现，再开页面；
+                    // 之后的 ensureUsbBtStandby() 会清抑制并 syncUsbBtStandby(force=true)。
+                    LiteConfig.setUsbBtPowerMode(this, LiteConfig.USB_BT_MODE_DISCOVERABLE)
+                    ExternalBtPairingDialog.show(this)
+                }
+                .show()
+
+            else -> AppDialog.Builder(this)   // UNPAIRED：现状文案，一个字不改
+                .setTitle("先完成配对")
+                // vc247（V11）：单台语义文案 —— 同一时间只服务一台，配对新手机会顶替旧设备。
+                .setMessage("外置蓝牙还没和 iPhone 配对。同一时间只服务一台设备，配对新手机会顶替旧设备。点「去配对」打开配对窗口，完成后再回来连接。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("去配对") { _, _ -> ExternalBtPairingDialog.show(this) }
+                .show()
+        }
     }
 
     /**
@@ -1406,11 +1647,14 @@ class MainActivity : Activity() {
         if (width <= 0 || height <= 0) return false
         // 只有 ACTION_MOVE 是可合并的中间态；DOWN/UP/POINTER_*/CANCEL 都必须逐条送达。
         val sticky = event.actionMasked != MotionEvent.ACTION_MOVE
-        // 1.0.7：MOVE 按 30fps 节流——手指按屏抖动会以 60Hz 洪灌 HID 通道
+        // 1.0.7：MOVE 节流——手指按屏抖动会以 60Hz 洪灌 HID 通道
         // （3e 实测 15 秒 310 条 POST），DOWN/UP 不受影响。
+        // vc278（跟手度）：33ms → 8ms（约 120Hz 采样）。洪灌由 sendTouch 的
+        // 「MOVE 队尾就地覆盖 + 单泵串行排空」兜住（见 CarPlayController.enqueueTouchLocked），
+        // 真正上行的条数与采样率无关；放宽采样只让滑动中间态更完整。
         if (!sticky) {
             val now = System.currentTimeMillis()
-            if (now - lastMoveForwardMs < 33) return true
+            if (now - lastMoveForwardMs < 8) return true
             lastMoveForwardMs = now
         }
         return service.sendTouch(CarPlayTouchMapper.contacts(event, width, height), sticky)
@@ -2097,6 +2341,13 @@ class MainActivity : Activity() {
         if (LiteSessionService.current != null) return
         val config = LiteConfig.load(this)
         if (!config.autoConnect) return
+        // vc311（UI-310-02）：与主按钮走同一个门槛出口，避免「按钮灰着但自连照发」。
+        // 位置必须在 autoConnect 判定之后，否则没开自连的用户也会被打一条「跳过」。
+        if (externalBtGateBlocked()) {
+            LiteLog.log("ui", "自动连接跳过：外置蓝牙未就绪（${extBtState()}）")
+            autoConnectTried = true
+            return
+        }
         val channel = config.activeChannel
         // vc158：新增 p2p（Wi-Fi Direct）通道。
         if (channel != "car" && channel != "relay" && channel != "usb" && channel != "p2p") return
@@ -2171,12 +2422,52 @@ class MainActivity : Activity() {
         val phase = LiteState.phase
         val running = LiteState.running
         val statusText = LiteState.statusText
+        val statusCode = LiteState.statusCode
+        val coarse = LiteState.coarse
+        // vc308 INV-1（第二道保险）：C-3 出现后锁定，晚到的 C-2 不得把界面打回「连接中」。
+        // 解锁集合按 15-编号表 §2.1 取「会话终态」七码：S-01/S-02/S-12/S-14/S-15/S-16/S-27。
+        // 其中 S-16（连接已断开，尝试重连中）本身就在 C-2——若只认 S-01/S-14 解锁，
+        // 断流后界面会一直停在「已激活」，INV-2 的「已等待 N 秒」也永远不出现。
+        // 细状态迁移照旧记日志，本锁只管 UI 显示，不掩盖排障信息。
+        when (statusCode) {
+            LiteState.UiStateCode.S01,
+            LiteState.UiStateCode.S02,
+            LiteState.UiStateCode.S12,
+            LiteState.UiStateCode.S14,
+            LiteState.UiStateCode.S15,
+            LiteState.UiStateCode.S16,
+            LiteState.UiStateCode.S27,
+            -> coarseLocked = false
+            else -> Unit
+        }
+        if (coarse == LiteState.CoarseState.C3) coarseLocked = true
+        val coarseSuppressed = coarseLocked && coarse == LiteState.CoarseState.C2
+        // vc308 INV-2（方案 A）：C-2 持续 >15s 追加「· 已等待 N 秒」。
+        // N 取 elapsedRealtime 差值（不用墙钟）；秒数必须在下方短路条件里参与比较，
+        // 否则 statusText 不变会让界面不刷新、N 永远显示 0。
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (coarse == LiteState.CoarseState.C2) {
+            if (c2SinceElapsed == 0L) c2SinceElapsed = nowElapsed
+        } else {
+            c2SinceElapsed = 0L
+        }
+        val waitedSeconds =
+            if (c2SinceElapsed == 0L) 0L else (nowElapsed - c2SinceElapsed) / 1_000L
+        val waitingSuffix = if (coarse == LiteState.CoarseState.C2 && waitedSeconds >= 15L) {
+            " · 已等待 $waitedSeconds 秒"
+        } else {
+            ""
+        }
+        val displayText = statusText + waitingSuffix
         // vc145：状态未变即短路（哨兵 null 保证首 tick 必跑）；activeChannel/面板
         // 显隐有独立变化检测，保持每 tick 执行（设置页改动后回主页实时刷新依赖它）。
-        if (phase != shownPhase || running != shownRunning || statusText != shownStatus) {
+        if (phase != shownPhase || running != shownRunning || statusText != shownStatus ||
+            displayText != shownDisplayText
+        ) {
             shownPhase = phase
             shownRunning = running
             shownStatus = statusText
+            shownDisplayText = displayText
             // 大状态卡状态点：总览实时状态。
             (statusDot.background as? GradientDrawable)?.setColor(
                 when (phase) {
@@ -2186,17 +2477,37 @@ class MainActivity : Activity() {
                     LiteState.Phase.IDLE -> Color.GRAY
                 },
             )
-            statusLine.text = statusText
+            // vc308 INV-1：锁定期间收到 C-2，不改写状态行（保留已连接的 C-3 文字），日志照记。
+            if (!coarseSuppressed) statusLine.text = displayText
             // M6k24：主按钮固定「立即连接」（连接中/激活置灰）；断开连接独立成键，仅连接中出现。
             primaryActionButton.isEnabled = !running
             primaryActionButton.alpha = if (running) 0.5f else 1f
             disconnectButton.visibility = if (running) View.VISIBLE else View.GONE
             // FAILED 态弹居中小卡片（标题+3行省略+重试）；其余状态收起。
+            // vc300：等待热点态（CONNECTING + 「热点未开启」）同样弹卡，但按钮换成
+            // 「去打开热点」——只跳系统热点页，不停会话，开热点后编排层自动续连。
+            // vc308：判据从文案 contains 改为编号（S-26），改文案不再静默废掉这张卡（治 G-6）。
             val failed = phase == LiteState.Phase.FAILED
-            if (failed && errorCard.visibility != View.VISIBLE) {
+            val hotspotWaiting = phase == LiteState.Phase.CONNECTING &&
+                statusCode == LiteState.UiStateCode.S26
+            if (failed || hotspotWaiting) {
+                errorTitleView.text = if (hotspotWaiting) "热点未开启" else "连接失败"
                 errorTextView.text = statusText
+                hotspotJumpButton.visibility = if (hotspotWaiting) View.VISIBLE else View.GONE
+                if (hotspotWaiting) {
+                    errorActionButton.visibility = View.GONE
+                } else {
+                    errorActionButton.visibility = View.VISIBLE
+                    errorActionButton.text = when (LiteState.failureClass) {
+                        LiteLog.FailureClass.CredTimeout -> "去打开热点"
+                        LiteLog.FailureClass.BtNoResponse,
+                        LiteLog.FailureClass.Iap2Timeout,
+                        -> if (LiteConfig.usbBtDongleOf(this)) "去配对" else "重试"
+                        else -> "重试"
+                    }
+                }
                 errorCard.visibility = View.VISIBLE
-            } else if (!failed && errorCard.visibility == View.VISIBLE) {
+            } else if (errorCard.visibility == View.VISIBLE) {
                 errorCard.visibility = View.GONE
             }
             // 连接成功即自动收起面板 —— 此时用户要看的是 CarPlay 画面；断开后再自动展开。
@@ -2214,29 +2525,31 @@ class MainActivity : Activity() {
             shownActiveChannel = activeChannel
             hintLabel.text = defaultChannelHint(activeChannel)
         }
-        // vc206：外置蓝牙未配对门槛（设计稿 §04 G1）——主流程灰化 + warnline 警示 +
-        // 「选择 iPhone」ACCENT 描边。USB 直连不经蓝牙，不拦；判据 = UsbBtStandby.isUsable
-        // （常驻广播在跑 且 已配对）。哨兵门控，状态翻转才重建背景。
-        val gateVisual = LiteConfig.usbBtDongleOf(this) && activeChannel != "usb" &&
-            !UsbBtStandby.isUsable && !running
-        if (gateVisual != shownGateVisual) {
-            shownGateVisual = gateVisual
-            pairGateLabel.visibility = if (gateVisual) View.VISIBLE else View.GONE
-            primaryActionButton.setTextColor(if (gateVisual) 0xFF7F91AB.toInt() else Ui.BG)
-            primaryActionButton.background = if (gateVisual) {
-                // 设计稿 §05 禁用主按钮：底 #2E3B52@52%、字 #7F91AB、无高光
-                rounded(0x852E3B52.toInt(), Ui.BORDER)
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                RippleDrawable(ColorStateList.valueOf(0x336F9FD9), rounded(Ui.ACCENT, Ui.ACCENT), null)
-            } else {
-                rounded(Ui.ACCENT, Ui.ACCENT)
+        // vc206：外置蓝牙门槛 —— 只保留 warnline 黄字（vc313 起不再灰化主按钮，点击已能说清原因）。
+        // USB 直连不经蓝牙，不拦。
+        // vc310：判据升级为三态（dongle 未插入 / 未就绪失败 / 未配对），三态只决定黄字文案。
+        // 哨兵改用状态本身，避免「三态互切但文案相同」时不刷新。
+        val extState = extBtState()
+        if (extState != shownExtBtState) {
+            shownExtBtState = extState
+            pairGateLabel.text = when (extState) {
+                ExtBtState.DONGLE_ABSENT -> "未检测到外置蓝牙"
+                ExtBtState.NOT_READY -> "外置蓝牙连接失败"
+                ExtBtState.UNPAIRED -> "未配对，请进入配对窗口进行配对"
+                ExtBtState.USER_STOPPED -> "外置蓝牙已停止"
+                else -> ""
             }
-            val pickStroke = if (gateVisual) Ui.ACCENT else Ui.BORDER
-            pickIphoneButton.background = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                RippleDrawable(ColorStateList.valueOf(0x336F9FD9), rounded(Ui.CARD, pickStroke), null)
-            } else {
-                rounded(Ui.CARD, pickStroke)
-            }
+            // 可见性只看三态：都非 READY 就显示原因，即使正在连接（running）——
+            // 否则连接失败后停在「未连接」反而看不到原因。
+            pairGateLabel.visibility =
+                if (extState == ExtBtState.DONGLE_ABSENT || extState == ExtBtState.NOT_READY ||
+                    extState == ExtBtState.UNPAIRED || extState == ExtBtState.USER_STOPPED
+                ) {
+                    View.VISIBLE
+                } else {
+                    View.GONE
+                }
+            btModeLabel.text = btModeText(LiteConfig.load(this))
         }
     }
 

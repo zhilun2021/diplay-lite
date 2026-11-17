@@ -37,6 +37,20 @@ object CarHotspotStatus {
     }
 
     /**
+     * vc299：原始 AP 状态值 → 可读名（AOSP 语义 10=disabling / 11=disabled /
+     * 12=enabling / 13=enabled）。日志按 `state=11(disabled)` 输出，避免旧文案
+     * `state=11 (AOSP 13=enabled)` 被误读成「11 就是 enabled」。
+     */
+    fun rawStateLabel(state: Int?): String = when (state) {
+        10 -> "disabling"
+        11 -> "disabled"
+        12 -> "enabling"
+        13 -> "enabled"
+        null -> "unknown"
+        else -> "unmapped"
+    }
+
+    /**
      * vc93：AP 专用接口探测（235233 实锤 ECARX state=11 但 ap0 存活带地址）。
      * 只认 AP 专用命名（ap 前缀、swlan、softap、swla 前缀），不认 wlan1 —— BYD
      * 未开热点也保持 wlan1 带地址，会假阳性（沿用 M6k24 结论）。仅作状态判死前的兜底证据。

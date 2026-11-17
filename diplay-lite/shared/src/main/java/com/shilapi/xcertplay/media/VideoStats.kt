@@ -25,6 +25,11 @@ internal class VideoStats(
     // 只观测，用于定论 A1 在 rx≈0 / 静屏时是否扣 buffer。
     private var pendingDepthPeak = 0
     private var maxHoldMs = 0L
+    // vc280（#13）：解码耗时（入队 → 输出可用）。与 maxHoldMs（入队 → 上屏，含 16ms/VSYNC
+    // 节拍等待）分开：前者只看 codec 吞吐，后者含渲染调度，两者差距即「等上屏」的时间。
+    private var decodeSamples = 0
+    private var decodeSumNs = 0L
+    private var maxDecodeNs = 0L
     private var bytes = 0L
     private var maxArrivalGapNs = 0L
     private var touchSamples = 0
@@ -73,6 +78,15 @@ internal class VideoStats(
     }
 
 
+    /** vc280（#13）：一帧从 queueInputBuffer 到输出缓冲可用的耗时（纯观测）。 */
+    @Synchronized fun onDecodeLatency(durationNs: Long) {
+        if (durationNs <= 0L) return
+        decodeSamples++
+        decodeSumNs += durationNs
+        if (durationNs > maxDecodeNs) maxDecodeNs = durationNs
+    }
+
+
     @Synchronized fun onInputStalled() { inputStalled++ }
 
     @Synchronized fun onFlush() { flushes++ }
@@ -90,6 +104,7 @@ internal class VideoStats(
         val rx = received / seconds
         val shown = rendered / seconds
         val maxGapMs = (maxArrivalGapNs / 1_000_000).toInt()
+        val decodeAvgMs = if (decodeSamples == 0) -1L else decodeSumNs / decodeSamples / 1_000_000
         BandwidthMonitor.setVideoMetrics(rx.toFloat(), shown.toFloat(), maxGapMs, recoveries)
         // M4k：带上堆占用。用户反馈"视频流突然变大后闪退"，而闪退零日志——
         // 若是 OutOfMemoryError（catch(Exception) 兜不住 → 线程死 → 进程被杀），
@@ -99,12 +114,12 @@ internal class VideoStats(
         val heapMaxMb = runtime.maxMemory() / (1024 * 1024)
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
             "backlog=%d stalled=%d flush=%d superseded=%d dueGated=%d " +
-            "pendingDepthPeak=%d maxHoldMs=%d " +
+            "pendingDepthPeak=%d maxHoldMs=%d decodeAvg=%dms decodeMax=%dms " +
             "heap=%d/%dMB touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(
             rx, shown, maxGapMs,
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
             backlogs, inputStalled, flushes, superseded, dueGated,
-            pendingDepthPeak, maxHoldMs,
+            pendingDepthPeak, maxHoldMs, decodeAvgMs, maxDecodeNs / 1_000_000,
             heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
         ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?")
@@ -114,6 +129,7 @@ internal class VideoStats(
         received = 0; rendered = 0; recoveries = 0; backlogs = 0; inputStalled = 0; flushes = 0
         superseded = 0; dueGated = 0
         pendingDepthPeak = 0; maxHoldMs = 0
+        decodeSamples = 0; decodeSumNs = 0; maxDecodeNs = 0
         bytes = 0; maxArrivalGapNs = 0
         touchSamples = 0; touchLatencySumNs = 0; maxTouchLatencyNs = 0
         return line

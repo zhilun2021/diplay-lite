@@ -110,15 +110,6 @@ data class LiteConfig(
     // 1.0.17：CarPlay 显示名称（/info name + Bonjour 服务名）。自定义返回图标页可改，
     // 选厂家预置图标时自动替换为厂家名；空串回落 "DiPlay"。
     val carIconName: String = "DiPlay Lite",
-    // vc258（A+B 连接提速实验，三态）：
-    //   0 = 关闭（现状：凭证先发，mDNS 广告随后慢慢就绪）
-    //   1 = 仅等待：首个 0x5703 前等 Bonjour 广播就绪（≤10s，失败/超时直接放行；
-    //       iPhone 已在热点/已有 TCP 时不等）——消除「广告晚于 iPhone 入网 → iOS 下次
-    //       服务发现要等 ~35s」的固定慢轮
-    //   2 = 等待 + 预热：在此之上进程内复用 JmDNS 实例（跨代只 register/unregister），
-    //       把每代 ~7.5s 的 create 摊销掉
-    //   3 = IPv6 广播（实验）：选址/监听/mDNS 全长走 fe80 link-local，对齐 CatPlay 地址族
-    val mdnsConnectBoost: Int = 0,
 ) {
     companion object {
         private const val PREFS = "diplay_lite"
@@ -175,6 +166,22 @@ data class LiteConfig(
                 .putString("bt_address", address)
                 .putString("bt_name", name)
                 .apply()
+        }
+
+        /**
+         * vc285：上次成功连接的 iPhone 蓝牙 MAC。与用户点选（bt_address）分开存，
+         * 不改变热点页「自动匹配」的展示语义；仅在多台已配对且都未连接时兜底。
+         */
+        fun bluetoothLastGoodAddress(context: Context): String =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString("bt_last_good_address", "")
+                .orEmpty()
+
+        fun saveBluetoothLastGoodAddress(context: Context, address: String) {
+            if (address.isBlank()) return
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (prefs.getString("bt_last_good_address", "") == address) return
+            prefs.edit().putString("bt_last_good_address", address).apply()
         }
 
         /**
@@ -345,7 +352,6 @@ data class LiteConfig(
                 relayIpv6Channel = prefs.getInt("relay_ipv6_channel", 0),
                 relayIpv4Channel = prefs.getInt("relay_ipv4_channel", 0),
                 carIconName = prefs.getString("car_icon_name", "DiPlay Lite").orEmpty().ifBlank { "DiPlay Lite" },
-                mdnsConnectBoost = prefs.getInt("mdns_connect_boost", 0).coerceIn(0, 3),
             )
         }
 
@@ -401,8 +407,6 @@ data class LiteConfig(
                 .putInt("relay_ipv6_channel", config.relayIpv6Channel)
                 .putInt("relay_ipv4_channel", config.relayIpv4Channel)
                 .putString("car_icon_name", config.carIconName)
-                // vc258：mDNS 连接提速实验三态（0/1/2，重连生效）。
-                .putInt("mdns_connect_boost", config.mdnsConnectBoost)
                 // 注意：applied_video_key 故意不在这里写 —— 它只由 saveAppliedVideoKey() 维护，
                 // 否则表单保存（每次勾选都会触发）会用默认值把它冲掉。
                 //

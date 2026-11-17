@@ -126,9 +126,6 @@ class CarPlayBonjour(
     private val identity: AirPlayIdentity,
     private val advertisedHost: String? = null,
     useInterfaceMdns: Boolean = false,
-    // vc258（B）：true 时进程内复用 JmDNS 实例（跨代只 unregister/register，不重开），
-    // 把每代 ~7.5s 的 create 摊销掉；false = 现状（每代 create/close）。
-    private val prewarmMdns: Boolean = false,
     // vc269（MX6 取证）：广播地址诊断行（走宿主 debugLog 落文件日志）。
     private val onDiagnostic: (String) -> Unit = {},
     private val onEvent: (CarPlayBonjourEvent) -> Unit = {},
@@ -172,12 +169,11 @@ class CarPlayBonjour(
     @Volatile
     private var activeSocket: Socket? = null
     private var interfaceMdns: JmDNS? = null
-    // vc258（A）：广播就绪信号。凭证闸门（CarPlayController）等它，最多等 MDNS_ADVERTISE_WAIT；
-    // 失败/超时也 countDown，保证任何情况下都不会把连接堵死。
+    // 广播就绪信号（vc310 起无凭证闸门消费者，仅保留状态位与 countDown 语义）。
     private val advertiseLatch = CountDownLatch(1)
     @Volatile
     private var advertised = false
-    /** vc258（B）：本代注册进 JmDNS 的 ServiceInfo，预热模式下 close 时用它对冲注册。 */
+    /** 本代注册进 JmDNS 的 ServiceInfo（close 时用它注销）。 */
     private var registeredInfo: ServiceInfo? = null
 
     private val interfaceListener = object : ServiceListener {
@@ -419,64 +415,18 @@ class CarPlayBonjour(
         workerToJoin?.let(::joinWorker)
     }
 
-    /**
-     * vc258（A）：等待 AirPlay 广播真正就绪。返回 false 表示失败或超时——调用方必须照常放行
-     * （广播不是连接的前提；宁可不提速，也不能把凭证卡死）。
-     */
-    fun awaitAdvertising(timeoutMillis: Long): Boolean {
-        if (advertised) return true
-        val completed = runCatching {
-            advertiseLatch.await(timeoutMillis.coerceAtLeast(0), TimeUnit.MILLISECONDS)
-        }.getOrDefault(false)
-        return completed && advertised
-    }
-
     private fun acquireMulticastLock() {
-        if (!prewarmMdns) {
-            multicastLock.acquire()
-            return
-        }
-        synchronized(MdnsCache.lock) {
-            if (MdnsCache.multicast == null) {
-                runCatching { multicastLock.acquire() }
-                MdnsCache.multicast = multicastLock
-            }
-        }
+        multicastLock.acquire()
     }
 
     private fun releaseMulticastLock() {
-        val keptByCache = prewarmMdns && MdnsCache.multicast === multicastLock
-        if (!keptByCache && multicastLock.isHeld) runCatching { multicastLock.release() }
+        if (multicastLock.isHeld) runCatching { multicastLock.release() }
     }
 
-    /** vc258（B）：取 JmDNS 实例；预热模式下按「地址+名字」复用，地址变了才重建。 */
-    private fun obtainMdns(address: InetAddress, name: String): JmDNS {
-        if (!prewarmMdns) return JmDNS.create(address, name)
-        val key = "${address.hostAddress}|$name"
-        synchronized(MdnsCache.lock) {
-            val cached = MdnsCache.dns
-            if (cached != null && MdnsCache.key == key) return cached
-            MdnsCache.dns?.let { runCatching { it.close() } }
-            MdnsCache.dns = null
-            MdnsCache.key = null
-            val created = JmDNS.create(address, name)
-            MdnsCache.dns = created
-            MdnsCache.key = key
-            return created
-        }
-    }
+    private fun obtainMdns(address: InetAddress, name: String): JmDNS = JmDNS.create(address, name)
 
-    /** vc258（B）：预热模式只对冲本代服务注册并保留实例；非预热模式维持原 close 语义。 */
     private fun releaseMdns(dns: JmDNS?, info: ServiceInfo?) {
         if (dns == null) return
-        if (!prewarmMdns) {
-            runCatching { dns.close() }
-            return
-        }
-        synchronized(MdnsCache.lock) {
-            runCatching { info?.let { dns.unregisterService(it) } }
-            if (MdnsCache.dns === dns) return
-        }
         runCatching { dns.close() }
     }
 
@@ -836,19 +786,5 @@ class CarPlayBonjour(
         const val READ_TIMEOUT_MILLIS = 3_000
         const val JOIN_TIMEOUT_MILLIS = 2_000L
         const val FAILURE_NONE = -1
-
-        /** vc258（B）：进程内 JmDNS 实例缓存（预热模式下跨连接复用）。 */
-        private object MdnsCache {
-            val lock = Any()
-
-            @Volatile
-            var dns: JmDNS? = null
-
-            @Volatile
-            var key: String? = null
-
-            @Volatile
-            var multicast: WifiManager.MulticastLock? = null
-        }
     }
 }

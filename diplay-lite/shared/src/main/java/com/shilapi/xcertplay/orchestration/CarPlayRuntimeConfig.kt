@@ -68,6 +68,10 @@ class CarPlayRuntimeConfig(
     val manualHotspotChannel: Int = 0,
     val manualHotspotSecurity: ManualHotspotSecurity = ManualHotspotSecurity.WPA2,
     val wirelessBluetoothDeviceAddress: String? = null,
+    // vc285：上次成功连接的 iPhone 蓝牙 MAC。自动匹配遇到「多台已配对 iPhone 且都未连接」
+    // 的歧义时用它兜底——名字兜底会被同名设备（两台都叫同一名字）或改名打乱，MAC 不会。
+    // 仅作兜底：显式点选（wirelessBluetoothDeviceAddress）与连接态判定的优先级都更高。
+    val wirelessBluetoothLastGoodAddress: String? = null,
     val locationReportingEnabled: Boolean = false,
     // 1.1.6(vc76)：有线 cdc_ncm 解绑守护开关（TS7 无 root 裁决实验）。默认 true=正式路径；
     // false 时不启动 WiredNcmGuard，验证「仅 NTB16 重同步、无 root 无守护」能否稳住会话。
@@ -107,8 +111,6 @@ class CarPlayRuntimeConfig(
     // RELAY（本机就是中继 client，断开=自断）与 WIFI_P2P 一律跳过。失败只记日志不阻断。
     // 默认 true；false = 完全不动 STA。
     val wirelessStaKickFor5g: Boolean = true,
-    // vc258（A+B 连接提速实验）：0=关闭 / 1=凭证等 Bonjour 广播就绪 / 2=等待+JmDNS 预热。
-    val mdnsConnectBoost: Int = 0,
 ) {
     init {
         require(hostMac.size == 6) { "hostMac must be 6 bytes" }

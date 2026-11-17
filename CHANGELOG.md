@@ -1,3 +1,29 @@
+# 1.7.0 — 2026-11-17
+
+- Four-state Bluetooth gate on the home screen (dongle not inserted / connect failed / not paired / stopped); the primary button no longer greys out — tapping it states the reason and offers the matching action.
+- Failed-connection card now carries an actionable button (open hotspot / go to pairing / retry), selected by failure reason.
+- Unplugging the external dongle no longer tears down an active session, fires a false error, or burns five reconnect attempts; replugging restores the broadcast automatically.
+- Fixed Android 10+ reporting "dongle not detected" while the dongle was actually ready.
+- Added a disconnect entry while a session is active; fixed state and button mix-ups after rotation or returning from the settings page.
+- Link-loss detection shortened from about 22 s to about 10 s on Android 10+; a slow iPhone re-join is no longer judged as a failure too early.
+- Fixed a relay-mode stall (up to 93 s) caused by a missing channel field in the hotspot information.
+- Fixed colour artifacts at 50%/75% scaling, and post-resume artifacts on Android 4.x devices.
+- Fixed an occasional native crash on Bluetooth teardown on Android 4.1.
+- Removed the "mDNS connection boost" options; they showed no measurable benefit.
+- Removed the hard-coded "30 seconds" from failure messages and shortened seven status labels.
+
+# 1.5.5 — 2026-11-14
+
+- Fixed the wireless link hanging at "building link" after connecting to the car hotspot: the hotspot information sent to the phone was missing the channel number.
+- Fixed display artifacts after switching to the home screen and back; only a clean keyframe is shown on resume.
+- Connection speed: no longer waits an extra ~8 s when the iPhone is already on the hotspot.
+- Unknown hotspot channel now defaults by band (channel 6 for 2.4 GHz, 149 for 5 GHz).
+- Log upload anonymisation restored; two misleading diagnostics corrected.
+
+# 1.5.3 — 2026-11-14
+
+- Wireless cold start gated on iPhone network join: cold 36.5 s → 18.6 s, warm 35 s → 10.4 s.
+
 # 0.2.0 — BYD navigation and connection improvements
 
 - Standalone windshield HUD arrows, distance and street names on the verified DiLink5.1 firmware; no ADB, root or computer helper.

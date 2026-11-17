@@ -3,6 +3,7 @@ package com.shilapi.diplay.lite
 import android.content.Context
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.os.SystemClock
 import android.util.Log
 import com.shilapi.xcertplay.usbbt.UsbBinderGate
 import com.shilapi.xcertplay.usbbt.UsbBtBootstrapStream
@@ -60,9 +61,82 @@ object UsbDongleGuard {
     /** vc247（V2）：单飞，防 Activity 重建/多处调用重复计数与并跑。 */
     private val checkRunning = AtomicBoolean(false)
 
+    // vc310：在场判定的缓存参数。sysfs 只读、不走 binder（D 态下仍可读）；
+    // 2s TTL 避免 renderState 的 500ms tick 每拍都扫一遍 /sys。
+    private const val PRESENCE_TTL_MS = 2_000L
+    @Volatile private var presenceCache = false
+    @Volatile private var presenceCacheAt = 0L
+
     /** vc246（USB-246-04）：sysfs 旁证是否仍能看到 0a12（只读、不走 binder，D 态下仍可读）。 */
     val sysfsPresent: Boolean
-        get() = runCatching { sysfsNode() != null }.getOrDefault(false)
+        get() {
+            val now = SystemClock.elapsedRealtime()
+            if (presenceCacheAt != 0L && now - presenceCacheAt < PRESENCE_TTL_MS) return presenceCache
+            val present = runCatching { sysfsNode() != null }.getOrDefault(false)
+            presenceCache = present
+            presenceCacheAt = now
+            return present
+        }
+
+    /** vc310：USB 插拔时强制失效，下一次读立即重扫。 */
+    fun invalidatePresence() {
+        presenceCacheAt = 0L
+        presenceAnyAt = 0L      // vc311：新增缓存一并失效，插拔后下一读立即重算
+    }
+
+    // ── vc311：三路合一的在场判定 ────────────────────────────────────────────
+    // 独立缓存字段：**不复用** presenceCache / presenceCacheAt（那两个是 sysfsPresent
+    // 的私有缓存，混用会让 sysfs 旁证读回 binder 的结论，语义互相污染）。
+    @Volatile private var presenceBinder = false
+    @Volatile private var presenceSysfs = false
+    @Volatile private var presenceAnyAt = 0L
+    private var lastPresenceKey: String? = null
+
+    /**
+     * vc311（UI-310-03）：dongle 是否在场。
+     * 任一路为真即在场；sysfs 只做老设备兜底，**不参与否决**。
+     * ① standby 在跑 ⇒ 直接 true（纯内存，零 binder / 零 sysfs 扫描）
+     * ② 否则事件驱动：presenceAnyAt == 0 时查一次（由 invalidatePresence 归零）
+     */
+    fun isPresent(context: Context): Boolean {
+        // vc313（UI-312-01）：短路判据由 isRunning 改为 isHostReady。
+        // isRunning 在 start() 里、open dongle **之前**就置 true ⇒ 冷启动无 dongle 的那个窗口
+        // 会把「在场」误报成 true，使 externalBtGateBlocked() 放过自动连接（vc312 门② D 组实证）。
+        // isHostReady = isRunning && hostReadyGeneration == generation && generation != 0，
+        // 语义是「host 已初始化成功」＝ dongle 真的被打开了，且带代次校验。
+        if (UsbBtStandby.isHostReady) {
+            // host 已就绪就必然在场（零 binder / 零 sysfs 扫描）。
+            notePresence(true, null, null)
+            return true
+        }
+        // vc311：**事件驱动**，不是 TTL。presenceAnyAt 只由 invalidatePresence()
+        //（USB 插拔 / onResume / 重连前）归零 ⇒ binder 只在插拔后查一次，
+        // 绝不在 renderState 的 500ms tick 里周期性查（deviceList 是到 system_server
+        // 的 binder，system_server 一旦 D 态卡在 usbdev_open 就会阻塞主线程，vc245 教训）。
+        if (presenceAnyAt == 0L) {
+            // getSystemService(String) 是 API1；**禁**用 getSystemService(Class)（API23+，minSdk16 会崩）
+            val manager = context.getSystemService(Context.USB_SERVICE) as? UsbManager
+            presenceBinder = manager != null && findDongle(manager) != null
+            presenceSysfs = sysfsPresent          // 复用其自带 2s 缓存，不重复扫 /sys
+            presenceAnyAt = SystemClock.elapsedRealtime()
+        }
+        notePresence(false, presenceBinder, presenceSysfs)
+        return presenceBinder || presenceSysfs
+    }
+
+    /** B-104：四元组变化才打，避免 renderState 的 500ms tick 刷屏。null = 该路本轮未查。 */
+    private fun notePresence(running: Boolean, binder: Boolean?, sysfs: Boolean?) {
+        val key = "$running/$binder/$sysfs"
+        if (key == lastPresenceKey) return
+        lastPresenceKey = key
+        val src = when {
+            running -> "standby"
+            binder == true -> "binder"
+            sysfs == true -> "sysfs"
+            else -> "none"
+        }
+        LiteLog.log("bt", "B-104 src=$src running=$running binder=$binder sysfs=$sysfs | 在场判定")
+    }
 
     /**
      * vc250：sysfs 旁证看到的 dongle 身份（"vid:pid"，任意 0x0a12 PID，判据与 [findDongle] 一致）。

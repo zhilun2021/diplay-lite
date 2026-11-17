@@ -68,9 +68,6 @@ class Iap2WirelessControlClient(
         // vc250-05：真凭证 0x5703 成功写出时回调，携带「发送瞬间 iPhone 是否还没有
         // AirPlay TCP」快照，只供 summary 判定 credential=full|cached|none，不参与控制流。
         onCredentialSent: ((beforeAirPlayTcp: Boolean) -> Unit)? = null,
-        // vc258（A）：首个真凭证写出前的一次性回调（上层用来等 mDNS 广播就绪）。
-        // 只调一次；异常/超时按放行处理，绝不让凭证发不出去。
-        beforeFirstCredential: (() -> Unit)? = null,
         // [RELAY-TEST] 1.0.28-中继test 实验参数：(假SSID, 随机密码)。null = 实验关闭。
         relayTestFakeCredential: Pair<String, String>? = null,
         // vc83 中继踢出（攻「iPhone 提前连到中继 WiFi 后 CarPlay 永远连不上」）：
@@ -83,7 +80,16 @@ class Iap2WirelessControlClient(
         relayKickAfterResends: Int = -1,
         // vc264：0x4301 前等 iPhone 真正入网。实测 iOS 16：0x4301 早于关联 → 35s；
         // 晚于关联 → 0.2~1s。默认 true=放行（历史行为），上层用热点客户端数判断。
-        staAssociated: () -> Boolean = { true },
+        // vc284：改为三态。null = 拿不到权威关联态（无 SoftApCallback 且 /proc/net/arp
+        // 不可读）——不再等同「未关联」盲等满 8.1s，只封顶 2s（见下方闸门）。
+        staAssociated: () -> Boolean? = { true },
+        // vc287：确认「未关联」时的等待预算。中继模式下 iPhone 是否入网由我方 0x5703 凭证
+        // 驱动（C8815 实测：闸门等满 8s 期间 ARP 只有网关，凭证发出后 0.9s 手机就入网），
+        // 先等关联属于反因果，纯损耗 → 上层传 3s。车机自建热点（AP）保持 8s。
+        staAbsentWaitNanos: Long = START_SESSION_STA_WAIT_NANOS,
+        // vc280（#11 A）：不再等 mDNS 广播「有结论」——广播与 0x4301 并行。
+        // 依据：C8815 实测 Bonjour 完全失败（setsockopt ENODEV）仍能正常出画，iPhone 靠
+        // 0x4301 里的 wirelessIP 建 TCP，广播不是建链前提；中继模式等广播白拖 ~6s。
     ): Iap2WirelessControlResult {
         require(identification.wireless != null || identification.usbWirelessUpgradeSsid != null) {
             "Wireless control requires wireless (Bluetooth) or usbWirelessUpgradeSsid (USB bootstrap) transport"
@@ -111,20 +117,32 @@ class Iap2WirelessControlClient(
 
         // vc264：0x4301 前等 iPhone 入网（仅当上层明确报告热点 0 客户端时才等；
         // 已关联 / 未知一律直接放行，避免 warm 场景被无谓延迟）。
+        // vc284：未知态（staAssociated() 返回 null，例如 /proc/net/arp 不可读且无
+        // SoftApCallback）不再盲等满 8.1s，封顶 2s 后照常发 0x4301——晚发不如早发，
+        // 0x4301 早于关联的代价（iOS 35s）远大于这 2s。
         fun awaitStaAssociationBeforeStart() {
-            if (staAssociated()) return
+            val first = staAssociated()
+            if (first == true) return
             val startedAt = System.nanoTime()
-            val limitNanos = startedAt + START_SESSION_STA_WAIT_NANOS
-            while (!staAssociated() && System.nanoTime() < limitNanos) {
+            val budgetNanos = if (first == null) {
+                START_SESSION_STA_UNKNOWN_WAIT_NANOS
+            } else {
+                staAbsentWaitNanos
+            }
+            val limitNanos = startedAt + budgetNanos
+            var state = first
+            while (state != true && System.nanoTime() < limitNanos) {
                 try {
                     Thread.sleep(200L)
                 } catch (_: InterruptedException) {
                     break
                 }
+                state = staAssociated()
             }
             onProgress(
-                "wireless start-session gate: associated=${staAssociated()} " +
-                    "waitedMs=${(System.nanoTime() - startedAt) / 1_000_000}",
+                "wireless start-session gate: associated=${state ?: "unknown"} " +
+                    "waitedMs=${(System.nanoTime() - startedAt) / 1_000_000} " +
+                    "budgetMs=${budgetNanos / 1_000_000}",
             )
         }
         try {
@@ -179,15 +197,8 @@ class Iap2WirelessControlClient(
         var credentialSentAtNanos: Long? = null
         // vc250-05：所有「真凭证」0x5703 的唯一出口（relay 恢复 / 凭证重发 / iPhone 请求 /
         // post-transport）。发送成功才回调；快照必须在 send 之前取，否则会被本轮 TCP 污染。
-        var credentialGateDone = false
         fun sendRealCredential() {
             val beforeAirPlayTcp = !phoneOnAirPlay()
-            // vc258（A）：首个真凭证前给上层一次等待机会（等 mDNS 广播就绪）。
-            // 只在「iPhone 还没上 AirPlay」时等；已缓存/已建流不浪费任何时间。
-            if (!credentialGateDone && beforeAirPlayTcp) {
-                credentialGateDone = true
-                runCatching { beforeFirstCredential?.invoke() }
-            }
             send(accessoryWiFiConfiguration(endpoint), deadlineNanos)
             if (beforeAirPlayTcp && credentialSentAtNanos == null) {
                 credentialSentAtNanos = System.nanoTime()
@@ -451,7 +462,9 @@ class Iap2WirelessControlClient(
                             }
                         onProgress(
                             "iap2 tx=0x5703/0x4301 credential resend #$credentialResendsSent " +
-                                "(iPhone not on Wi-Fi yet)",
+                                // vc278：原文案在 ARP 已看到 STA（associated=true）时自相矛盾，
+                                // 实际判据是「还没有 AirPlay TCP」。
+                                "(no AirPlay TCP yet)",
                         )
                     }
                     continue
@@ -626,6 +639,12 @@ class Iap2WirelessControlClient(
 
         /** vc264：0x4301 前等待 iPhone 关联的上限。 */
         private const val START_SESSION_STA_WAIT_NANOS = 8_000_000_000L
+        /**
+         * vc284：关联态未知时的等待上限。原实现把「读不到 /proc/net/arp」等同「未关联」，
+         * 于是 TS7 / S3018 冷启动每代都在 0x4301 前固定空等 8.0s（实测 waitedMs=8004/8034）。
+         * 未知态没有可等的事件源，只留 2s 覆盖 SoftApCallback 晚到，然后照常发 0x4301。
+         */
+        private const val START_SESSION_STA_UNKNOWN_WAIT_NANOS = 2_000_000_000L
         private const val CARPLAY_AVAILABILITY = 0x4300
         private const val CARPLAY_START_SESSION = 0x4301
         private const val WIRELESS_CARPLAY_UPDATE = 0x4e0d

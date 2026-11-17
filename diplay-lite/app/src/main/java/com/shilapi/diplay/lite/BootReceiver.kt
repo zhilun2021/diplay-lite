@@ -23,12 +23,17 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         val config = LiteConfig.load(context)
-        if (!config.bootAutostart && !config.bootAutoBluetooth && !config.bootAutoHotspot && !config.bootAutoWifi) return
+        // vc303（BOOT-300-01）：日志前移到 early-return 之前——原实现全未勾选时静默 return，
+        // 「未勾选」与「ROM 未投递 BOOT_COMPLETED」在日志上都表现为「没有 [boot] 行」，无法区分。
+        val anyAuto = config.bootAutostart || config.bootAutoBluetooth ||
+            config.bootAutoHotspot || config.bootAutoWifi
         LiteLog.log(
             "boot",
-            "BOOT_COMPLETED autostart=${config.bootAutostart} autoBt=${config.bootAutoBluetooth} " +
-                "autoAp=${config.bootAutoHotspot} autoWifi=${config.bootAutoWifi} autoConnect=${config.autoConnect}",
+            "BOOT_COMPLETED 收到 autostart=${config.bootAutostart} autoBt=${config.bootAutoBluetooth} " +
+                "autoAp=${config.bootAutoHotspot} autoWifi=${config.bootAutoWifi} " +
+                "autoConnect=${config.autoConnect} 执行=${if (anyAuto) "是" else "否（四项均未勾选）"}",
         )
+        if (!anyAuto) return
         // enable()/setWifiApEnabled() + 轮询等待耗时超过 onReceive 上限，投后台线程 + goAsync。
         // 1.0.16（方案四②）：主页先拉起并弹「等待勾选项启动」弹窗（等待/滤波/超时都在 UI 层），
         // 再在后台跑勾选项启动——避免蓝牙轮询 20s 期间主页迟迟不出现。
@@ -108,9 +113,13 @@ class BootReceiver : BroadcastReceiver() {
             LiteLog.log("boot", "Wi-Fi 已开启")
             return
         }
-        val started = runCatching {
+        val started = try {
             wifi.setWifiEnabled(true)
-        }.getOrDefault(false)
+        } catch (error: Throwable) {
+            // vc303：显式捕获并记录类名（Error 不是 Exception，runCatching 会把它吞成 false）。
+            LiteLog.log("boot", "Wi-Fi setWifiEnabled(true) 异常（${error.javaClass.name}）: ${error.message}")
+            false
+        }
         if (!started) {
             LiteLog.log("boot", "Wi-Fi setWifiEnabled(true) 被拒绝（ROM 策略），跳过等待")
             return
@@ -137,29 +146,62 @@ class BootReceiver : BroadcastReceiver() {
             LiteLog.log("boot", "WifiManager 不可用，跳过热点自启")
             return
         }
-        val apEnabled = runCatching {
-            // WIFI_AP_STATE_ENABLED = 13（API 16-25 各版本常量一致）
-            WifiManager::class.java.getMethod("getWifiApState").invoke(wifi) as Int == 13
-        }.getOrDefault(false)
-        if (apEnabled) {
+        val beforeState = wifiApState(wifi)
+        LiteLog.log("boot", "热点自启前 AP state=$beforeState（13=已开启）")
+        if (beforeState == 13) {
             LiteLog.log("boot", "热点已开启")
             return
         }
         // STA/AP 模式互斥：先关 Wi-Fi 再起 AP
-        runCatching {
+        try {
             WifiManager::class.java
                 .getMethod("setWifiEnabled", Boolean::class.javaPrimitiveType)
                 .invoke(wifi, false)
-        }.onFailure { LiteLog.log("boot", "关闭 Wi-Fi 失败: ${it.message}") }
+        } catch (error: Throwable) {
+            LiteLog.log("boot", "关闭 Wi-Fi 失败（${error.javaClass.name}）: ${error.message}")
+        }
         try {
             Thread.sleep(800)
         } catch (_: InterruptedException) {
         }
-        val started = runCatching {
+        val started = try {
             WifiManager::class.java
                 .getMethod("setWifiApEnabled", WifiConfiguration::class.java, Boolean::class.javaPrimitiveType)
-                .invoke(wifi, null, true) as Boolean
-        }.getOrDefault(false)
-        LiteLog.log("boot", "热点自启 setWifiApEnabled=$started")
+                .invoke(wifi, null, true) as? Boolean ?: false
+        } catch (error: Throwable) {
+            // vc303：显式捕获并把类名记进日志（NoSuchMethodError 是 Error，runCatching 会吞成 false）。
+            LiteLog.log("boot", "setWifiApEnabled 调用异常（${error.javaClass.name}）: ${error.message}")
+            false
+        }
+        if (!started) {
+            LiteLog.log("boot", "热点自启被拒绝 setWifiApEnabled=false AP state=${wifiApState(wifi)}")
+            return
+        }
+        // vc303（BOOT-300-01）：setWifiApEnabled 返回 true 不代表 AP 已起——轮询 AP state，
+        // 把「已执行但失败」与「已执行且成功」区分开（原实现只调一次、不校验结果）。
+        val apReadyWaitMs = 10_000
+        var waited = 0
+        var state = wifiApState(wifi)
+        while (waited < apReadyWaitMs && state != 13) {
+            try {
+                Thread.sleep(500)
+            } catch (_: InterruptedException) {
+                break
+            }
+            waited += 500
+            state = wifiApState(wifi)
+        }
+        LiteLog.log(
+            "boot",
+            "热点自启结果=${if (state == 13) "ready" else "timeout"} AP state=$state waited=${waited}ms",
+        )
+    }
+
+    /** 反射读取 AP 状态（13=ENABLED）；取不到返回 -1 并记录异常类名。 */
+    private fun wifiApState(wifi: WifiManager): Int = try {
+        WifiManager::class.java.getMethod("getWifiApState").invoke(wifi) as? Int ?: -1
+    } catch (error: Throwable) {
+        LiteLog.log("boot", "getWifiApState 调用失败（${error.javaClass.name}）: ${error.message}")
+        -1
     }
 }

@@ -117,11 +117,16 @@ object NetworkFamilyGuard {
             val file = File("/proc/net/if_inet6")
             file.exists() && file.readLines().any { it.isNotBlank() }
         }.getOrDefault(false)
+        // API16 兼容：ServerSocket 到 API19 才实现 Closeable，`use {}` 在 API16 上会类转换失败。
+        // 这里手动 try/finally 关闭，语义与 use 一致。
         val bindOk = runCatching {
-            ServerSocket().use { socket ->
+            val socket = ServerSocket()
+            try {
                 socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+                true
+            } finally {
+                runCatching { socket.close() }
             }
-            true
         }.getOrDefault(false)
         val scan = scan(null)
         val ipv6 = scan?.ipv6

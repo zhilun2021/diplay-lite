@@ -169,6 +169,9 @@ class LiteSessionService : Service() {
             userStopped = false // 新会话激活，清除上一轮主动断开标记
             LiteState.phase = LiteState.Phase.ACTIVE
             LiteState.statusText = "CarPlay 会话已激活"
+            // vc308：S-13（AirPlay 层激活，C-3）。
+            LiteState.statusCode = LiteState.UiStateCode.S13
+            LiteState.coarse = LiteState.UiStateCode.S13.coarse
             LiteLog.log("airplay", "会话已激活 peer=${session.host}")
             markStage(LiteLog.Stage.AirPlayEstablish, "session active peer=${session.host}")
         }
@@ -177,9 +180,21 @@ class LiteSessionService : Service() {
             LiteState.phase = LiteState.Phase.IDLE
             // K60 实测（20261023）：拔线瞬间的「会话已结束」观感像故障，误导用户在重插后
             // 多点一次按钮；实际重插→attach→授权→重枚举已全自动续连。中断场景给可行动文案。
-            LiteState.statusText =
-                if (userStopped) "会话已结束"
-                else "连接已断开：重新插入 USB 线（或点连接）即可自动恢复"
+            // vc285：无线不再以「点连接」为唯一出路——会话结束后会自动补发 0x4301 邀请并
+            // 主动请 iPhone 回连（最多 10 分钟），ARM 与中继两种模式都适用；USB 文案保持原样。
+            // vc308：文案与编号同源产出，三分支各一个编号（userStopped→S-14 / usb→S-15 / 其它→S-16）。
+            val endedState = when {
+                userStopped -> "会话已结束" to LiteState.UiStateCode.S14
+                requestedChannel == "usb" ->
+                    "连接已断开，重新接入可自动恢复" to LiteState.UiStateCode.S15
+                else ->
+                    // vc288：用户要求收敛为短句——细节（邀请/回连/10 分钟上限）留给日志，
+                    // 界面只表达「已断且正在自愈」，避免长句在 540px 老屏上折行。
+                    "连接已断开，尝试重连中。" to LiteState.UiStateCode.S16
+            }
+            LiteState.statusText = endedState.first
+            LiteState.statusCode = endedState.second
+            LiteState.coarse = endedState.second.coarse
             LiteLog.log("airplay", "会话已结束 userStopped=$userStopped")
             // vc250：会话结束回到链路起点，避免下一次失败沿用上一会话的阶段。
             currentStage = LiteLog.Stage.UsbEnum
@@ -260,6 +275,9 @@ class LiteSessionService : Service() {
         LiteState.running = true
         LiteState.phase = LiteState.Phase.CONNECTING
         LiteState.statusText = "正在初始化…"
+        // vc308：S-02（C-1）。
+        LiteState.statusCode = LiteState.UiStateCode.S02
+        LiteState.coarse = LiteState.UiStateCode.S02.coarse
         LiteLog.log("service", "前台会话服务已启动")
         // 构建标识：实机每次启动都打印，用于区分本轮跑的是哪个包（T17 归档约定）。
         LiteLog.log("service", "构建标识 version=${buildVersion()} apk=${apkStamp()}")
@@ -313,6 +331,9 @@ class LiteSessionService : Service() {
         LiteState.running = false
         LiteState.phase = LiteState.Phase.IDLE
         LiteState.statusText = "未连接"
+        // vc308：S-01（C-0）——同时是 INV-1 的解锁点。
+        LiteState.statusCode = LiteState.UiStateCode.S01
+        LiteState.coarse = LiteState.UiStateCode.S01.coarse
         stopForeground(true)
         // vc250-03：兜底——连接中直接 stopService（未走到状态机终态）也要出汇总；幂等不会重复。
         LiteLog.endSession()
@@ -355,10 +376,10 @@ class LiteSessionService : Service() {
         if (usb) {
             // U4 USB 有线：不走 Wi-Fi/蓝牙段，热点凭据校验全部跳过。
         } else if (relay && config.relaySsid.isBlank()) {
-            fail("当前是中继热点模式，未配置SSID，无法连接")
+            fail("当前是中继热点模式，未配置SSID，无法连接", LiteState.UiStateCode.S27)
             return
         } else if (!relay && config.ssid.isBlank()) {
-            fail("当前是车机热点模式，未配置SSID，无法连接")
+            fail("当前是车机热点模式，未配置SSID，无法连接", LiteState.UiStateCode.S27)
             return
         }
         val ssid = if (usb) "" else if (relay) config.relaySsid else config.ssid
@@ -372,7 +393,7 @@ class LiteSessionService : Service() {
             mapSecurity(config.security)
         }
         if (!usb && security != ManualHotspotSecurity.OPEN && passphrase.length !in 8..63) {
-            fail("热点密码需 8-63 位（当前 ${passphrase.length} 位）")
+            fail("热点密码需 8-63 位（当前 ${passphrase.length} 位）", LiteState.UiStateCode.S27)
             return
         }
         ensureMfiDirectory()
@@ -476,7 +497,7 @@ class LiteSessionService : Service() {
             microphoneGainDb = { LiteConfig.micGainDbOf(this) },
             // 1.1.4：CarPlay 媒体流首包 → ECARX 桥显式抢源。
             onMediaPlaybackStarted = { bridge.onCarPlayMediaStarted() },
-            // 1.1.6(vc76)：媒体断供看门狗（音视频双静默 20s）→ 编排层整代回收。
+            // 1.1.6(vc76)：媒体断供看门狗（vc290 起只看视频，vc291 阈值 60s）→ 编排层整代回收。
             // sink 先于 controller 构造，经 service 字段间接引用（调用时已就绪）。
             onMediaStall = { this@LiteSessionService.controller?.notifyWirelessMediaStall() },
         )
@@ -537,6 +558,9 @@ class LiteSessionService : Service() {
                     // （0=自动）；relay 复用凭据字段不吃信道、usb 无热点，均保持 0。
                     manualHotspotChannel = if (usb || relay) 0 else config.carIpv4Channel,
                     wirelessBluetoothDeviceAddress = config.bluetoothAddress.takeIf { it.isNotBlank() },
+                    // vc285：自动匹配歧义时的 MAC 兜底（用户点选 > 上次成功 MAC > 自动匹配）。
+                    wirelessBluetoothLastGoodAddress = LiteConfig.bluetoothLastGoodAddress(this)
+                        .takeIf { it.isNotBlank() },
                     // 1.1.6(vc76)：TS7 无 root 裁决实验——本包关闭有线 cdc_ncm 解绑守护。
                     wiredNcmGuardEnabled = BuildConfig.WIRED_NCM_GUARD_ENABLED,
                     // 2026-11-07：有线实验 —— 内核 cdc_ncm 数据面（设置页勾选，默认关）。
@@ -550,8 +574,6 @@ class LiteSessionService : Service() {
                     videoVsyncPacing = true,
                     // vc237（VID-234-01 / A1）：视频待渲帧不合并（vc238 默认开）。
                     videoNoCoalesce = config.videoNoCoalesce,
-                    // vc258：mDNS 连接提速实验（0/1/2，设置页体验优化区）。
-                    mdnsConnectBoost = config.mdnsConnectBoost,
                 ),
                 airPlayConfig = AirPlayConfig(
                     // 1.0.17：显示名称可自定义（自定义返回图标页），默认 DiPlay；流向 /info name + Bonjour 服务名。
@@ -599,12 +621,14 @@ class LiteSessionService : Service() {
                 loadPairRecord = { loadLockdownPairRecord() },
                 savePairRecord = { saveLockdownPairRecord(it) },
                 clearPairRecord = { clearLockdownPairRecord() },
+                // vc285：记住本次选定的 iPhone MAC，供下次多台歧义时兜底。
+                rememberWirelessBluetoothAddress = { LiteConfig.saveBluetoothLastGoodAddress(this, it) },
             )
         } catch (error: IllegalArgumentException) {
-            fail("配置不合法：${error.message}")
+            fail("配置不合法：${error.message}", LiteState.UiStateCode.S27)
             return
         } catch (error: Exception) {
-            fail("初始化失败：${error.message}")
+            fail("初始化失败：${error.message}", LiteState.UiStateCode.S27)
             return
         }
         controller = newController
@@ -632,35 +656,48 @@ class LiteSessionService : Service() {
         // 其余任何状态（含 Failed/ControlEnded/新授权请求）一律清除。
         LiteState.reenumerating = status is CarPlayStatus.WaitingForReenumeration
         when (status) {
-            is CarPlayStatus.DiscoveringMfi -> connecting("正在加载 MFi 证书")
-            is CarPlayStatus.MfiReady -> connecting("MFi 证书就绪")
-            is CarPlayStatus.StartingHotspot -> connecting("正在加入车机热点…")
-            is CarPlayStatus.HotspotReady -> connecting("网络就绪 ssid=${status.ssid} band=${bandLabelCn(status.band)}")
-            is CarPlayStatus.WaitingForPairedIphone -> connecting("等待 iPhone 连接热点（请先在蓝牙设置中配对）")
-            is CarPlayStatus.AttachingNetwork -> connecting("正在下发网络配置（0x5703）")
-            is CarPlayStatus.ConnectingBluetooth -> connecting("蓝牙 iAP2 握手中")
-            is CarPlayStatus.RunningWireless -> connecting("无线链路建立中")
+            // vc308：编号在分支处传（不在 connecting/fail 里按文案反查——那是 G-6 的翻版）。
+            is CarPlayStatus.DiscoveringMfi -> connecting("正在加载 MFi 证书", LiteState.UiStateCode.S03)
+            is CarPlayStatus.MfiReady -> connecting("MFi 证书就绪", LiteState.UiStateCode.S04)
+            is CarPlayStatus.StartingHotspot -> connecting("正在加入车机热点…", LiteState.UiStateCode.S05)
+            is CarPlayStatus.HotspotReady -> connecting("网络就绪 ssid=${status.ssid} band=${bandLabelCn(status.band)}", LiteState.UiStateCode.S06)
+            is CarPlayStatus.WaitingForPairedIphone -> connecting("等待 iPhone 连接热点", LiteState.UiStateCode.S07)
+            is CarPlayStatus.AttachingNetwork -> connecting("正在下发网络配置", LiteState.UiStateCode.S08)
+            is CarPlayStatus.ConnectingBluetooth -> connecting("蓝牙 iAP2 握手中", LiteState.UiStateCode.S09)
+            is CarPlayStatus.RunningWireless -> connecting("无线链路建立中", LiteState.UiStateCode.S10)
             is CarPlayStatus.WirelessActive -> {
                 LiteState.phase = LiteState.Phase.ACTIVE
                 LiteState.statusText = "无线 CarPlay 已激活"
+                LiteState.statusCode = LiteState.UiStateCode.S11
+                LiteState.coarse = LiteState.UiStateCode.S11.coarse
             }
             // —— U4 USB 有线状态序列 ——
-            is CarPlayStatus.DiscoveringIphone -> connecting("正在查找 USB 连接的 iPhone…")
-            is CarPlayStatus.WaitingForIphone -> connecting("请用数据线连接 iPhone 到车机 USB 口")
-            is CarPlayStatus.RequestingIphonePermission -> connecting("请在弹窗中允许 USB 访问 iPhone")
-            is CarPlayStatus.WaitingForReenumeration -> connecting("iPhone 重新枚举中，请保持连接…")
-            is CarPlayStatus.SelectingConfiguration -> connecting("正在选择 CarPlay USB 配置")
-            is CarPlayStatus.OpeningDataPaths -> connecting("正在打开 USB 数据通道…")
-            is CarPlayStatus.Pairing -> connecting("正在与 iPhone 配对（首次较慢，请勿拔线）…")
-            is CarPlayStatus.ConnectingControl -> connecting("正在建立有线控制通道…")
-            is CarPlayStatus.RunningControl -> connecting("有线链路建立中")
+            is CarPlayStatus.DiscoveringIphone -> connecting("正在查找 USB 连接的 iPhone…", LiteState.UiStateCode.S17)
+            is CarPlayStatus.WaitingForIphone -> connecting("请用数据线连接 iPhone 到车机 USB 口", LiteState.UiStateCode.S18)
+            is CarPlayStatus.RequestingIphonePermission -> connecting("请在弹窗中允许 USB 访问 iPhone", LiteState.UiStateCode.S19)
+            is CarPlayStatus.WaitingForReenumeration -> connecting("iPhone 重新枚举中，请保持连接…", LiteState.UiStateCode.S20)
+            is CarPlayStatus.SelectingConfiguration -> connecting("正在配置USB", LiteState.UiStateCode.S21)
+            is CarPlayStatus.OpeningDataPaths -> connecting("正在打开 USB 数据通道", LiteState.UiStateCode.S22)
+            is CarPlayStatus.Pairing -> connecting("正在配对（首次较慢，请勿拔线）", LiteState.UiStateCode.S23)
+            is CarPlayStatus.ConnectingControl -> connecting("正在建立有线控制通道…", LiteState.UiStateCode.S24)
+            is CarPlayStatus.RunningControl -> connecting("有线链路建立中", LiteState.UiStateCode.S25)
             is CarPlayStatus.ControlEnded -> {
                 LiteState.phase = LiteState.Phase.IDLE
                 LiteState.statusText = "控制通道已结束"
+                LiteState.statusCode = LiteState.UiStateCode.S12
+                LiteState.coarse = LiteState.UiStateCode.S12.coarse
                 // vc250-03：有线控制通道结束即本次连接终态。
                 LiteLog.endSession()
             }
-            is CarPlayStatus.RecoveryHint -> connecting(status.message)
+            // vc308：只按 reason 分流（S-26 等待热点 / S-28 其它恢复提示），禁止按文案判。
+            is CarPlayStatus.RecoveryHint -> connecting(
+                status.message,
+                if (status.reason == CarPlayStatus.RecoveryReason.HotspotOff) {
+                    LiteState.UiStateCode.S26
+                } else {
+                    LiteState.UiStateCode.S28
+                },
+            )
             is CarPlayStatus.Failed -> {
                 // vc250：优先用源头标注；上游仍是 Unknown 时才按文案兜底猜测。
                 val failureClass = if (status.failureClass != CarPlayFailureClass.Unknown) {
@@ -669,7 +706,8 @@ class LiteSessionService : Service() {
                     classifyFailure(status.message)
                 }
                 LiteLog.failure(currentStage, failureClass, status.message)
-                fail(localizeFailure(status.message))
+                LiteState.failureClass = failureClass
+                fail(localizeFailure(status.message), LiteState.UiStateCode.S27)
             }
         }
     }
@@ -738,9 +776,27 @@ class LiteSessionService : Service() {
         }
     }
 
-    private fun connecting(text: String) {
+    private fun connecting(text: String, code: LiteState.UiStateCode) {
         LiteState.phase = LiteState.Phase.CONNECTING
-        LiteState.statusText = text
+        // vc314：新一次尝试清掉上次的失败分型（失败卡的动作依赖它）。
+        LiteState.failureClass = LiteLog.FailureClass.Unknown
+        // vc308：编号与粗状态并列写入（编号由 when(status) 分支传入，禁止按文案反查）。
+        LiteState.statusCode = code
+        LiteState.coarse = code.coarse
+        // vc286：无线自动重试期间把重试进度带进文案——K60 实测掉线重建时界面只剩
+        // 「蓝牙 iAP2 握手中 / 无线链路建立中」，看起来像卡住；补上次数让用户知道是自动在跑。
+        // USB 链路不受影响（本就没这条重试链）。
+        LiteState.statusText = if (requestedChannel == "usb") text else text + wirelessRetrySuffix()
+    }
+
+    /** vc286：`（自动重试 n/5）`／额度用尽后的低频续试提示；正常态返回空串。 */
+    private fun wirelessRetrySuffix(): String {
+        val attempt = controller?.wirelessAutoRetryAttempt() ?: 0
+        return when {
+            attempt <= 0 -> ""
+            attempt <= 5 -> "（自动重试 $attempt/5）"
+            else -> "（自动重试中，低频续试）"
+        }
     }
 
     /** M6k18：band 标签中文化（relay=中继网络）。 */
@@ -796,14 +852,16 @@ class LiteSessionService : Service() {
                 val fast = Regex("fastFail=(\\d+)").find(message)?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 val slow = Regex("timeout=(\\d+)").find(message)?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 when {
+                    // vc300：连续 `Service discovery failed` 实测重新配对后 7.9s 出画，
+                    // 故所有分支的可行动项统一为「关开 iPhone 蓝牙 / 重新配对」。
                     fast > 0 && slow > 0 ->
-                        "蓝牙连接先超时后快速失败：系统蓝牙栈状态异常（多见于蓝牙栈被改动/驱动未就绪）。请检查系统蓝牙或重启车机后重试"
+                        "蓝牙连接先超时后快速失败：请关闭再打开 iPhone 蓝牙（或重新配对该 iPhone）后重试"
                     fast > 0 ->
-                        "蓝牙连接被本机拒绝：请确认iPhone已与车机配对且iPhone蓝牙已开启；若近期改动过系统蓝牙，请重启车机"
+                        "蓝牙连接被本机拒绝：请关闭再打开 iPhone 蓝牙（或重新配对该 iPhone）后重试"
                     slow > 0 ->
-                        "iPhone无应答：请解锁iPhone、确认蓝牙可见并靠近车机；仍失败请在iPhone上忽略此设备后重新配对"
+                        "iPhone无应答：请关闭再打开 iPhone 蓝牙（或重新配对该 iPhone）后重试"
                     else ->
-                        "蓝牙连接失败：请确认iPhone已配对且蓝牙已开启"
+                        "蓝牙连接失败：请关闭再打开 iPhone 蓝牙（或重新配对该 iPhone）后重试"
                 }
             }
             // vc170：Wi-Fi Direct 在部分机型上是**硬件/ROM 层面不支持**（C8815 实测：
@@ -829,9 +887,9 @@ class LiteSessionService : Service() {
             // 1.0.0-demo：中继模式拆分文案——iPhone 已收到凭证却零 TCP，首要嫌疑是
             // 路由器 AP 隔离/访客隔离（家庭路由常见默认项），与热点模式自查项不同。
             "first tcp timeout (relay)" in m ->
-                "iPhone已收到Wi-Fi凭证但30秒未连入。中继模式请检查：① 路由器是否开启「无线隔离/访客隔离」（最常见原因，需关闭）；② iPhone与本机连的是同一个WiFi（名字完全一致）；③ 在iPhone的WiFi设置中忽略本网络后重连，再点重试"
+                "iPhone已收到Wi-Fi凭证但未连入。中继模式请检查：① 路由器是否开启「无线隔离/访客隔离」（最常见原因，需关闭）；② iPhone与本机连的是同一个WiFi（名字完全一致）；③ 在iPhone的WiFi设置中忽略本网络后重连，再点重试"
             "first tcp timeout" in m ->
-                "iPhone迟迟未连入车机网络（30秒内无连接）：请确认iPhone已加入热点/随身WiFi且蓝牙已开启；系统会自动重试（旧记录约40秒后过期）"
+                "iPhone迟迟未连入车机网络：请确认iPhone已加入热点/随身WiFi且蓝牙已开启；系统会自动重试（旧记录约40秒后过期）"
             "control channel closed before tunnel" in m -> "iPhone提前断开控制通道，请重试或关开iPhone蓝牙"
             // —— U4 USB 有线错误文案 ——
             "usb host is unavailable" in m -> "此设备不支持 USB 主机模式，无法使用有线连接"
@@ -868,8 +926,10 @@ class LiteSessionService : Service() {
         }
     }
 
-    private fun fail(text: String) {
+    private fun fail(text: String, code: LiteState.UiStateCode) {
         LiteState.phase = LiteState.Phase.FAILED
+        LiteState.statusCode = code
+        LiteState.coarse = code.coarse
         LiteState.statusText = text
         LiteLog.log("service", "失败：$text")
         // vc250-03：失败也是会话终态；failureClass 已由先行的 LiteLog.failure 记入本会话。
@@ -1137,11 +1197,19 @@ class LiteSessionService : Service() {
     private fun scaleDisplay(full: Pair<Int, Int>, percent: Int): Pair<Int, Int> {
         val value = percent.coerceIn(LiteConfig.MIN_SCALE_PERCENT, LiteConfig.MAX_SCALE_PERCENT)
         if (value >= LiteConfig.MAX_SCALE_PERCENT) {
-            // 1.0.29：手动值可能是奇数，即使 150% 不缩放也强制取偶（H.264 要求）。
+            // 1.0.29：150% 是「不缩放」哨兵——手动分辨率原样上报，长度只取偶（H.264 要求），
+            // 不做 16 对齐：用户手动填奇怪尺寸时按原值强制，由用户自行承担。
             return scaleEven(full.first, 100) to scaleEven(full.second, 100)
         }
-        return scaleEven(full.first, value) to scaleEven(full.second, value)
+        // vc280：按百分比缩小时，高度向上对齐 16。
+        // 依据：H.264 高度按 16 行宏块对齐，解码器会把 480x270 pad 成 slice=272；
+        // 老厂商 OMX（C8815 实测）在 slice≠height 时色度平面定位错位，
+        // 表现为「轮廓对、颜色错」的块状花屏，且放大倍数越大越明显（50% 档 2 倍放大）。
+        return scaleEven(full.first, value) to align16(scaleEven(full.second, value))
     }
+
+    /** 向上对齐到 16 的倍数（H.264 宏块高度）。 */
+    private fun align16(pixels: Int): Int = ((pixels + 15) / 16) * 16
 
     private fun scaleEven(pixels: Int, percent: Int): Int {
         val scaled = (pixels.toLong() * percent + 50L) / 100L

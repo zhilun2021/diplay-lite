@@ -133,11 +133,12 @@ class AndroidMediaSink(
      */
     private val onMediaPlaybackStarted: (() -> Unit)? = null,
     /**
-     * 1.1.6(vc76)：媒体断供看门狗——媒体音频（type=102）与主屏视频（type=110）都
-     * 建过流且**同时**静默超过 [MEDIA_STALL_SILENCE_NS] 时回调一次（恢复收流自动复位）。
+     * 1.1.6(vc76)：媒体断供看门狗——主屏视频（type=110）建过流且静默超过
+     * [MEDIA_STALL_SILENCE_NS] 时回调一次（恢复收流自动复位）。
      * 形态 A 僵尸会话对策：iPhone 野蛮退出 CarPlay 不发 teardown（8815 整夜实测：
-     * CarPlay UI 已退、BT iAP2 心跳还活、RTSP 会话挂 ended=false 傻等 4 分钟+），
-     * 音视频双静默 = 会话实质死亡的媒质层判据（用户暂停音乐只停音频、视频仍在推）。
+     * CarPlay UI 已退、BT iAP2 心跳还活、RTSP 会话挂 ended=false 傻等 4 分钟+）。
+     * vc290：判据只看视频。用户在 iPhone 上手动切走音频（TEARDOWN type=102、视频仍在线）
+     * 是合法状态，旧「音视频双静默」会把它当僵尸整代拆掉（C8815 14:00 实测每分钟断一次）。
      */
     private val onMediaStall: (() -> Unit)? = null,
     /**
@@ -231,9 +232,19 @@ class AndroidMediaSink(
     private val recoveryExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "carplay-video-recovery").apply { isDaemon = true }
     }
-    // 1.1.6(vc76)：媒体断供监视线程。5s 一查；判据 = 媒体音频与主屏视频都建过流、
-    // 且当前同时静默超阈值 → 一次性回调 onMediaStall（任一流恢复即复位，允许下次再判）。
+    // 1.1.6(vc76)：媒体断供监视线程。5s 一查；判据 = 主屏视频建过流、且静默超阈值
+    // → 一次性回调 onMediaStall（收流恢复即复位，允许下次再判）。
     private val mediaStallLatch = AtomicBoolean(false)
+    // vc285：断供判据的最后收包时刻独立留存。TEARDOWN 会先删 decoder
+    // （videoDecoders.remove），旧判据 `videoDecoders[110] ?: continue` 一旦命中删除就
+    // 永久失明——C8815 11:30 实测：流被 TEARDOWN、视频随后静默、控制面走「降级不拆栈」
+    // 把自愈交给本看门狗，结果无人回收，界面卡在「连接已断开」。
+    // vc290：判据从「音视频双静默」收窄为「只看视频」。C8815 14:00 实测：用户在 iPhone
+    // 上手动切走音频（TEARDOWN types=[102]，视频仍 110 在线），音频合法停供，双静默判据
+    // 20s 后把好会话当僵尸拆掉，形成「每分钟断一次、10 秒又回来」。音频是否出声由用户
+    // 决定，不能作为会话死活的凭据；屏幕流才是无线 CarPlay 的命脉。
+    @Volatile private var mediaStallVideoLastNs = 0L
+    @Volatile private var mediaStallVideoSeen = false
     private val mediaStallMonitor = Thread({
         while (true) {
             try {
@@ -242,22 +253,23 @@ class AndroidMediaSink(
                 return@Thread
             }
             val callback = onMediaStall ?: continue
-            val renderer = audioRenderers[MEDIA_AUDIO_PAYLOAD_TYPE] ?: continue
-            if (renderer.format.audioType != MEDIA_AUDIO_TYPE) continue
-            val audioLastNs = renderer.lastArrivalNanos()
-            if (audioLastNs == 0L) continue // 本代从未收过音频包：没建过流，无从谈断供
-            val video = videoDecoders[MEDIA_VIDEO_PAYLOAD_TYPE] ?: continue // 纯音频场景不判死
-            val videoLastNs = video.lastArrivalNanos()
-            if (videoLastNs == 0L) continue
+            val video = videoDecoders[MEDIA_VIDEO_PAYLOAD_TYPE]
+            if (video != null) {
+                val videoLastNs = video.lastArrivalNanos()
+                if (videoLastNs == 0L) continue
+                mediaStallVideoSeen = true
+                mediaStallVideoLastNs = videoLastNs
+            } else if (!mediaStallVideoSeen) {
+                continue // 本代从未建过主屏视频流（纯音频场景不判死）
+            }
             val now = System.nanoTime()
-            val bothSilent = now - audioLastNs > MEDIA_STALL_SILENCE_NS &&
-                now - videoLastNs > MEDIA_STALL_SILENCE_NS
-            if (bothSilent) {
+            val videoSilent = now - mediaStallVideoLastNs > MEDIA_STALL_SILENCE_NS
+            if (videoSilent) {
                 if (mediaStallLatch.compareAndSet(false, true)) {
                     Log.w(
                         "xcertplay-usb",
-                        "media stall: audio+video silent >${MEDIA_STALL_SILENCE_NS / 1_000_000}ms " +
-                            "with streams established; reporting to orchestration",
+                        "media stall: video silent >${MEDIA_STALL_SILENCE_NS / 1_000_000}ms " +
+                            "with stream established; reporting to orchestration",
                     )
                     callback()
                 }
@@ -268,12 +280,14 @@ class AndroidMediaSink(
     }, "carplay-media-stall").apply { isDaemon = true; start() }
 
     private companion object {
-        // 1.1.6(vc76)：媒体断供看门狗参数。20s 双静默远大于正常流间隙（视频 8fps 空闲
-        // 流 ~125ms/帧、音乐停顿由重传覆盖），且视频仍推 = 用户暂停音乐的合法场景。
-        const val MEDIA_AUDIO_PAYLOAD_TYPE = 102
+        // 1.1.6(vc76)：媒体断供看门狗参数。vc290：只判视频，音频停供是用户可手动制造的合法状态。
+        // vc292 实测（C8815 14:34~14:36，音频已切出、画面正常）：静止页面下统计行间隔
+        // 就是零视频包时长，实测出现过 35s、58s 两段——iOS 在画面静止时合法地可以近
+        // 一分钟不发视频包，90s 只留 55% 余量太薄（换壁纸/多点几次就踩线）。
+        // vc293（待出包）：放宽到 300s。正常退出都有 iAP2 link ended / RTSP session ended
+        // 两条立即重连路径，本看门狗只是「对端无声消失」的最后兜底，慢 5 分钟可接受。
         const val MEDIA_VIDEO_PAYLOAD_TYPE = 110
-        const val MEDIA_AUDIO_TYPE = "media"
-        const val MEDIA_STALL_SILENCE_NS = 20_000_000_000L
+        const val MEDIA_STALL_SILENCE_NS = 300_000_000_000L
     }
 
     override fun setVideoRecoveryHandler(type: Int, handler: () -> Unit) {
@@ -602,6 +616,8 @@ private class VideoDecoder(
     // vc239（VID-234-03）：元素带出队时刻，供统计「入队→上屏」最大耗时（纯观测，不影响出队顺序）。
     private class PendingOutput(val index: Int, val enqueuedNs: Long)
     private val pendingOutputs = java.util.ArrayDeque<PendingOutput>()
+    // vc280（#13）：输入帧入队时刻 FIFO（仅解码线程访问），与输出一一配对算单帧解码耗时。
+    private val inputSubmitNs = java.util.ArrayDeque<Long>()
     // M6k：最近一次喂入的帧是不是随机访问帧（IDR）。解码失败时落盘，用于判读"是否从 P 帧续解"。
     @Volatile private var lastFrameKeyFrame = true
     // 1.0.29（AC8227 倒车闪屏）：恢复看门狗计数——关键帧连发无渲染 = control 通道疑似死亡。
@@ -615,6 +631,8 @@ private class VideoDecoder(
     // （renderHold=false）+ 持续 3s 零渲染 → 走 recover(flush)+请求关键帧，10s 限频防抖。
     private var lastRenderNanos = 0L
     private var lastStallRecoveryNanos = 0L
+    // vc300：render stall 诊断日志节流（恢复节奏不变，仅日志每 60s 一条）。
+    private var lastStallReportNanos = 0L
     // vc253（出画后掉帧取证）：首帧上屏时刻——之后 60s 内的 video stats 行附 Wi-Fi 侧采样。
     private var firstRenderNanos = 0L
     // The main screen keeps the historical log format; other screens are labelled.
@@ -711,7 +729,7 @@ private class VideoDecoder(
      * vc150（T3 来电假死定案）：静默渲染看门狗——rx 满帧到达但持续零渲染。
      * iPhone 来电/通话/Siri 重建视频流后只发 P 帧不补参数集，解码器停在旧流状态，
      * 帧进得来（无积压、解码器不报错）但一帧都解不出 → shown=0 永久定格，
-     * 且积压路径（backlog flush）与断供看门狗（A/V 双静默）均不覆盖本场景。
+     * 且积压路径（backlog flush）与断供看门狗（视频静默）均不覆盖本场景。
      * 判据全部满足才触发：曾渲出过帧（排除冷启动首解期）+ 3s 内有收帧（流活着）
      * + 不在恢复流程（renderHold=false）+ 距上次渲染超 3s。恢复走既有
      * recover(flush) → referenceChain.needsKeyFrame → 请求关键帧路径，10s 限频防抖。
@@ -724,7 +742,14 @@ private class VideoDecoder(
         val lastArrival = stats.lastArrivalNanos()
         if (lastArrival == 0L || now - lastArrival > RENDER_STALL_THRESHOLD_NS) return
         lastStallRecoveryNanos = now
-        report("render stall: frames arriving but none rendered for ${RENDER_STALL_THRESHOLD_NS / 1_000_000} ms — request keyframe (incoming call/Siri stream reset)")
+        // vc300：恢复仍按 10s 节奏跑，但这条诊断日志每 60s 最多一条——持续 stall 时
+        // 此前每 10s 刷一次，长会话把日志文件写满、也掩盖真正的一次性事件。
+        if (lastStallReportNanos == 0L ||
+            now - lastStallReportNanos >= RENDER_STALL_REPORT_INTERVAL_NS
+        ) {
+            lastStallReportNanos = now
+            report("render stall: frames arriving but none rendered for ${RENDER_STALL_THRESHOLD_NS / 1_000_000} ms — request keyframe (incoming call/Siri stream reset)")
+        }
         recover("video render stall (frames arriving, none rendered)", rebuildDecoder = false)
     }
 
@@ -1028,6 +1053,7 @@ private class VideoDecoder(
         if (annexB.size <= input.remaining()) {
             input.put(annexB)
             codec.queueInputBuffer(index, 0, annexB.size, System.nanoTime() / 1000, 0)
+            inputSubmitNs.addLast(System.nanoTime())
             referenceChain.onQueued()
             // vc277：抑制期唯一放行的就是 IDR，它一入队，后续输出必为干净帧，可解除抑制。
             // 非抑制态下 releaseRenderHold 内部直接返回，零副作用。
@@ -1072,11 +1098,17 @@ private class VideoDecoder(
     }
 
     private fun recover(reason: String, rebuildDecoder: Boolean = true) {
+        // vc279（老 OMX 脏图定案）：不再一律信任 MediaCodec.flush()。
+        // Android 9 之前的厂商 OMX 在 flush 后经常残留 DPB 参考状态，随后送入的 IDR
+        // 会在残留状态上解出脏帧并被后续 P 帧继承——观感是一张脏图停住、滑动触发
+        // 1~2 次新 IDR 才恢复。Codec2（API28 起成为默认路径）flush 语义干净，
+        // 保留 flush 以省掉重建开销。
+        val rebuild = rebuildDecoder || Build.VERSION.SDK_INT < Build.VERSION_CODES.P
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
-        report("recovery: $reason; waiting for keyframe" + if (rebuildDecoder) "" else " (flush decoder)")
+        report("recovery: $reason; waiting for keyframe" + if (rebuild) "" else " (flush decoder)")
         beginRenderHold("recover: $reason")
-        if (rebuildDecoder) {
+        if (rebuild) {
             // Recreate with codec-specific data: flush can discard CSD before the first output.
             releaseDecoder()
         } else {
@@ -1096,6 +1128,8 @@ private class VideoDecoder(
         try {
             codec.flush()
             stats.onFlush()
+            // vc280（#13）：flush 丢弃在途输入帧，配对时刻同步清空。
+            inputSubmitNs.clear()
         } catch (error: Exception) {
             Log.w(TAG, "video decoder flush failed; rebuilding instead", error)
             releaseDecoder()
@@ -1226,6 +1260,14 @@ private class VideoDecoder(
                     logOutputFormat(codec.outputFormat)
                 }
                 index >= 0 -> {
+                    // vc280（#13）：解码耗时 = 本输出可用时刻 - 对应输入帧入队时刻。
+                    // codec 配置缓冲不对应任何输入帧（否则 FIFO 会整体错位一格），跳过。
+                    if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                        val submittedNs = inputSubmitNs.pollFirst()
+                        if (submittedNs != null) {
+                            stats.onDecodeLatency(System.nanoTime() - submittedNs)
+                        }
+                    }
                     // vc277：抑制期的干净性由「输入侧只放 IDR」保证，输出侧不再做关键帧标志判定
                     //（SPRD OMX 不打 BUFFER_FLAG_KEY_FRAME，靠它会退化成 1.5s 兜底解除→花屏）。
                     if (noCoalesce) {
@@ -1236,9 +1278,26 @@ private class VideoDecoder(
                         } else {
                             // vc239（VID-234-03）：入队即记时刻，并在入队后采样队列深度峰值。
                             val pending = PendingOutput(index, System.nanoTime())
+                            // vc278（跟手度）：队列硬封顶。不合并模式是「一个 VSYNC 上屏一帧」，
+                            // 出队被面板刷新率卡在 ≤60fps；链路突发把队列灌深后入队速率同为
+                            // ≤60fps，积压永远不会自愈 → 画面长期比手指慢几十~上百毫秒。
+                            // 只保留 MAX_PENDING_OUTPUT_FRAMES 帧余量，超出就归还最旧的待渲帧
+                            // （render=false）：丢的只是「已解码帧的显示机会」，不触碰参考链。
+                            var droppedIndex = -1
                             val depth = synchronized(pendingOutputs) {
+                                while (pendingOutputs.size >= MAX_PENDING_OUTPUT_FRAMES) {
+                                    droppedIndex = pendingOutputs.removeFirst().index
+                                }
                                 pendingOutputs.addLast(pending)
                                 pendingOutputs.size
+                            }
+                            if (droppedIndex >= 0) {
+                                try {
+                                    codec.releaseOutputBuffer(droppedIndex, false)
+                                } catch (_: Exception) {
+                                    // close/flush 竞态：组件正在拆除，best effort。
+                                }
+                                stats.onSuperseded()
                             }
                             stats.onPendingDepth(depth)
                         }
@@ -1317,6 +1376,8 @@ private class VideoDecoder(
     private fun releaseDecoder() {
         val codec = decoder
         decoder = null
+        // vc280（#13）：在途输入帧随组件一起消失，清掉配对时刻，防后续统计错位。
+        inputSubmitNs.clear()
         if (codec != null) {
             // vc237（A1）：重建前归还待渲帧，避免缓冲悬空。
             discardPendingOutputs(codec)
@@ -1377,12 +1438,18 @@ private class VideoDecoder(
         // （来电/通话/Siri 流重建后只发 P 帧不补参数集），恢复后 10s 内不再重复触发。
         const val RENDER_STALL_THRESHOLD_NS = 3_000_000_000L
         const val RENDER_STALL_RECOVERY_INTERVAL_NS = 10_000_000_000L
+        /** vc300：stall 诊断日志最小间隔（恢复仍按 10s 限频，只节流日志）。 */
+        const val RENDER_STALL_REPORT_INTERVAL_NS = 60_000_000_000L
         // vc277：兜底时限。抑制期只放 IDR 进来，正常 1s 内就能拿到（surface 重接会立即要 IDR
         // 且每 1s 重发请求）；超过该时限仍未见到 IDR 才退回「按普通帧续解」，避免永久黑屏。
         // 取值依据（TS7 有线实测 19:26:57）：iPhone 对 forceKeyFrame 的响应并不及时，天然 IDR
         // 在解码器创建后 ~5s 才到。因此兜底必须显著大于该窗口，否则会在 IDR 到达前就放行
         // P 帧——那一段既不会出画（无参考），还可能让厂商解码器吐出脏缓冲。
         const val RENDER_HOLD_FALLBACK_NS = 8_000_000_000L
+        // vc278（跟手度）：不合并模式待渲队列硬上限。出队被 VSYNC 卡在 ≤60fps，链路突发后
+        // 队列只会越来越深且不自愈；封顶 2 帧把稳态显示延迟再压约 16ms，代价是极端突发时
+        // 丢弃「最旧的显示机会」（不影响解码参考链）。
+        const val MAX_PENDING_OUTPUT_FRAMES = 2
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }

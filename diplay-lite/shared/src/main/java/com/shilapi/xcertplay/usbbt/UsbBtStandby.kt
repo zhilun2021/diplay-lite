@@ -267,6 +267,13 @@ object UsbBtStandby {
         get() = isRunning && UsbBtHost.pairStateSnapshot == PairState.PAIRED
 
     /**
+     * vc310：连续失败次数（成功清零）。外置蓝牙三态 UI 的判据出口。
+     * 语义与 UsbDongleGuard.consecutiveFailures 一致，但本字段按「常驻广播重开轮次」计。
+     */
+    @Volatile var failStreak: Int = 0
+        private set
+
+    /**
      * vc212：SSP 弹码确认出口转发（UsbBtHost 为 internal，app 侧经这里注册）。
      * UI 回调三参 = 对端冒号 MAC、6 位确认数字、答案回调（true=确认 / false=取消，
      * 任意线程可调）。不注册（null）= 无 UI 接管，host 一律拒绝。
@@ -369,6 +376,7 @@ object UsbBtStandby {
 
     private fun loop(context: Context, onDiagnostic: ((String) -> Unit)?, myGeneration: Int) {
         var failures = 0
+        failStreak = 0
         while (isRunning && myGeneration == generation) {
             // vc236（BT-235-01）：上一代交出的流可能还没关（Activity 销毁让旧 loop 先退出，
             // 而控制器仍持链路）。先等它 close + 静默窗，再 openDirect；超时则本轮跳过，
@@ -406,11 +414,17 @@ object UsbBtStandby {
                     onHostInitialized = {
                         synchronized(lock) {
                             if (isRunning && myGeneration == generation) hostReadyGeneration = myGeneration
+                            // vc316（BT-315-01）：host 初始化成功＝dongle 确实能用，连续失败计数此刻就该归零。
+                            // 不能等 :421-422 那两行——openDirect 要等 iPhone 连上/窗口超时才返回，
+                            // 「广播中、等 iPhone」这段期间 failStreak 会一直停在上一轮的失败值，
+                            // 使 extBtState() 的 failStreak 判据把界面钉在「外置蓝牙连接失败」。
+                            failStreak = 0
                             lock.notifyAll()
                         }
                     },
                 )
                 failures = 0
+                failStreak = 0
                 // vc232：包一层只为记 close —— 控制器取走这条流后 loop 必须停迭代等它 close；
                 // 否则下一轮 openDirect 的 forceClaim 会把正在跑 RFCOMM/iAP2 的 driver 顶掉
                 // （vc231 实测：publish 后 33ms loop 就重开 dongle → ACL 立刻断，主线程卡在网链路）。
@@ -489,7 +503,24 @@ object UsbBtStandby {
                     break
                 }
             } catch (error: Throwable) {
+                // vc317（BT-316-01）：空闲窗口到期不是故障。
+                // 链路语义已从「蓝牙必须常连」变成「dongle 在场即待命」——常驻广播开着、
+                // 10 分钟内没有 iPhone 来连，是待命常态（vc315 实测每 10:00 一次，投屏中
+                // 界面被顶成「外置蓝牙连接失败」，累计 5 次还会停广播）。这类到期直接
+                // 重开窗口，不计失败、不写 failStreak、不进退避。
+                // 真正的设备故障（open / claimInterface / idle 探测无应答 / dongle 已停止）
+                // 消息各不相同，仍走下面的计数与 5 次上限，保护不削弱。
+                if (error.message?.startsWith("等待 iPhone 连接超时") == true) {
+                    // vc317：openDirect 的内层 catch 已 host.stop() + driver.close()，但内核释放
+                    // 接口需要时间。原来是第一次失败有 1000ms 退避、恰好覆盖 RECLAIM_SETTLE_MILLIS，
+                    // 改成 continue 后间隔变 0，forceClaim 会抢在 release 之前（vc233 教训：首命令
+                    // ReadLocalVersion 白等 3s，严重时「打开 dongle 失败：设备刚重枚举或打开被拒」，
+                    // 而那条消息会照常计入 failStreak ⇒ 黄字又回来）。这里显式补回释放静默窗。
+                    sleepQuietly(RECLAIM_SETTLE_MILLIS, myGeneration)
+                    continue
+                }
                 failures++
+                failStreak = failures
                 statusText = error.message ?: "常驻广播失败"
                 // vc246（USB-246-01）：与手动/掉线重连共用同一节律 1s→2s→4s→8s（封顶），
                 // 连续 5 次失败即停并让状态可见（不再 2s/4s 无上限地反复重开 dongle）。
@@ -501,6 +532,14 @@ object UsbBtStandby {
                 )
                 if (failures >= UsbBtRetryPolicy.MAX_ATTEMPTS) {
                     statusText = "连续 ${UsbBtRetryPolicy.MAX_ATTEMPTS} 次重开失败，已停止自动重试（可插拔 dongle 或重启车机）"
+                    // vc312（BT-311-01）：放弃态必须同时放下 isRunning —— 否则 start() 入口的
+                    // `if (isRunning) return` 会把后续一切拉起（插回 dongle / 回前台 / 打开配对窗）
+                    // 全部吞掉，而 isPresent() 的 standby 短路还会把「在场」误判为 true。
+                    // 与 stop() 的语义对齐：isRunning=false + hostReadyGeneration=0。
+                    synchronized(lock) {
+                        isRunning = false
+                        hostReadyGeneration = 0
+                    }
                     break
                 }
                 sleepQuietly(delay, myGeneration)

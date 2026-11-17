@@ -128,7 +128,13 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
             }
             OP_VIDEO_CONFIG -> {
                 val (codec, codecData) = ScreenCodec.detectConfig(body)
-                Log.i(TAG, "video codec config codec=$codec body=${body.size} data=${codecData.size}")
+                // vc280（#2）：iPhone 起流时连发两次 VideoConfig 时，靠 head 区分「同一份
+                // avcC 重复投递」与「同长度不同内容」——后者会走重建解码器分支。
+                Log.i(
+                    TAG,
+                    "video codec config codec=$codec body=${body.size} data=${codecData.size} " +
+                        "head=${codecData.hexPrefix(12)}",
+                )
                 listener.onCodec(codec)
                 listener.onConfig(codecData)
             }

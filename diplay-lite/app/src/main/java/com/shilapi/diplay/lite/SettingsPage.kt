@@ -98,13 +98,6 @@ class SettingsPage(private val activity: MainActivity) {
     // vc158：自动连接方式第四项（Wi-Fi Direct）。
     private lateinit var rbAutoP2p: RadioButton
     private lateinit var rbAutoUsb: RadioButton
-    // vc258：mDNS 连接提速实验三态（关闭 / 等待广播 / 等待+预热）。
-    private lateinit var rgMdnsBoost: WrapRadioGroup
-    private lateinit var rbMdnsOff: RadioButton
-    private lateinit var rbMdnsWait: RadioButton
-    private lateinit var rbMdnsWarm: RadioButton
-    // vc259：实验 3 档 —— IPv6 广播（fe80 地址族，对齐竞品）。
-    private lateinit var rbMdnsIpv6: RadioButton
     private lateinit var rgOrientation: RadioGroup
     private lateinit var rbOrientLand: RadioButton
     private lateinit var rbOrientPortrait: RadioButton
@@ -514,23 +507,6 @@ class SettingsPage(private val activity: MainActivity) {
         // 不做兜底：probe/bind/iAP2 任一失败即结束本次有线会话并明确报错，不回落 TUN。
         cbWiredKernelNcm = checkbox("有线实验：内核 NCM（老车机专用，失败直接报错，重连生效）")
         column.addView(cbWiredKernelNcm, block(bottom = dip(4)))
-        // vc258：mDNS 连接提速实验（三态，重连生效）。
-        // K60 实测：iPhone 入网约 1s，而 JmDNS 广播要 7.5s 才就绪；广告晚于入网时
-        // iOS 下一次服务发现要等 ~35s。开启后首个凭证等广播就绪再发。
-        column.addView(subSectionLabel("mDNS 连接提速（实验，重连生效）"), block(top = dip(8), bottom = dip(2)))
-        rgMdnsBoost = WrapRadioGroup(activity)
-        rbMdnsOff = radio("关闭（现状）")
-        rbMdnsWait = radio("等待广播")
-        rbMdnsWarm = radio("等待+预热")
-        rbMdnsIpv6 = radio("IPv6 广播")
-        rgMdnsBoost.addButtons(rbMdnsOff, rbMdnsWait, rbMdnsWarm, rbMdnsIpv6)
-        rgMdnsBoost.onRelayout = { refreshRadioDrawables(rgMdnsBoost) }
-        rgMdnsBoost.setOnCheckedChangeListener {
-            if (isLoading) return@setOnCheckedChangeListener
-            refreshRadioDrawables(rgMdnsBoost)
-            persistFromForm()
-        }
-        column.addView(rgMdnsBoost, block(top = dip(6), bottom = dip(4)))
         cbBoot = checkbox("开机自启Diplay Lite")        // 1.0.11：开机自动开启蓝牙/热点/Wi-Fi（独立于"开机自启"，任一勾选 BootReceiver 即工作；
         // 1.0.29 Wi-Fi 与热点互斥——勾了热点则 Wi-Fi 自启跳过，STA/AP 不能同开）
         cbBootBluetooth = checkbox("开机自启蓝牙")
@@ -1254,8 +1230,6 @@ class SettingsPage(private val activity: MainActivity) {
         refreshRadioDrawables(rgOrientation)
         refreshRadioDrawables(rgAutoChannel)
         refreshRadioDrawables(rgBtSelect)
-        // vc258：mDNS 连接提速三态组。
-        if (::rgMdnsBoost.isInitialized) refreshRadioDrawables(rgMdnsBoost)
         // avGroup 是局部变量（非字段），且其仍是 RadioGroup、按钮为直接子级，用 parent 取
         (rbAvFull.parent as? ViewGroup)?.let { refreshRadioDrawables(it) }
         // 1.0.29：分辨率设定组。
@@ -1309,13 +1283,6 @@ class SettingsPage(private val activity: MainActivity) {
         cbBootHotspot.isChecked = config.bootAutoHotspot
         cbBootWifi.isChecked = config.bootAutoWifi
         cbAutoConnect.isChecked = config.autoConnect
-        // vc258：mDNS 连接提速三态回显。
-        when (config.mdnsConnectBoost) {
-            1 -> rbMdnsWait.isChecked = true
-            2 -> rbMdnsWarm.isChecked = true
-            3 -> rbMdnsIpv6.isChecked = true
-            else -> rbMdnsOff.isChecked = true
-        }
         cbSoftDecode.isChecked = config.softwareVideoDecoder
         cbFe6Voice?.isChecked = config.rootMicFallback
         // vc157：帧率四档回显（load 已过网格校验，else 兜底 30）。
@@ -1427,13 +1394,6 @@ class SettingsPage(private val activity: MainActivity) {
                 bootAutoHotspot = cbBootHotspot.isChecked,
                 bootAutoWifi = cbBootWifi.isChecked,
                 autoConnect = cbAutoConnect.isChecked,
-                // vc258：mDNS 连接提速实验（0/1/2，重连生效）。
-                mdnsConnectBoost = when {
-                    rbMdnsIpv6.isChecked -> 3
-                    rbMdnsWarm.isChecked -> 2
-                    rbMdnsWait.isChecked -> 1
-                    else -> 0
-                },
             ),
         )
         // 2026-11-07：该实验为连接级开关，不做热切换；明确提示必须断开重连。

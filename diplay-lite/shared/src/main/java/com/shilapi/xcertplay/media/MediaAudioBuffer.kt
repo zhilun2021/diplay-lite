@@ -13,10 +13,10 @@ object MediaAudioBuffer {
     const val DEFAULT_MILLIS = 300
     val presets = listOf(DEFAULT_MILLIS, 500, 1000)
 
-    /** 媒体（音乐）缓冲池下限：须大于实测最大抖动（~1.3s），否则突发期必然 underrun。 */
-    private const val MEDIA_MIN_CAPACITY_MILLIS = 1500
+    /** 媒体（音乐）缓冲池下限：与起播阈值对齐，不再额外加抗抖动余量（有线链路无需）。 */
+    private const val MEDIA_MIN_CAPACITY_MILLIS = 300
 
-    private const val HEADROOM_MILLIS = 200 // room above the start level so bursts after a gap fit
+    private const val HEADROOM_MILLIS = 0 // 有线：不留抗抖动余量
     private const val MIN_TRACK_BUFFER_BYTES = 16 * 1024
     private const val MIN_START_BUFFER_BYTES = 4 * 1024
     // P0: raise the low-latency start level for non-media streams (speech/Siri/nav).

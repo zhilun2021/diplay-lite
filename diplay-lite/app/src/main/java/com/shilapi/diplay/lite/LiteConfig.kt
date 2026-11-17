@@ -43,10 +43,9 @@ data class LiteConfig(
     val btAudioInfoVariant: String = "no_audio",
     // M6k19：音乐缓存毫秒数（10-4000，默认 300 = MediaAudioBuffer.DEFAULT_MILLIS）。
     val mediaBufferMillis: Int = 300,
-    // vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲）：媒体流预缓冲开关（默认开）。
-    // 开 = 音乐起播/复播水位抬到约 1s，抗 Wi-Fi 断流；关 = 维持 mediaBufferMillis 原阈值
-    // （起播更快）。仅媒体流生效，通话/Siri 低延迟流不受影响；重新连接后生效。
-    val audioPrebuffer: Boolean = true,
+    // vc156 媒体流预缓冲开关（2026-11-14 有线默认关）。旧默认开 = 起播/复播水位抬高以抗
+    // Wi-Fi 断流；现已不保留抗抖余量，默认关，起播更快（重新连接后生效）。
+    val audioPrebuffer: Boolean = false,
     // vc236（VID-234-01 / A2）：视频渲染改 VSYNC（Choreographer）节拍。
     // vc238：A2 升为默认开启且**不再保留开关**（它修的是绿线这类可见缺陷，不该由用户关掉）；
     // 旧键 video_vsync_pacing 由 migrateVideoRenderDefaults() 一次性清理。
@@ -313,7 +312,7 @@ data class LiteConfig(
                 btAudioInfoVariant = prefs.getString("bt_audio_info_variant", "no_audio") ?: "no_audio",
                 mediaBufferMillis = prefs.getInt("media_buffer_millis", 300),
                 // vc156：媒体预缓冲开关（默认开）。
-                audioPrebuffer = prefs.getBoolean("audio_prebuffer", true),
+                audioPrebuffer = prefs.getBoolean("audio_prebuffer", false),
                 // vc238：A1 —— 帧不合并（默认开；旧键已由迁移清理，此后为用户真实选择）。
                 videoNoCoalesce = prefs.getBoolean("video_no_coalesce", true),
                 // vc238：麦克风收音增益（0=关闭，1~10 dB）。

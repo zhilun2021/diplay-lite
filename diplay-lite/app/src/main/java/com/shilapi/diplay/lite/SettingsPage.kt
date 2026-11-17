@@ -412,18 +412,17 @@ class SettingsPage(private val activity: MainActivity) {
         inputDuck = buildValueRow(column, "导航音频触发音量降低", "${LiteConfig.MIN_DUCK_PERCENT}% - ${LiteConfig.MAX_DUCK_PERCENT}%") { applyDuck(it) }
         // M6k19：音频缓存毫秒数（跟随导航音量降低之后），范围 10-4000ms。1.1.3 改名「音频缓存」。
         inputBuffer = buildValueRow(column, "音频缓存", "${LiteConfig.MIN_MEDIA_BUFFER_MILLIS} - ${LiteConfig.MAX_MEDIA_BUFFER_MILLIS} (ms)") { applyBuffer(it) }
-        // 生效说明：起播阈值跟随设置值；缓冲池深度有 1500ms 下限（T29 防抖动），设置 >1300ms 才会加深。
+        // 生效说明：起播阈值跟随设置值；缓冲池下限=起播阈值（有线不再保留抗抖动余量）。
         column.addView(
             TextView(activity).apply {
-                text = "影响音乐起播速度。更改在重新连接后生效。缓冲池固定不低于 1500ms 防网络卡顿，设置高于 1300 才会加深缓冲池。"
+                text = "影响音乐起播速度。更改在重新连接后生效。缓冲池下限与起播阈值一致（有线不保留抗 Wi-Fi 抖动余量），设置越大缓冲越深、延迟越高。"
                 setTextColor(Ui.SUB)
                 textSize = 12f
             },
             block(top = dip(2), bottom = dip(4)),
         )
-        // vc156（移植自上游 0.2.21 BufferedAudioStream 预缓冲）：媒体预缓冲开关，默认开。
-        // 开 = 音乐起播/复播水位抬到约 1s，Wi-Fi 短断流不再卡顿；代价是切歌起播稍慢。
-        cbPrebuffer = checkbox("音乐预缓冲（抗Wi-Fi卡顿，起播稍慢）")
+        // vc156 媒体预缓冲开关：2026-11-14 有线默认关（不保留抗抖余量，起播更快）。
+        cbPrebuffer = checkbox("音乐预缓冲（默认关，开启会增加起播延迟）")
         column.addView(cbPrebuffer, block(bottom = dip(4)))
         // vc238：A2「视频渲染按 VSYNC 节拍」升为默认开启并删除勾选项（它修的是绿线这类
         // 可见缺陷，不应留给用户关闭）；A1「视频帧不合并」默认开、保留开关，已移至体验优化区。

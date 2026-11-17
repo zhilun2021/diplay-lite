@@ -467,8 +467,25 @@ class CarPlayController(
         iphoneHost?.debugSink = { message -> debugLog(message) }
     }
 
-    private val hostId = UUID.randomUUID().toString().uppercase(Locale.US)
-    private val systemBuid = UUID.randomUUID().toString().uppercase(Locale.US)
+    // vc318（USB 有线信任修复）：HostID / SystemBUID 必须跨进程稳定。旧实现每次新建
+    // controller 都随机生成，一旦走到重配就会以「新电脑」身份出现，iPhone 反复弹
+    // 「要信任此电脑吗」。这里首次生成后持久化，后续（含重启）复用同一身份。
+    private val lockdownIdentityPrefs by lazy {
+        appContext.getSharedPreferences(LOCKDOWN_IDENTITY_PREFS, Context.MODE_PRIVATE)
+    }
+    private val hostId: String by lazy { stableLockdownUuid("host_id") }
+    private val systemBuid: String by lazy { stableLockdownUuid("system_buid") }
+
+    private fun stableLockdownUuid(key: String): String {
+        lockdownIdentityPrefs.getString(key, null)?.let { return it }
+        val value = UUID.randomUUID().toString().uppercase(Locale.US)
+        lockdownIdentityPrefs.edit().putString(key, value).apply()
+        return value
+    }
+
+    // vc318：配对单飞锁 + 冷却时刻，避免并发/连环重配在 iPhone 上叠加多个信任弹窗。
+    private val pairingLock = Any()
+    @Volatile private var lastPairAttemptAtMs = 0L
     private val permissionGrant = AtomicBoolean(false)
     private val availabilityPollGeneration = AtomicInteger(0)
     private var permissionPollGeneration = 0
@@ -4402,26 +4419,21 @@ class CarPlayController(
             onStatus(CarPlayStatus.Pairing)
             val pairingClient = LockdownPairingClient(mux)
             val savedPairRecord = loadPairRecord()
-            var pairRecord = savedPairRecord ?: pairNewRecord(pairingClient)
-            debugLog(
-                if (savedPairRecord != null) {
-                    "wired using saved Lockdown pair record"
-                } else {
-                    "wired created a new Lockdown pair record"
-                },
-            )
             onStatus(CarPlayStatus.ConnectingControl)
             val carKitClient = LockdownCarKitClient(mux)
-            val carkit = try {
-                carKitClient.open(pairRecord, config.label)
-            } catch (error: Throwable) {
-                val rejection = rejectedPairRecordError(error)
-                if (savedPairRecord == null || rejection == null) throw error
-                debugLog("saved Lockdown pair record rejected by Lockdown error=$rejection; clearing and pairing again")
-                clearPairRecord()
-                pairRecord = pairNewRecord(pairingClient)
-                carKitClient.open(pairRecord, config.label)
-            }
+            // vc318（USB 有线信任修复）：优先复用已保存配对记录；被 Lockdown 判失效时先
+            // 用同一记录重试一次（瞬时 USB 抖动常表现为一次 InvalidPairRecord），确属真
+            // 失效才清除重配，且重配沿用原 hostId/systemBuid，iPhone 视作同一台电脑。
+            val opened = openCarkitRecovering(carKitClient, pairingClient, savedPairRecord)
+            val carkit = opened.first
+            val pairRecord = opened.second
+            debugLog(
+                if (savedPairRecord != null && pairRecord === savedPairRecord) {
+                    "wired using saved Lockdown pair record"
+                } else {
+                    "wired opened with Lockdown pair record hostId=${pairRecord.hostId}"
+                },
+            )
             debugLog("wired com.apple.carkit.service stream opened")
             val csm = Iap2Session.open(
                 carkit,
@@ -5146,14 +5158,67 @@ class CarPlayController(
         return kernel
     }
 
-    private fun pairNewRecord(client: LockdownPairingClient): LockdownPairRecord =
+    /**
+     * vc318：单飞 + 冷却，避免并发/连环重配在 iPhone 上叠加多个信任弹窗。
+     * [hostIdOverride]/[systemBuidOverride] 用于复用已失效记录的 hostId，保证重配后
+     * iPhone 仍视作同一台电脑。
+     */
+    private fun pairNewRecord(
+        client: LockdownPairingClient,
+        hostIdOverride: String? = null,
+        systemBuidOverride: String? = null,
+    ): LockdownPairRecord = synchronized(pairingLock) {
+        val now = SystemClock.elapsedRealtime()
+        val sinceLast = now - lastPairAttemptAtMs
+        if (lastPairAttemptAtMs != 0L && sinceLast in 0L until PAIR_RETRY_COOLDOWN_MILLIS) {
+            val wait = PAIR_RETRY_COOLDOWN_MILLIS - sinceLast
+            debugLog("wired pairing cooldown ${wait}ms before re-pairing")
+            SystemClock.sleep(wait)
+        }
+        lastPairAttemptAtMs = SystemClock.elapsedRealtime()
         client.pair(
             label = config.label,
-            hostId = hostId,
-            systemBuid = systemBuid,
+            hostId = hostIdOverride ?: hostId,
+            systemBuid = systemBuidOverride ?: systemBuid,
             totalTimeoutMillis = PAIR_TIMEOUT_MILLIS,
             isCancelled = { closed },
         ).pairRecord.also(savePairRecord)
+    }
+
+    /**
+     * vc318：打开 carkit 服务。优先用 [saved]；被 Lockdown 判失效时先用同一记录重试一次，
+     * 确属真失效才 [clearPairRecord] 并用原 hostId 重配。返回 (数据流, 实际使用记录)。
+     */
+    private fun openCarkitRecovering(
+        client: LockdownCarKitClient,
+        pairingClient: LockdownPairingClient,
+        saved: LockdownPairRecord?,
+    ): Pair<BlockingDuplexByteStream, LockdownPairRecord> {
+        if (saved != null) {
+            try {
+                return client.open(saved, config.label) to saved
+            } catch (error: Throwable) {
+                val rejection = rejectedPairRecordError(error)
+                if (rejection == null) throw error
+                debugLog("saved Lockdown pair record rejected error=$rejection; retrying same record once")
+                try {
+                    return client.open(saved, config.label) to saved
+                } catch (retryError: Throwable) {
+                    val retryRejection = rejectedPairRecordError(retryError)
+                    if (retryRejection == null) throw retryError
+                    debugLog(
+                        "saved Lockdown pair record rejected again error=$retryRejection; " +
+                            "clearing and pairing again with same hostId",
+                    )
+                    clearPairRecord()
+                    val newRecord = pairNewRecord(pairingClient, saved.hostId, saved.systemBuid)
+                    return client.open(newRecord, config.label) to newRecord
+                }
+            }
+        }
+        val newRecord = pairNewRecord(pairingClient)
+        return client.open(newRecord, config.label) to newRecord
+    }
 
     private fun rejectedPairRecordError(error: Throwable): String? {
         var cause: Throwable? = error
@@ -5875,7 +5940,14 @@ class CarPlayController(
         // M6k24（D' 方案）：本机蓝牙地址进程级缓存（accessoryBluetoothMac 写入/消费）。
         @Volatile private var cachedLocalBtMac: String? = null
         // —— USB 有线（U3）——
-        private const val PAIR_TIMEOUT_MILLIS = 5 * 60_000L
+        // vc318（信任弹窗修复）：配对总超时 5min → 2min。旧值让弹窗/建链线程可被占住
+        // 最多 5 分钟；配合同连接原地轮询，2 分钟足以覆盖首次「信任」确认，超时则本轮
+        // 干净失败、交给插拔/自动重试，避免车机长时间「正在配对」假死。
+        private const val PAIR_TIMEOUT_MILLIS = 120_000L
+        /** vc318：HostID / SystemBUID 持久化用的 SharedPreferences 名。 */
+        private const val LOCKDOWN_IDENTITY_PREFS = "diplay_lockdown_identity"
+        /** vc318：两次重配之间的最小间隔，防止连环重配叠加多个信任弹窗。 */
+        private const val PAIR_RETRY_COOLDOWN_MILLIS = 3_000L
         // vc278（有线提速）：500 → 120。权限轮询是纯本地状态查询，授权后应立刻推进建链。
         private const val PERMISSION_POLL_INTERVAL_MILLIS = 120L
         private const val PERMISSION_POLL_TIMEOUT_MILLIS = 120_000L

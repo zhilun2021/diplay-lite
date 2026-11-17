@@ -1,3 +1,9 @@
+# 1.7.0-vc318 — 2026-11-17（USB 有线信任修复）
+
+- 修复 USB 有线连接间歇性导致车机卡死、iPhone 反复弹出「要信任此电脑吗」的问题：Lockdown 配对在等待用户点「信任」期间保持同一条连接原地轮询，不再每秒断开重连重发配对请求，弹窗只出现一次。
+- 配对总超时由 5 分钟缩短为 2 分钟，并加入配对单飞锁与 3 秒冷却，建链线程不再被未处理的信任弹窗占住数分钟，车机侧不再长时间停留在「正在配对」。
+- HostID / SystemBUID 首次生成后持久化，重配时沿用同一身份；已保存的配对记录被瞬时 USB 抖动误判失效时先用同一记录重试一次，确属真失效才重配，iPhone 不再把每次连接当成一台新电脑。
+
 # 1.7.0 — 2026-11-17
 
 - Four-state Bluetooth gate on the home screen (dongle not inserted / connect failed / not paired / stopped); the primary button no longer greys out — tapping it states the reason and offers the matching action.

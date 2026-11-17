@@ -29,8 +29,13 @@ android {
         // 覆盖；出包时改错一处即打错版本，已移除。
         // 构建标识：T15 曾因 versionName 恒为 0.1-lite 而误跑旧包、结论作废。
 
-        versionCode = 317
-        versionName = "1.7.0-vc317"
+        // vc318（USB 有线信任修复）：只改配对流程，不动协议/功能面。
+        // ① 信任弹窗：Lockdown 配对在「等待用户点信任」期间保持同一条连接原地轮询，
+        //    不再每秒断开重连重发 Pair，消除 iPhone 反复重弹「要信任此电脑吗」；
+        // ② 卡死：PAIR_TIMEOUT 5min→2min + 配对单飞/冷却，建链线程不再被弹窗占住数分钟；
+        // ③ 身份稳定：HostID/SystemBUID 首次生成后持久化，重配沿用原身份，不再每次当新电脑。
+        versionCode = 318
+        versionName = "1.7.0-vc318"
     }
 
     // 日志上云 token 脱敏（公开源码前置条件）：不再硬编码进源码，改由 local.properties

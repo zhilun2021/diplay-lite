@@ -40,19 +40,32 @@ class LockdownPairingClient(
 
         val deadline = Deadline(totalTimeoutMillis)
         var pairRecord: LockdownPairRecord? = null
+        var channel: LockdownPlistChannel? = null
         var attempt = 0
-        while (true) {
-            checkCancelled(isCancelled)
-            attempt += 1
-            val connection = host.connect(
-                destinationPort = Iap2UsbMuxHost.LOCKDOWN_PORT,
-                timeoutMillis = stepTimeoutMillis(deadline),
-            )
-            var pending = false
-            LockdownPlistChannel(connection).use { channel ->
-                setUntrustedHostBuid(channel, label, systemBuid, deadline, isCancelled)
+        try {
+            while (true) {
+                checkCancelled(isCancelled)
+                // 复用同一条 lockdown 连接等待用户点「信任」：iOS 在弹窗未处理时对每次 Pair
+                // 都回 PairingDialogResponsePending。旧实现每轮都断开重连再发 Pair，会让 iOS
+                // 反复重弹「要信任此电脑吗」，并把建链线程占住数分钟（车机端表现为「正在配对」
+                // 假死）。这里保持连接、原地轮询，弹窗只出现一次。
+                if (channel == null) {
+                    val connection = host.connect(
+                        destinationPort = Iap2UsbMuxHost.LOCKDOWN_PORT,
+                        timeoutMillis = stepTimeoutMillis(deadline),
+                    )
+                    val newChannel = LockdownPlistChannel(connection)
+                    try {
+                        setUntrustedHostBuid(newChannel, label, systemBuid, deadline, isCancelled)
+                    } catch (error: Throwable) {
+                        runCatching { newChannel.close() }
+                        throw error
+                    }
+                    channel = newChannel
+                }
+                val active = channel ?: continue
                 val record = pairRecord ?: generatePairRecord(
-                    channel = channel,
+                    channel = active,
                     label = label,
                     hostId = hostId,
                     systemBuid = systemBuid,
@@ -67,21 +80,34 @@ class LockdownPairingClient(
                             "hostCert=${it.hostCertificatePem.size} rootCert=${it.rootCertificatePem.size}",
                     )
                 }
+                attempt += 1
                 Log.i(TAG, "lockdown pair attempt=$attempt")
-                val response = channel.request(pairRequest(label, record), stepTimeoutMillis(deadline))
+                val response = try {
+                    active.request(pairRequest(label, record), stepTimeoutMillis(deadline))
+                } catch (error: IphoneUsbException) {
+                    // 连接被 iPhone 侧重置/关闭（拔插、锁屏、超时）：丢弃本连接，退避后重连。
+                    // pairRecord 已缓存，重连时复用同一套主机密钥/证书，iPhone 不会把它当成
+                    // 一台新电脑而重新弹窗。
+                    Log.i(TAG, "lockdown pair connection lost at attempt=$attempt: ${error.message}")
+                    channel = null
+                    runCatching { active.close() }
+                    waitForRetry(deadline, isCancelled)
+                    continue
+                }
                 checkCancelled(isCancelled)
                 when (val error = response.errorCodeOrNull()) {
                     null -> return PairedRecord(record, response.entries["EscrowBag"].asOptionalData())
-                    "PairingDialogResponsePending" -> pending = true
+                    "PairingDialogResponsePending" -> {
+                        Log.i(TAG, "lockdown trust dialog pending; keeping connection and polling")
+                        waitForRetry(deadline, isCancelled)
+                    }
                     "UserDeniedPairing" -> throw LockdownPairingException.UserDeniedPairing
                     "PasswordProtected" -> throw LockdownPairingException.PasswordProtected
                     else -> throw LockdownPairingException.RemoteError(error)
                 }
             }
-            if (pending) {
-                Log.i(TAG, "lockdown trust pending; reconnecting before retry")
-                waitForRetry(deadline, isCancelled)
-            }
+        } finally {
+            runCatching { channel?.close() }
         }
     }
 

@@ -2,6 +2,7 @@ package com.shilapi.diplay.lite
 
 import android.app.Application
 import android.os.Environment
+import android.util.Log
 import com.shilapi.xcertplay.diag.CarPlayStageLog
 import com.shilapi.xcertplay.diag.boundedTrace
 import com.shilapi.xcertplay.network.NetworkFamilyGuard
@@ -49,9 +50,12 @@ class LiteApp : Application() {
             LiteLog.flushNow()
             previous?.uncaughtException(thread, throwable)
         }
+        // vc325（DIAG-318-02）：设备码实例码要读 SharedPreferences，必须在任何 DeviceCode 调用之前
+        // 注入 applicationContext（本行早于下方 versionName / 设备码日志）。
+        DeviceCode.initialize(this)
         LiteLog.log("app", "DiPlay Lite 进程启动 versionName=${packageManager.getPackageInfo(packageName, 0).versionName}")
         // 本地日志也带归机码：用户直接拷日志时同样能分辨来自哪台机器。
-        // 设备码是明文蓝牙 MAC + ROM 指纹（VC250-02）；describe 在取不到 MAC 时写明 unknown 的具体原因。
+        // 设备码 = ROM 指纹 + 8 位安装实例码（vc325，已去蓝牙 MAC）。
         LiteLog.log("app", "设备码 ${DeviceCode.describe()}")
         // vc262：启动自检一次「本机地址族能力」，后续选址/广播只查缓存结论。
         LiteLog.log("app", "网络族自检 ${NetworkFamilyGuard.selfCheckAtStartup().describe()}")
@@ -66,6 +70,14 @@ class LiteApp : Application() {
             val dir = File(external, "DiPlayLite")
             if (dir.mkdirs() || dir.isDirectory) return dir
         }
-        return getExternalFilesDir(null) ?: File(filesDir, "logs")
+        val fallback = getExternalFilesDir(null) ?: File(filesDir, "logs")
+        // vc318（LOG-318-01）：降级必须 logcat 留痕。151421 实证：sdcard 短暂未挂载时
+        // 降级到内部目录，日志照写 332KB，但现场只去 /sdcard/DiPlayLite/ 找 → 误判"日志停写"。
+        Log.w(
+            "LiteApp",
+            "外部存储不可用 state=${Environment.getExternalStorageState()}，" +
+                "日志降级到 ${fallback.absolutePath}",
+        )
+        return fallback
     }
 }

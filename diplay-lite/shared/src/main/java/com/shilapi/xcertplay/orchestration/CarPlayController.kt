@@ -53,6 +53,7 @@ import com.shilapi.xcertplay.network.WiredBonjourAdvertiser
 import com.shilapi.xcertplay.network.WiredMdnsResponder
 import com.shilapi.xcertplay.network.WiredNcmGuard
 import com.shilapi.xcertplay.network.WiredVpnService
+import com.shilapi.xcertplay.network.WirelessHotspotBackend
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import com.shilapi.xcertplay.network.WirelessHotspotManager
 import com.shilapi.xcertplay.network.diagnosticSummary
@@ -99,6 +100,7 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.util.ArrayDeque
+import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -820,7 +822,9 @@ class CarPlayController(
                 }
             } ?: return
             try {
-                session.sendTouch(next.contacts)
+                // vc327：出队等待 = 入队 → 被发送泵取出的耗时，随触点一起下传做分段统计。
+                val queueWaitNs = System.nanoTime() - next.enqueuedNs
+                session.sendTouch(next.contacts, next.sticky, queueWaitNs)
                 synchronized(touchLock) { touchSentCount++ }
             } catch (error: Exception) {
                 debugLog("touch send failed", error)
@@ -2780,16 +2784,33 @@ class CarPlayController(
     private fun startWirelessHotspot(generation: Int): WirelessHotspotInfo {
         // M6k24（C 方案）：上轮未建流 EOF 重启保留的热点附着仍健康 → 直接复用，
         // 跳过重新附着（最慢一步），iPhone 也不掉网、TCP 重试即刻可达。
+        // vc328（HOT-313-01）：复用前只对 MANUAL 热点做地址有效性三态检查——旧 IP 已不在
+        // 原接口时丢弃句柄走重取，避免 bind 7100 撞 EADDRNOTAVAIL；其余后端一律原样复用。
         retainedHotspot?.let { (manager, info) ->
-            retainedHotspot = null
-            hotspot = manager
-            lastHotspotInfo = info
-            debugLog(
-                "wireless hotspot reused from previous generation ssid=${info.ssid} " +
-                    "host=${info.hostAddress?.let(::hostAddressText) ?: "unknown"}",
-            )
-            observeHotspotIdentity("reuse", generation, info)
-            return info
+            val addrValid = if (info.backend == WirelessHotspotBackend.MANUAL_HOTSPOT) {
+                hotspotAddressValidity(info)
+            } else {
+                "unknown" // 非 MANUAL 后端不检查（未检查 ≠ 失败）
+            }
+            if (addrValid == "stale") {
+                retainedHotspot = null
+                // 不打印 addr=：hostAddressText 仍返回完整 IP 且地址不可用时会抛异常。
+                debugLog(
+                    "wireless hotspot reuse dropped: stale address gen=$generation " +
+                        "iface=${info.interfaceName ?: "unknown"} addrValid=stale",
+                )
+                closeBestEffort("stale wireless hotspot") { manager.close() }
+            } else {
+                retainedHotspot = null
+                hotspot = manager
+                lastHotspotInfo = info
+                debugLog(
+                    "wireless hotspot reused from previous generation ssid=${info.ssid} " +
+                        "host=${info.hostAddress?.let(::hostAddressText) ?: "unknown"}",
+                )
+                observeHotspotIdentity("reuse", generation, info, addrValid)
+                return info
+            }
         }
         val hotspotMode = config.wirelessHotspotMode
         // vc157：Wi-Fi Direct 升为一级模式——选此模式直接建 P2P GO，绕过 SoftAP 判死逻辑
@@ -2875,7 +2896,8 @@ class CarPlayController(
                     "backend=${info.backend}",
             )
             lastHotspotInfo = info
-            observeHotspotIdentity("fresh", generation, info)
+            // vc328：fresh 路径不做地址检查（未检查，传 unknown），检查只在 MANUAL 复用前。
+            observeHotspotIdentity("fresh", generation, info, "unknown")
             info
         } catch (failure: Exception) {
             if (hotspot === manager) hotspot = null
@@ -3369,7 +3391,8 @@ class CarPlayController(
                             "authenticated=${wirelessAuthenticated.get()} " +
                             "handoffRequested=${wirelessHandoffRequested.get()} " +
                             "tunnelReady=${wirelessTunnelReady.get()} " +
-                            "wifiConfigs=$wifiConfigs",
+                            // vc328（DIAG-300-01）：-1 是读取失败，显示 unknown；真实 0/正数照常。
+                            "wifiConfigs=${if (wifiConfigs < 0) "unknown" else wifiConfigs.toString()}",
                     )
                     try {
                         Thread.sleep(1_000L)
@@ -3479,6 +3502,32 @@ class CarPlayController(
             // 任何 ROM 差异/权限拒绝都不许影响建链。
             debugLog("staKick failed (non-fatal): ${error.message}")
         }
+    }
+
+    /**
+     * vc328（HOT-313-01）：热点旧地址三态判定——**只查 [WirelessHotspotInfo.interfaceName] 指定的原接口**，
+     * 不做全接口扫描；只用 API1 接口（`getByName` / `inetAddresses` / `Collections.list`）。
+     *
+     * - `stale`：原接口明确消失，或读取成功但旧 IP 已不在该接口（此时必须丢弃句柄重取）；
+     * - `unknown`：接口名缺失 / 无旧 IP / 读取或枚举异常——**沿用原复用路径，不判失败**；
+     * - `valid`：旧 IP 仍在原接口。
+     */
+    private fun hotspotAddressValidity(info: WirelessHotspotInfo): String {
+        val iface = info.interfaceName ?: return "unknown"
+        val target = info.hostAddress ?: return "unknown"
+        val ni = try {
+            NetworkInterface.getByName(iface)
+        } catch (t: Throwable) {
+            debugLog("hotspot addr check read failed iface=$iface err=${t.javaClass.simpleName}")
+            return "unknown"
+        } ?: return "stale"
+        val addrs = try {
+            Collections.list(ni.inetAddresses)
+        } catch (t: Throwable) {
+            debugLog("hotspot addr check enum failed iface=$iface err=${t.javaClass.simpleName}")
+            return "unknown"
+        }
+        return if (addrs.any { it == target }) "valid" else "stale"
     }
 
     @Suppress("DEPRECATION")
@@ -5509,14 +5558,20 @@ class CarPlayController(
      * 已知盲区：只走 EUI-64 反解（hardwareAddress 被 ROM 屏蔽时唯一可用路径），
      * 若某机型 hardwareAddress 可读而 IPv6 非 EUI-64，会出现 observed=unknown —— 属预期，不要改。
      */
-    private fun observeHotspotIdentity(source: String, generation: Int, info: WirelessHotspotInfo) {
+    private fun observeHotspotIdentity(
+        source: String,
+        generation: Int,
+        info: WirelessHotspotInfo,
+        addrValid: String,
+    ) {
         val observed = HotspotInterfaceBssid.read(info.interfaceName)
         val issued = info.bssid
         val changed = observed != null && issued != null && !observed.equals(issued, ignoreCase = true)
         debugLog(
             "hotspot identity source=$source gen=$generation " +
                 "iface=${info.interfaceName ?: "unknown"} " +
-                "issued=${issued ?: "unknown"} observed=${observed ?: "unknown"} changed=$changed",
+                "issued=${issued ?: "unknown"} observed=${observed ?: "unknown"} changed=$changed" +
+                " addrValid=$addrValid",
         )
         startHotspotLivenessSampler(generation, info.interfaceName)
     }
@@ -5929,7 +5984,12 @@ class CarPlayController(
     }
 
     /** M6k：排队中的一条触摸事件。[sticky] 标记它是否代表触点状态变化（不可被 MOVE 覆盖）。 */
-    private class PendingTouch(val contacts: List<AirPlayContact>, val sticky: Boolean)
+    private class PendingTouch(
+        val contacts: List<AirPlayContact>,
+        val sticky: Boolean,
+        // vc327：入队时刻（只增字段），用于出队等待计时。
+        val enqueuedNs: Long = System.nanoTime(),
+    )
 
     companion object {
         /** vc267：进程级 warm 时刻（每次连接会新建 controller，实例字段跨会话会丢）。 */

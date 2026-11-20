@@ -30,6 +30,9 @@ import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 object UsbBtStandby {
     private const val TAG = UsbBtSession.TAG
 
+    /** vc319（BT-318-01）：配对持久化 prefs 名。与 SharedPrefsPairingStore 共用，禁再写第二份字面量。 */
+    internal const val PAIRING_PREFS = "usbbt_pairing"
+
     /** 单轮常驻广播里「等 iPhone 回连」的窗口（长窗口，避免反复重开 dongle）。vc206 起 public：弹层倒计时总时长读它。 */
     const val LINK_WINDOW_MILLIS = 10 * 60_000L
 
@@ -350,6 +353,25 @@ object UsbBtStandby {
 
     /** vc206：已配对设备只读快照（UI 列表数据源；不暴露可变 map）。 */
     fun pairedDevices(): List<PairedDevice> = UsbBtHost.pairedDevicesSnapshot()
+
+    /**
+     * vc319（BT-318-01 方案B）：磁盘上是否已有配对记忆。
+     *
+     * **不启动 standby、不碰 dongle、零 binder** —— 只读 prefs，主线程可调。
+     * 判据必须与 SharedPrefsPairingStore.loadAll() 一致：`key_*` 且值为 32 位 hex（16 字节）；
+     * 只看 key 存在会把非法残留误判成「已配对」。
+     *
+     * 为什么要它：pairStateSnapshot 冷启恒 UNPAIRED（restorePairing 只在 start() 链里跑），
+     * 而本函数的调用场景正是「standby 尚未启动」，拿快照判会永远 false。
+     */
+    fun hasSavedPairing(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PAIRING_PREFS, Context.MODE_PRIVATE)
+        for ((k, v) in prefs.all) {
+            if (!k.startsWith("key_") || v !is String) continue
+            if (v.length == 32) return true
+        }
+        return false
+    }
 
     /** vc206：清除配对 —— 删全部 link key + PairState 回 UNPAIRED。 */
     fun clearPairing() = UsbBtHost.clearPairing()

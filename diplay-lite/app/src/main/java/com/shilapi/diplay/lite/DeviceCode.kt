@@ -1,45 +1,45 @@
 package com.shilapi.diplay.lite
 
-import android.bluetooth.BluetoothAdapter
+import android.content.Context
 import android.os.Build
 import java.util.Locale
+import java.util.UUID
 
 /**
- * 设备唯一码：**明文蓝牙 MAC + ROM 指纹**，用于「这台机器是谁」的日志归机与用户报号。
+ * 设备码：**ROM 指纹 + 8 位安装实例码**，用于「这台机器是谁」的日志归机与用户报号。
  *
- * 格式（2026-11-07，VC250-02 拍板）：
+ * vc325（DIAG-318-02）起格式（去 MAC）：
  * ```
- * 22-22-0B-E8-E6-92-t3p1-20181203
- * │────────── MAC 段 ──────────│ └ROM 指纹┘
+ * t3p1-eng442kot49h201-a1b2c3d8
+ * │───── ROM 指纹段（原算法冻结）─────│ └实例码┘
  * ```
- * - MAC 段：大写、**横杠分隔**的蓝牙 MAC（12 位十六进制）。
- * - ROM 段：优先 `ro.build.display.id`（[Build.DISPLAY]），取不到退
- *   `ro.build.version.incremental`（[Build.VERSION.INCREMENTAL]），都取不到为 [UNKNOWN]。
- *   原串转小写、去掉 `a-z0-9-` 之外的字符（空格/下划线/斜杠等）、连续横杠压成一个，
- *   再截断到 [ROM_FINGERPRINT_MAX] 字符；同一台机器每次结果一致。
+ * - ROM 段：算法与长度与 vc250~324 完全一致（见 [romFingerprint]），保留它是为了新旧日志
+ *   能用子串匹配对账——改算法/改长度会断掉 vc250~324 老日志的桥。
+ * - 实例码：8 位十六进制小写，安装实例 ID，存 SharedPreferences，同一安装跨日志稳定。
  * - 整串不含 `:`、`#`、空格、`/`，可直接进日志头、日志文件名与剪贴板。
  *
- * 为什么加 ROM 指纹：vc249 起设备码是明文 MAC，但实机日志汇总发现 P1/T3 平台出厂 MAC
- * 是 `22:22:*` 这类固定值，多台车机完全相同（`22:22:0B:E8:E6:92` 同时对应 1024×500 与
- * 1280×720 两台不同机器），只靠 MAC 会让日志仓库里两台机器共用一个设备码。ROM 指纹是
- * 同一固件版本的稳定值，正好用来区分同 MAC 的不同机器。
+ * 为什么去掉 MAC 段（vc325，用户 2026-11-18 08:54 拍板）：
+ * P1/T3 平台出厂 MAC 是 `22:22:*` 这类固定值，多台车机完全相同；明文 MAC 既不能唯一归机，
+ * 又让上传件/剪贴板长期携带蓝牙地址。去 MAC 后由实例码承担「同一安装可追踪」，
+ * 由 ROM 段承担「同一型号可参考」。
  *
- * 兼容：vc249 的老日志只有纯 MAC（冒号分隔、无指纹），对账时按 MAC 前缀匹配即可；
- * 历史日志不做改写。[LogRedactor] 的 `DEVICE_CODE_MARK` 同时认新旧两种写法。
+ * 三条语义边界（用户原话，禁止自行扩大解释）：
+ * 1. **同型≠同机**：同分辨率 + 同 ROM = 同一「型」设备，日志可互相参考；不得当作物理唯一性
+ *    对账（btMac 已因同类误判被机型总表 §1 降级）。
+ * 2. **实例码 = 安装实例 ID**：刷机 / 卸载重装 / 恢复出厂后换新码是**预期行为、非缺陷**；
+ *    它只保证「同一安装跨日志稳定可追踪」，对不上任何出厂清单。
+ * 3. **实例码不用于对账**：与已否决的「哈希兜底」语义不同——哈希兜底想冒充物理号
+ *    （对不上清单 = 假号码，已否），实例码明确只做实例追踪。
  *
- * 取不到 MAC 时的降级（**不使用哈希兜底**，用户已否）：MAC 段写 [UNKNOWN]，整串仍是
- * `unknown-<ROM 指纹>`，并在 [describe] 里写明具体原因（无适配器 / 权限拒绝 / 占位地址 /
- * 格式非法）。理由：明文方案的价值是「拿这串数直接对账」，哈希兜底值对不上任何清单，
- * 等于制造一个无法核对的假号码。
- * ROM 取不到时同理降级为 `22-22-0B-E8-E6-92-unknown`。
- * 已知会取不到 MAC 的真实场景：API 31+ 未授予 BLUETOOTH_CONNECT（`getAddress` 抛
- * SecurityException）；Android 6+ 对普通应用返回占位地址 `02:00:00:00:00:00`。
- * 不新增权限：复用 Manifest 里已有的 BLUETOOTH / BLUETOOTH_CONNECT。
+ * 兼容：vc249 老日志是冒号纯 MAC；vc250~324 是「横杠 MAC + ROM 段」；vc325 起是「ROM 段 +
+ * 实例码」。三代都能靠 ROM 段子串对账，[LogRedactor] 的 `DEVICE_CODE_MARK` 同时认三种写法。
+ *
+ * 不新增权限：本版不再读蓝牙地址，Manifest 不变。
  */
 object DeviceCode {
     const val UNKNOWN = "unknown"
 
-    /** ROM 指纹长度上限：足够区分固件版本，又不让文件名过长。 */
+    /** 冻结：新旧日志靠本段做子串匹配对账（DIAG-318-02 vc325），禁止修改算法/长度。 */
     private const val ROM_FINGERPRINT_MAX = 20
 
     /** 归一化只保留 `a-z0-9` 与横杠：横杠是 ROM 短形里的分隔符（如 `t3p1-20181203`），其余一律去掉。 */
@@ -48,71 +48,88 @@ object DeviceCode {
     /** 连续横杠压成一个，避免 `T3P1 - 20181203` 这类原串产生 `--`。 */
     private val ROM_DASH_RUN = Regex("-{2,}")
 
-    /** 设备码本体：`22-22-0B-E8-E6-92-t3p1-20181203` / `unknown-<ROM 指纹>`。 */
-    fun of(): String = resolve().code
+    /** vc325：安装实例码持久化位置（独立 SP，卸载即清，符合「安装实例」语义）。 */
+    private const val PREFS_NAME = "diplay_device"
+    private const val KEY_INSTANCE_ID = "install_instance_id"
+
+    /** 合法实例码：8 位十六进制小写。 */
+    private val INSTANCE_ID_PATTERN = Regex("[0-9a-f]{8}")
+
+    /** vc325：首次生成实例码的并发保护（LiteApp.onCreate 与 UI 首帧可能同时触发）。 */
+    private val INSTANCE_LOCK = Any()
+
+    @Volatile
+    private var appContext: Context? = null
+
+    /** 是否已注入 applicationContext（[initialize]）。 */
+    @Volatile
+    var initialized: Boolean = false
+        private set
+
+    @Volatile
+    private var cachedInstanceId: String? = null
+
+    /** 未 initialize 时的临时实例码（仅防御，正常路径不会走到；同一进程内保持稳定）。 */
+    @Volatile
+    private var ephemeralInstanceId: String? = null
+
+    @Volatile
+    private var warnedNotInitialized = false
 
     /**
-     * `22-22-0B-E8-E6-92-t3p1-20181203（bt=ok）` /
-     * `unknown-t3p1-20181203（bt=miss: <原因>）`：启动日志标明降级原因。
+     * vc325：注入 applicationContext。**只存引用，不生成实例码**——首次 [of] 惰性生成，
+     * 保证「读 SP → 生成 → 落盘」只发生在真正需要设备码的那一刻。
      */
-    fun describe(): String {
-        val resolved = resolve()
-        return if (resolved.macKnown) {
-            "${resolved.code}（bt=ok）"
-        } else {
-            "${resolved.code}（bt=miss: ${resolved.reason}）"
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
+        initialized = true
+    }
+
+    /** 设备码本体：`t3p1-eng442kot49h201-a1b2c3d8`。 */
+    fun of(): String = romFingerprint() + "-" + instanceId()
+
+    /** vc325 起去 MAC，不再有 `unknown-` / `（bt=ok）` 降级分支；保留签名供既有调用点使用。 */
+    fun describe(): String = of()
+
+    /**
+     * 8 位十六进制实例码：读 SP → 合法直接用 → 否则生成、写入（apply）、内存缓存。
+     * 整段 synchronized：同一进程内只生成一次（Concurrent 首调不会写出两个码）。
+     */
+    private fun instanceId(): String {
+        cachedInstanceId?.let { return it }
+        synchronized(INSTANCE_LOCK) {
+            cachedInstanceId?.let { return it }
+            val context = appContext
+            if (context == null) {
+                val ephemeral = ephemeralInstanceId ?: newInstanceId().also { ephemeralInstanceId = it }
+                if (!warnedNotInitialized) {
+                    warnedNotInitialized = true
+                    LiteLog.log("app", "DeviceCode warn: not initialized, ephemeral instance id")
+                }
+                return ephemeral
+            }
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val saved = prefs.getString(KEY_INSTANCE_ID, null)
+            val instance = if (saved != null && INSTANCE_ID_PATTERN.matches(saved)) {
+                saved
+            } else {
+                newInstanceId().also { prefs.edit().putString(KEY_INSTANCE_ID, it).apply() }
+            }
+            cachedInstanceId = instance
+            return instance
         }
     }
 
-    private class Resolved(val code: String, val macKnown: Boolean, val reason: String)
-
-    private fun resolve(): Resolved {
-        val fingerprint = romFingerprint()
-        val adapter = try {
-            BluetoothAdapter.getDefaultAdapter()
-        } catch (error: Exception) {
-            return Resolved("$UNKNOWN-$fingerprint", false, "BT adapter exception ${error.javaClass.simpleName}")
-        } ?: return Resolved("$UNKNOWN-$fingerprint", false, "no BT adapter")
-
-        val raw = try {
-            adapter.address
-        } catch (error: SecurityException) {
-            return Resolved(
-                "$UNKNOWN-$fingerprint",
-                false,
-                "BT address denied (BLUETOOTH_CONNECT not granted)",
-            )
-        } catch (error: Exception) {
-            return Resolved(
-                "$UNKNOWN-$fingerprint",
-                false,
-                "BT address exception ${error.javaClass.simpleName}",
-            )
-        }.orEmpty().trim()
-
-        val hex = raw.replace(":", "").replace("-", "").uppercase(Locale.US)
-        if (hex.isEmpty()) return Resolved("$UNKNOWN-$fingerprint", false, "BT address empty")
-        if (hex.length != 12 || !hex.all { it in '0'..'9' || it in 'A'..'F' }) {
-            return Resolved("$UNKNOWN-$fingerprint", false, "BT address malformed '$raw'")
-        }
-        if (hex.all { it == '0' }) {
-            return Resolved("$UNKNOWN-$fingerprint", false, "BT address all-zero")
-        }
-        if (hex == "020000000000") {
-            return Resolved(
-                "$UNKNOWN-$fingerprint",
-                false,
-                "BT address placeholder 02:00:00:00:00:00",
-            )
-        }
-        return Resolved(hex.chunked(2).joinToString("-") + "-" + fingerprint, true, "ok")
-    }
+    private fun newInstanceId(): String = UUID.randomUUID().toString().replace("-", "").take(8)
 
     /**
      * ROM 指纹：`Build.DISPLAY` → `Build.VERSION.INCREMENTAL` → [UNKNOWN]。
      * 转小写 → 去掉 `a-z0-9-` 之外的字符（空格/下划线/斜杠等）→ 连续横杠压成一个 →
      * 去掉首尾横杠 → 截断到 [ROM_FINGERPRINT_MAX]。全程无随机因素，同一台机器每次结果一致。
      * 例：`T3P1-20181203` → `t3p1-20181203`；`T3P1_20181203` → `t3p120181203`。
+     *
+     * 冻结：本函数与 [ROM_FINGERPRINT_MAX] 是 vc250~324 与 vc325 之后日志的对账桥，
+     * 任何算法/长度改动都会让老日志无法子串命中（DIAG-318-02 vc325）。
      */
     private fun romFingerprint(): String {
         val display = runCatching { Build.DISPLAY }.getOrNull().orEmpty()

@@ -112,6 +112,14 @@ internal class VideoStats(
         val runtime = Runtime.getRuntime()
         val heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
         val heapMaxMb = runtime.maxMemory() / (1024 * 1024)
+        // vc327：分段聚合只由主视频窗口整组读清；副流各持一个 logIfDue，读了会提前清掉主窗口更新。
+        val phases = if (label.isEmpty()) TouchLatencyProbe.readAndResetPhases() else null
+        val sentN = phases?.sentSamples ?: 0
+        val slowN = phases?.slowCount ?: 0
+        val qWaitMs = (phases?.queueWaitMaxNs ?: 0L) / 1_000_000
+        val lockWaitMs = (phases?.lockWaitMaxNs ?: 0L) / 1_000_000
+        val postLockMs = (phases?.postLockMaxNs ?: 0L) / 1_000_000
+        val sockWriteMs = (phases?.socketWriteMaxNs ?: 0L) / 1_000_000
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
             "backlog=%d stalled=%d flush=%d superseded=%d dueGated=%d " +
             "pendingDepthPeak=%d maxHoldMs=%d decodeAvg=%dms decodeMax=%dms " +
@@ -122,7 +130,10 @@ internal class VideoStats(
             pendingDepthPeak, maxHoldMs, decodeAvgMs, maxDecodeNs / 1_000_000,
             heapUsedMb, heapMaxMb,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
-        ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?")
+        ) + " " + (processLoad.sample(now) ?: "cpu=? threads=?") +
+            " touchSentN=$sentN touchSlowN=$slowN touchQWaitMax=${qWaitMs}ms " +
+            "touchLockWaitMax=${lockWaitMs}ms touchPostLockMax=${postLockMs}ms " +
+            "touchSockWriteMax=${sockWriteMs}ms"
         TouchLatencyProbe.maxSendNs = 0
         Log.i(TAG, line)
         windowStartNs = now

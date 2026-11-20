@@ -2,7 +2,10 @@ package com.shilapi.diplay.lite
 
 import com.shilapi.xcertplay.root.SuShell
 import java.io.File
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * vc96：有线会话 root 诊断探针——内核级 USB 取证。
@@ -31,59 +34,159 @@ internal object WiredUsbForensics {
     /** vc97⑤：内核时间戳提取（形如 [ 248.509207]，含 dmesg -t 无前缀格式兜底）。 */
     private val TS_PATTERN = Regex("\\[\\s*(\\d+\\.\\d+)\\]")
 
+    /** vc326：未退出后台任务上限（含卡在 API16 `Process.destroy()` 的滞留任务）。 */
+    private const val MAX_LIVE_TASKS = 2
+
     private val running = AtomicBoolean(false)
-    private var thread: Thread? = null
+
+    /** vc326：任务代次——`stop()` 时 +1，使全部在途任务立即过期（不依赖 interrupt 成功）。 */
+    private val epoch = AtomicLong(0L)
+
+    /** vc326：当前未退出任务数（含滞留任务）。 */
+    private val liveTasks = AtomicInteger(0)
+
+    /** vc326：在途线程（快照遍历，用于尽力 interrupt）。 */
+    private val threads = Collections.synchronizedList(mutableListOf<Thread>())
+
+    /**
+     * vc326（40b §1.4）：状态跃迁临界区——`running` / `epoch` / `liveTasks` 的组合读写必须原子，
+     * 否则 stop 与 start 交错会丢新会话探针（窗口 A/B/C）。
+     * **慢调用（suExec/dmesg/sleep）一律在锁外**，否则重演 ANR。
+     */
+    private val stateLock = Any()
+
+    @Volatile
     private var suOk = false
 
-    /** 会话建立时调用：root 可用则启动增量探针；重复调用幂等。 */
-    fun start(report: (String) -> Unit = { LiteLog.log(TAG, it) }) {
-        if (!running.compareAndSet(false, true)) return
-        // su 探测：5s 超时（防 su 弹框挂死），失败即静默关闭
-        val id = suExec("id")
-        suOk = id.contains("uid=0")
-        if (!suOk) {
-            report("probe disabled: su unavailable")
-            running.set(false)
+    /**
+     * 会话建立时调用：仅有线通道启动增量探针；重复调用幂等。
+     *
+     * vc326（C8815/API16 ANR）：su 探测与 dmesg 轮询全部移入后台线程。原实现把
+     * `suExec("id")` 放在调用线程（= 服务主线程），API16 上 `SuShell` 超时后的
+     * `Process.destroy()` 会等 `sushell-out` 输出流锁，直接把会话启动卡成 ANR。
+     */
+    fun start(
+        onlyUsb: Boolean,
+        slowSuMillis: Long = 0L,
+        report: (String) -> Unit = { LiteLog.log(TAG, it) },
+    ) {
+        if (!onlyUsb) {
+            report("probe skipped: channel not usb")
             return
         }
-        report("probe started (dmesg usb filter every ${POLL_INTERVAL_MILLIS / 1000}s)")
-        thread = Thread({
-            // vc97⑤：内核时间戳增量去重——旧 lastLine 尾行匹配在部分 ROM（T3 实锤）上
-            // 因输出顺序/格式抖动匹配失败，每拍全量重放启动期行（212K 日志中 263 行全是
-            // 0.x 秒老行）。dmesg 时间戳单调递增，按 [sec.millis] 维护水位：ts ≤ 水位丢弃。
-            var maxTsMillis = -1.0
-            var polls = 0
-            while (running.get()) {
-                try {
-                    val dmesg = suExec("dmesg")
-                    if (dmesg.isNotEmpty()) {
-                        val fresh = dmesg.lines()
-                            .filter { it.isNotBlank() && Regex(DMESG_FILTER).containsMatchIn(it) }
-                            .filter { line ->
-                                val ts = TS_PATTERN.find(line)?.groupValues?.get(1)?.toDoubleOrNull()
-                                if (ts == null) return@filter true
-                                if (ts <= maxTsMillis) return@filter false
-                                maxTsMillis = ts
-                                true
-                            }
-                        if (fresh.isNotEmpty()) {
-                            fresh.take(60).forEach { report("dmesg: ${it.trim()}") }
-                            if (fresh.size > 60) report("dmesg: ... ${fresh.size - 60} more lines suppressed")
-                        }
+        // vc326：running 幂等门 → liveTasks 上限 → epoch++ → liveTasks++ 必须整体原子（40b 窗口 A/B/C）。
+        val myEpoch = synchronized(stateLock) {
+            if (!running.compareAndSet(false, true)) return
+            if (liveTasks.get() >= MAX_LIVE_TASKS) { // 防堆积：旧任务卡住不无限新建
+                running.set(false)
+                return@synchronized -1L
+            }
+            liveTasks.incrementAndGet()
+            epoch.incrementAndGet()
+        }
+        if (myEpoch < 0L) {
+            report("probe skipped: too many live tasks")
+            return
+        }
+        val worker = Thread({
+            var stale = false
+            try {
+                if (slowSuMillis > 0L) {
+                    // vc326：门② 慢 su 注入（仅 DEBUG 测试入口会传非 0），模拟 su 卡住；
+                    // 仍在后台线程、锁外，验证主线程与会话不被阻塞。
+                    try {
+                        Thread.sleep(slowSuMillis)
+                    } catch (_: InterruptedException) {
+                        return@Thread
                     }
-                    polls++
-                    // 每 30 轮（约 1 分钟）心跳一次，确认探针活着（环形缓冲全 USB 静默时 dmesg 无新增行）
-                    if (polls % 30 == 0) report("heartbeat polls=$polls")
-                } catch (error: Throwable) {
-                    report("poll error: ${error.javaClass.simpleName}: ${error.message}")
                 }
-                try {
-                    Thread.sleep(POLL_INTERVAL_MILLIS)
-                } catch (_: InterruptedException) {
+                // su 探测：5s 超时（防 su 弹框挂死），失败即静默关闭。慢 su 只可能卡在本后台线程。
+                val id = suExec("id")
+                val rootGranted = synchronized(stateLock) {
+                    if (myEpoch != epoch.get()) {
+                        stale = true
+                        false
+                    } else {
+                        suOk = id.contains("uid=0")
+                        suOk
+                    }
+                }
+                if (stale) return@Thread
+                if (!rootGranted) {
+                    report("probe disabled: su unavailable")
                     return@Thread
                 }
+                if (myEpoch != epoch.get()) {
+                    stale = true
+                    return@Thread
+                }
+                report("probe started (epoch=$myEpoch dmesg usb filter every ${POLL_INTERVAL_MILLIS / 1000}s)")
+                // vc97⑤：内核时间戳增量去重——旧 lastLine 尾行匹配在部分 ROM（T3 实锤）上
+                // 因输出顺序/格式抖动匹配失败，每拍全量重放启动期行（212K 日志中 263 行全是
+                // 0.x 秒老行）。dmesg 时间戳单调递增，按 [sec.millis] 维护水位：ts ≤ 水位丢弃。
+                var maxTsMillis = -1.0
+                var polls = 0
+                while (running.get() && myEpoch == epoch.get()) {
+                    try {
+                        val dmesg = suExec("dmesg")
+                        if (myEpoch != epoch.get()) {
+                            stale = true
+                            break
+                        }
+                        if (dmesg.isNotEmpty()) {
+                            val fresh = dmesg.lines()
+                                .filter { it.isNotBlank() && Regex(DMESG_FILTER).containsMatchIn(it) }
+                                .filter { line ->
+                                    val ts = TS_PATTERN.find(line)?.groupValues?.get(1)?.toDoubleOrNull()
+                                    if (ts == null) return@filter true
+                                    if (ts <= maxTsMillis) return@filter false
+                                    maxTsMillis = ts
+                                    true
+                                }
+                            if (fresh.isNotEmpty()) {
+                                if (myEpoch != epoch.get()) {
+                                    stale = true
+                                    break
+                                }
+                                fresh.take(60).forEach { report("dmesg: ${it.trim()}") }
+                                if (fresh.size > 60) report("dmesg: ... ${fresh.size - 60} more lines suppressed")
+                            }
+                        }
+                        polls++
+                        // 每 30 轮（约 1 分钟）心跳一次，确认探针活着（环形缓冲全 USB 静默时 dmesg 无新增行）
+                        if (polls % 30 == 0) {
+                            if (myEpoch != epoch.get()) {
+                                stale = true
+                                break
+                            }
+                            report("heartbeat polls=$polls")
+                        }
+                    } catch (error: Throwable) {
+                        if (myEpoch == epoch.get()) report("poll error: ${error.javaClass.simpleName}: ${error.message}")
+                    }
+                    try {
+                        Thread.sleep(POLL_INTERVAL_MILLIS)
+                    } catch (_: InterruptedException) {
+                        return@Thread
+                    }
+                }
+            } finally {
+                synchronized(stateLock) {
+                    // 关键：旧代次任务迟到返回，不得清掉新一代的 running/suOk（40b 窗口 A/C）。
+                    if (myEpoch == epoch.get()) {
+                        suOk = false
+                        running.set(false)
+                    }
+                    // liveTasks 语义：**未退出任务数（含滞留）**。每个任务在 start 时只 +1 一次，
+                    // 故这里无条件 -1 释放的是自己的名额，永远不会误减新一代任务的名额。
+                    liveTasks.decrementAndGet()
+                    threads.remove(Thread.currentThread())
+                }
+                if (stale) report("probe stale task exited epoch=$myEpoch")
             }
-        }, "usbfx-dmesg").apply { isDaemon = true; start() }
+        }, "usbfx-boot-$myEpoch").apply { isDaemon = true }
+        threads.add(worker)
+        worker.start()
     }
 
     /** 断链/wedge 事件时调用：抓 sysfs 设备树快照（拓扑+挂起态+驱动绑定）+ dmesg 尾部。 */
@@ -114,11 +217,16 @@ internal object WiredUsbForensics {
         }
     }
 
-    /** 会话 teardown 时调用：停探针线程。 */
+    /** 会话 teardown 时调用：使全部在途任务失效（不依赖 interrupt 成功）。 */
     fun stop() {
-        if (!running.getAndSet(false)) return
-        thread?.interrupt()
-        thread = null
+        // vc326：epoch++ 与 running=false 必须原子（40b 窗口 A），否则中间插入 start 会丢新探针。
+        val toInterrupt = synchronized(stateLock) {
+            epoch.incrementAndGet() // 关键：所有在途任务 myEpoch 立即过期
+            if (!running.getAndSet(false)) return // 非活跃周期：epoch 已 +1，过期仍生效
+            threads.toList() // 快照，避免与 finally 的 threads.remove 并发
+        }
+        // interrupt 仅加速 sleep 中的正常任务；卡在 API16 destroy 的线程打不断，但已因 epoch 过期被隔离
+        toInterrupt.forEach { it.interrupt() }
         LiteLog.log(TAG, "probe stopped")
     }
 

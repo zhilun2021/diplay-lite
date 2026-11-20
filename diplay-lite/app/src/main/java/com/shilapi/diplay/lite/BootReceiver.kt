@@ -1,5 +1,6 @@
 package com.shilapi.diplay.lite
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -48,7 +49,12 @@ class BootReceiver : BroadcastReceiver() {
                     )
                     LiteLog.log("boot", "开机自启：拉起主页（自启等待弹窗由主页接管）")
                 }
-                if (config.bootAutoBluetooth) ensureBluetoothOn()
+                // vc318（BT-302-01）：上电后蓝牙栈可能处于「SDP 可见但 RFCOMM 全灭」半死态
+                //（C8815 六轮实证：与谁拉蓝牙无关、66 分钟不自愈、复位必愈）。
+                // vc319（BOOT-318-01）：改为**仅勾选自启蓝牙时**才复位——不勾时蓝牙交给系统恢复，
+                // Lite 一律不碰（避免把本来正常的用户蓝牙打进 disable→enable 重建流程）；
+                // 同时迟到的 BOOT_COMPLETED（T3 实测比出画晚 52s）也不会再触发复位打死实时链路。
+                if (config.bootAutoBluetooth) ensureBluetoothReady(config.bootAutoBluetooth)
                 // STA/AP 互斥：勾了热点自启时热点流程会先关 Wi-Fi，Wi-Fi 自启让位。
                 if (config.bootAutoWifi && !config.bootAutoHotspot) ensureWifiOn(context)
                 if (config.bootAutoHotspot) ensureHotspotOn(context)
@@ -61,8 +67,16 @@ class BootReceiver : BroadcastReceiver() {
         }.start()
     }
 
-    /** 开启蓝牙并等待就绪（最长 20 秒）。部分 ROM 拒绝静默 enable()，记日志继续。 */
-    private fun ensureBluetoothOn() {
+    /**
+     * vc318（BT-302-01）：复位蓝牙并等待就绪（原 ensureBluetoothOn 的复位增强版）。
+     * 流程：disable（若已开）→ 等 STATE_OFF（最长 8s）→ enable → 等 STATE_ON（最长 20s）
+     * → 稳定期 10s（vc318 实证：enable 就绪后 secure 通道仍有约 2 轮 SDF 过渡期）。
+     * [alsoEnable]=false 时只复位不负责拉起（autoBt=false 场景，蓝牙由系统恢复，
+     * 复位后回到系统开启状态由 enable 步骤完成——disable 之后必须 enable，否则蓝牙没开）。
+     * minSdk16 红线核对：disable()/enable()/getState() 均 API16 可用公开方法。
+     */
+    @SuppressLint("MissingPermission") // vc318：BLUETOOTH_ADMIN/CONNECT 已在 Manifest 声明；目标机型 API16-19 走旧权限模型
+    private fun ensureBluetoothReady(alsoEnable: Boolean) {
         val adapter = try {
             BluetoothAdapter.getDefaultAdapter()
         } catch (error: Throwable) {
@@ -73,14 +87,45 @@ class BootReceiver : BroadcastReceiver() {
             LiteLog.log("boot", "蓝牙适配器不可用")
             return
         }
-        if (adapter.isEnabled) {
-            LiteLog.log("boot", "蓝牙已开启")
+        // ①复位：已开才 disable（未开没有复位对象，直接走 enable）
+        var disabled = false
+        if (adapter.state == BluetoothAdapter.STATE_ON) {
+            LiteLog.log("boot", "蓝牙复位开始（BT-302-01：上电半死态例行规避）")
+            val disableOk = try {
+                adapter.disable()
+            } catch (error: Throwable) {
+                LiteLog.log("boot", "蓝牙 disable() 调用失败（${error.javaClass.name}）: ${error.message}")
+                false
+            }
+            if (disableOk) {
+                var waitedOff = 0
+                while (waitedOff < 8_000 && adapter.state != BluetoothAdapter.STATE_OFF) {
+                    try {
+                        Thread.sleep(1_000)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    waitedOff += 1_000
+                }
+                disabled = adapter.state == BluetoothAdapter.STATE_OFF
+                LiteLog.log("boot", "蓝牙复位 disable 完成 waited=${waitedOff}ms off=$disabled")
+            } else {
+                LiteLog.log("boot", "蓝牙复位 disable 被拒绝（ROM 策略），继续拉起")
+            }
+        }
+        // ②拉起：autoBt=false 时也要 enable（disable 过必须拉回来；没 disable 过且未开时同样拉起）
+        if (!alsoEnable && !disabled && adapter.state == BluetoothAdapter.STATE_ON) {
+            // 系统已恢复且本次未 disable：保持原 ensureBluetoothOn 的早退行为，但仍做稳定期
+            //（系统自恢复的栈正是半死高发场景，复位才是本次的主目的——此分支只在
+            // 「disable 被拒绝」时可达，稳定期照做，日志写明）。
+            LiteLog.log("boot", "蓝牙未复位（disable 被拒），仅等待稳定期")
+            stableSettle()
             return
         }
         val requested = try {
             adapter.enable()
         } catch (error: Throwable) {
-            LiteLog.log("boot", "蓝牙 enable() 调用失败: ${error.message}")
+            LiteLog.log("boot", "蓝牙 enable() 调用失败（${error.javaClass.name}）: ${error.message}")
             false
         }
         if (!requested) {
@@ -97,6 +142,16 @@ class BootReceiver : BroadcastReceiver() {
             waited += 1_000
         }
         LiteLog.log("boot", "蓝牙开启${if (adapter.isEnabled) "就绪" else "超时"} waited=${waited}ms")
+        if (adapter.isEnabled) stableSettle()
+    }
+
+    /** vc318：复位后稳定期（栈收敛，规避 secure 通道过渡期 SDF）。 */
+    private fun stableSettle() {
+        try {
+            Thread.sleep(10_000)
+        } catch (_: InterruptedException) {
+        }
+        LiteLog.log("boot", "蓝牙复位稳定期 done stableMs=10000")
     }
 
     /**

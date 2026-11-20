@@ -4,6 +4,7 @@ import android.util.Log
 import com.shilapi.xcertplay.diag.CarPlayStageLog
 import com.shilapi.xcertplay.diag.boundedTrace
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
+import com.shilapi.xcertplay.media.TouchLatencyProbe
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -108,7 +109,13 @@ class AirPlaySession(
     @Volatile private var presentationUri: String? = null
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
+    // vc327：首条触摸**完整报文**基准。sticky 事件始终完整打；普通 MOVE 只保留首条完整正文，
+    // 之后不再拼 bodyHex（降噪前提：不执行 toHex、不逐包写日志）。
+    private val firstTouchReportLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
+    // vc327：慢 MOVE 分段日志限频（同一 5s 窗口最多 3 条，防止慢事件风暴刷屏）。
+    private var slowTouchWindowStartNs = 0L
+    private var slowTouchWindowLogs = 0
     // vc250：会话建立（RECORD）即请求一次关键帧；无论成功与否都只试一次，
     // 不取代原有「stall / 恢复后请求」路径（部分接收端会丢弃首帧前的请求）。
     private val initialKeyFrameRequested = AtomicBoolean(false)
@@ -178,11 +185,25 @@ class AirPlaySession(
         if (notified.compareAndSet(false, true)) listener.onSessionEnded(this)
     }
 
-    fun sendCommand(command: Map<String, Any?>): Boolean = synchronized(eventWriteLock) {
-        sendCommandLocked(command)
+    fun sendCommand(command: Map<String, Any?>): Boolean {
+        // vc327：等锁计时点定死——块外记请求时刻，块内第一处记获得时刻。
+        val lockReqNs = System.nanoTime()
+        synchronized(eventWriteLock) {
+            val lockAcqNs = System.nanoTime()
+            return sendCommandLocked(command, lockAcqNs = lockAcqNs)
+        }
     }
 
-    private fun sendCommandLocked(command: Map<String, Any?>): Boolean {
+    /**
+     * vc327：发送一条命令。[timing] 非空时回填等锁/锁后处理/socket 写三段；
+     * [bodyTrace] 为 false 时**不执行** `body.toHex()`、不拼 trace 字符串（普通 MOVE 降噪）。
+     */
+    private fun sendCommandLocked(
+        command: Map<String, Any?>,
+        timing: EventSendTiming? = null,
+        lockAcqNs: Long = 0L,
+        bodyTrace: Boolean = true,
+    ): Boolean {
         val socket = eventSocket ?: return false
         val cipher = eventCipher ?: return false
         eventCseq++
@@ -191,12 +212,24 @@ class AirPlaySession(
             "Content-Type: $PLIST_CONTENT_TYPE\r\n" +
             "Content-Length: ${body.size}\r\n" +
             "CSeq: $eventCseq\r\n\r\n"
-        trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
+        // vc327：TRACE 开销段单独夹计时，事后从 postLock 扣除（日志开销不算进锁后处理）。
+        var traceNs = 0L
+        if (bodyTrace) {
+            val traceStartNs = System.nanoTime()
+            trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
+            traceNs = System.nanoTime() - traceStartNs
+        }
         return try {
             val bytes = cipher.encrypt(head.toByteArray(Charsets.US_ASCII) + body)
+            if (timing != null) {
+                val postDoneNs = System.nanoTime()
+                timing.postLockNs = (postDoneNs - lockAcqNs - traceNs).coerceAtLeast(0L)
+            }
             val output = socket.getOutputStream()
+            val writeStartNs = System.nanoTime()
             output.write(bytes)
             output.flush()
+            if (timing != null) timing.socketWriteNs = System.nanoTime() - writeStartNs
             true
         } catch (error: Exception) {
             Log.w(TAG, "airplay event command failed type=${command["type"]}", error)
@@ -216,14 +249,37 @@ class AirPlaySession(
         debugLog("airplay initial keyframe requested at session establishment sent=$sent")
     }
 
-    fun sendTouch(contacts: List<AirPlayContact>): Boolean {
+    /**
+     * vc327：触摸发送。[sticky] 来自编排层（DOWN/UP/POINTER_UP/CANCEL = true），
+     * 普通 MOVE = false；[queueWaitNs] 为入队到出队等待，仅用于分段统计。
+     */
+    fun sendTouch(contacts: List<AirPlayContact>, sticky: Boolean, queueWaitNs: Long = 0L): Boolean {
         val scaled = contacts.map {
             it.copy(x = it.x * config.main.widthPixels, y = it.y * config.main.heightPixels)
         }
         val report = AirPlayHid.touchReport(scaled)
+        val timing = EventSendTiming()
         val sendStartNs = System.nanoTime()
-        val sent = sendHidReport(AirPlayHid.TOUCH_HID_UID, report)
-        if (sent) com.shilapi.xcertplay.media.TouchLatencyProbe.onTouchSent(sendStartNs, System.nanoTime() - sendStartNs)
+        // vc327：sticky 与首条报文保留完整正文；普通 MOVE 不拼 hex、不写逐包日志。
+        val fullBodyTrace = sticky || !firstTouchReportLogged.get()
+        val sent = sendTouchHidReport(AirPlayHid.TOUCH_HID_UID, report, timing, fullBodyTrace)
+        // vc327：发送结果后立即冻结该包总耗时——之后不得再取时间（慢日志自身写入会污染判定）。
+        val sendTotalNs = System.nanoTime() - sendStartNs
+        if (sent) {
+            if (fullBodyTrace) firstTouchReportLogged.set(true)
+            TouchLatencyProbe.onTouchSent(sendStartNs, sendTotalNs)
+            TouchLatencyProbe.onSendPhases(
+                queueWaitNs = queueWaitNs,
+                lockWaitNs = timing.lockWaitNs,
+                postLockNs = timing.postLockNs,
+                socketWriteNs = timing.socketWriteNs,
+                totalNs = sendTotalNs,
+            )
+            // 慢 MOVE 分段日志：锁已释放，且限频；sticky 已有完整 TRACE，不重复刷。
+            if (!sticky && sendTotalNs >= TouchLatencyProbe.SLOW_SEND_THRESHOLD_NS) {
+                logSlowTouchMove(queueWaitNs, timing, sendTotalNs)
+            }
+        }
         if (sent && firstTouchSendLogged.compareAndSet(false, true)) {
             val first = scaled.firstOrNull()
             Log.i(
@@ -235,6 +291,49 @@ class AirPlaySession(
             Log.w(TAG, "airplay touch dropped: event channel is not ready")
         }
         return sent
+    }
+
+    /** vc327：触摸专用发送路径——回填三段计时，并由 [bodyTrace] 控制是否拼正文日志。 */
+    private fun sendTouchHidReport(
+        uid: Int,
+        report: ByteArray,
+        timing: EventSendTiming,
+        bodyTrace: Boolean,
+    ): Boolean {
+        val command = linkedMapOf<String, Any?>(
+            "type" to "hidSendReport",
+            "uuid" to uid.toString(16),
+            "hidReport" to report,
+        )
+        val lockReqNs = System.nanoTime()
+        synchronized(eventWriteLock) {
+            val lockAcqNs = System.nanoTime()
+            timing.lockWaitNs = lockAcqNs - lockReqNs
+            return sendCommandLocked(command, timing, lockAcqNs, bodyTrace)
+        }
+    }
+
+    /** vc327：慢 MOVE 简短分段日志（锁外、限频：同一 5s 窗口最多 [MAX_SLOW_TOUCH_LOGS] 条）。 */
+    private fun logSlowTouchMove(queueWaitNs: Long, timing: EventSendTiming, sendTotalNs: Long) {
+        val now = System.nanoTime()
+        if (now - slowTouchWindowStartNs >= TOUCH_SLOW_LOG_WINDOW_NS) {
+            slowTouchWindowStartNs = now
+            slowTouchWindowLogs = 0
+        }
+        if (slowTouchWindowLogs >= MAX_SLOW_TOUCH_LOGS) return
+        slowTouchWindowLogs++
+        trace(
+            "airplay touch slow move total=${sendTotalNs / 1_000_000}ms " +
+                "queueWait=${queueWaitNs / 1_000_000}ms lockWait=${timing.lockWaitNs / 1_000_000}ms " +
+                "postLock=${timing.postLockNs / 1_000_000}ms sockWrite=${timing.socketWriteNs / 1_000_000}ms",
+        )
+    }
+
+    /** vc327：一条命令的分段打点容器（只在触摸路径分配，控制面零开销）。 */
+    private class EventSendTiming {
+        var lockWaitNs = 0L
+        var postLockNs = 0L
+        var socketWriteNs = 0L
     }
 
     fun sendKnob(state: AirPlayKnobState, momentary: Boolean = true) {
@@ -1021,6 +1120,9 @@ class AirPlaySession(
 
     private companion object {
         const val TAG = "xcertplay-usb"
+        // vc327：慢 MOVE 分段日志限频窗口与条数。
+        const val TOUCH_SLOW_LOG_WINDOW_NS = 5_000_000_000L
+        const val MAX_SLOW_TOUCH_LOGS = 3
         const val PLIST_CONTENT_TYPE = "application/x-apple-binary-plist"
         const val PAIRING_CONTENT_TYPE = "application/pairing+tlv8"
         const val OCTET_CONTENT_TYPE = "application/octet-stream"

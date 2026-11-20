@@ -77,7 +77,8 @@ object DongleLogUploader {
         val header = buildString {
             append("dongle 连接日志（外置 USB 蓝牙）\n\n")
             append("设备：").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n")
-            // 设备码是明文蓝牙 MAC + ROM 指纹（VC250-02），多台同型号/同 MAC 车机靠它归机，便于与蓝牙清单对账。
+            // vc325：设备码 = ROM 指纹 + 8 位安装实例码（已去蓝牙 MAC）；同一安装跨日志稳定，
+            // 同型号不同机器靠 ROM 段区分，只作「型」参考，不作物理唯一性对账。
             append("设备码：").append(deviceCode).append("\n")
             append("系统版本：Android").append(Build.VERSION.RELEASE)
                 .append("（api ").append(Build.VERSION.SDK_INT).append("）\n")

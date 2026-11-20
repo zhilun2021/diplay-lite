@@ -120,6 +120,9 @@ class SettingsPage(private val activity: MainActivity) {
     private lateinit var cbBootBluetooth: CheckBox
     private lateinit var cbBootHotspot: CheckBox
     private lateinit var cbBootWifi: CheckBox
+    // vc321（UI-319-02）：仅防同一冲突弹窗重入，绝不记忆放行。
+    private var bootConflictDialogVisible = false
+    private var bootConflictDialog: AppDialog? = null
     private lateinit var cbAutoConnect: CheckBox
     private lateinit var cbSoftDecode: CheckBox
     // vc197：实验性 FE6 语音兜底。**只在 FE6 车型上创建**，其他机型为 null（不显示、不生效）。
@@ -170,23 +173,111 @@ class SettingsPage(private val activity: MainActivity) {
         UpdateDownloader.cancel()
     }
 
-    /** 进入设置页：构建根视图（含悬浮球）并完成表单回显。由 MainActivity.render() 调用。 */
+    // vc323（UI-320-01 C0）：只存本次同步构建耗时，不缓存业务数据。
+    private var c0RootSetupNs = 0L
+    private var c0ContentNs = 0L
+    private var c0MountNs = 0L
+    private var c0PreDeviceNs = 0L
+    private var c0DeviceNs = 0L
+    // vc324：连续分组边界，仅用于测量DeviceCode之前的构建开销。
+    private var c0HeaderNs = 0L
+    private var c0ConnectionNs = 0L
+    private var c0PictureNs = 0L
+    private var c0AudioNs = 0L
+    private var c0ExperienceNs = 0L
+
+    /** 首次进入：构建视图树并完成回显。缓存复用路径**不**走这里。 */
     fun buildRoot(): FrameLayout {
+        val c0Start = System.nanoTime()
+        val root = FrameLayout(activity).apply { setBackgroundColor(Ui.BG) }
+        val c0ContentStart = System.nanoTime()
+        c0RootSetupNs = c0ContentStart - c0Start
+        val content = buildContent()
+        val c0MountStart = System.nanoTime()
+        c0ContentNs = c0MountStart - c0ContentStart
+        root.addView(
+            content,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        c0MountNs = System.nanoTime() - c0MountStart
+        attach(AttachMode.FIRST)
+        return root
+    }
+
+    /** vc320：进入设置页的三种语义，决定「是否用磁盘配置覆盖表单」。 */
+    enum class AttachMode {
+        /** 首次构建：建完 View 后回显。 */
+        FIRST,
+
+        /** 重新进入页面：用户可能在其他页改过配置 ⇒ **必须**回显。 */
+        REENTER,
+
+        /**
+         * 当前页配置变化（旋转 / 分辨率变更）：**保留用户未保存的输入**。
+         * 🔴 不调 `loadIntoForm()` —— 这条路径不经过 cleanup()，磁盘配置是旧的，
+         * 刷一遍就等于把用户刚敲的值丢掉。
+         */
+        CONFIG_CHANGE,
+    }
+
+    /**
+     * vc320（UI-318-02 阶段一）：进入 / 重入 / 配置变化时刷新。
+     *
+     * 只做「无副作用 + 可只靠配置重建」的事；**禁止**重建 View 或重挂监听
+     * （监听已在 buildContent() 挂好，重复挂会翻倍）。
+     */
+    fun attach(mode: AttachMode) {
+        val c0AttachStart = System.nanoTime()
         applyOrientationMode(activity, LiteConfig.load(activity).orientationMode)
         // M6k19：进设置页不自动弹软键盘 —— 点击输入框时才弹（8815 实测反馈）。
         activity.window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
-        val root = FrameLayout(activity).apply { setBackgroundColor(Ui.BG) }
-        root.addView(
-            buildContent(),
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
-        )
-        // vc163：悬浮球已改为 MainActivity 全局常驻（render() 里统一挂载），
-        // 本页不再自建；点击语义（子页逐级返回）集中在 MainActivity 那一处。
-        loadIntoForm()
+        val c0FormStart = System.nanoTime()
+        if (mode != AttachMode.CONFIG_CHANGE) {
+            // 只有「首次」与「重新进入」才回显磁盘配置。
+            loadIntoForm()
+            // cleanup() 已取消下载，但按钮文案仍停在上一轮状态，这里复位。
+            // CONFIG_CHANGE 分支不动它：下载可能正在进行，改文案会误导。
+            updateButton.text = "检查更新"
+        }
+        val c0DrawablesStart = System.nanoTime()
+        // 配色与视觉态始终刷新（与表单值无关）。
         refreshAllDrawables()
+        val c0VersionStart = System.nanoTime()
         tvVersion.text = "版本 ${activity.readVersionName()}"
-        LiteLog.log("ui", "设置页打开")
-        return root
+        val c0End = System.nanoTime()
+        LiteLog.log(
+            "ui",
+            when (mode) {
+                AttachMode.FIRST -> "设置页打开"
+                AttachMode.REENTER -> "设置页打开（复用缓存）"
+                AttachMode.CONFIG_CHANGE -> "设置页配置变化（保留输入，不重建）"
+            },
+        )
+        // 全部区间在日志之前结束；syncUs不含旧日志与本条测量日志的同步写盘。
+        val first = mode == AttachMode.FIRST
+        val setupNs = if (first) c0RootSetupNs else 0L
+        val contentNs = if (first) c0ContentNs else 0L
+        val mountNs = if (first) c0MountNs else 0L
+        val preNs = if (first) c0PreDeviceNs else 0L
+        val deviceNs = if (first) c0DeviceNs else 0L
+        val postNs = if (first) contentNs - preNs - deviceNs else 0L
+        LiteLog.log(
+            "ui",
+            "C0-settings mode=$mode syncUs=${(setupNs + contentNs + mountNs + c0End - c0AttachStart) / 1000} " +
+                "rootSetupUs=${setupNs / 1000} contentUs=${contentNs / 1000} mountUs=${mountNs / 1000} " +
+                "preDeviceUs=${preNs / 1000} deviceUs=${deviceNs / 1000} postDeviceUs=${postNs / 1000} " +
+                "attachUs=${(c0End - c0AttachStart) / 1000} orientationUs=${(c0FormStart - c0AttachStart) / 1000} " +
+                "formUs=${(c0DrawablesStart - c0FormStart) / 1000} drawablesUs=${(c0VersionStart - c0DrawablesStart) / 1000} " +
+                "versionUs=${(c0End - c0VersionStart) / 1000} " +
+                "headerUs=${if (first) c0HeaderNs / 1000 else 0} " +
+                "connectionUs=${if (first) c0ConnectionNs / 1000 else 0} " +
+                "pictureUs=${if (first) c0PictureNs / 1000 else 0} " +
+                "audioUs=${if (first) c0AudioNs / 1000 else 0} " +
+                "experienceUs=${if (first) c0ExperienceNs / 1000 else 0}",
+        )
     }
 
     private fun dip(value: Int): Int = Ui.dip(activity, value)
@@ -194,11 +285,14 @@ class SettingsPage(private val activity: MainActivity) {
     // ---------- 程序化视图构建 ----------
 
     private fun buildContent(): View {
+        val c0ContentStart = System.nanoTime()
         val column = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dip(16), dip(8), dip(16), dip(32))
         }
         column.addView(buildHeader(), block())
+        val c0ConnectionStart = System.nanoTime()
+        c0HeaderNs = c0ConnectionStart - c0ContentStart
 
         // 1.1.1 UI：设置页四组分类 —— 连接设置 / 画面设置 / 音频设置 / 体验优化。
 
@@ -245,6 +339,8 @@ class SettingsPage(private val activity: MainActivity) {
         column.addView(rgBtSelect, block(top = dip(6)))
         // vc209：自定义名称行 + dongle 状态块已删（迁移至配对窗，见字段区注释）。
 
+        val c0PictureStart = System.nanoTime()
+        c0ConnectionNs = c0PictureStart - c0ConnectionStart
         // ── 画面设置：分辨率自定义百分比 / 分辨率设定 / 横竖屏切换 ──
         column.addView(sectionLabel("画面设置"), block(top = dip(16), bottom = dip(4)))
         inputScale = buildValueRow(column, "分辨率自定义", "${LiteConfig.MIN_SCALE_PERCENT}% - ${LiteConfig.MAX_SCALE_PERCENT}%") { applyScale(it) }
@@ -407,6 +503,8 @@ class SettingsPage(private val activity: MainActivity) {
         }
         column.addView(rgFps, block(top = dip(6)))
 
+        val c0AudioStart = System.nanoTime()
+        c0PictureNs = c0AudioStart - c0PictureStart
         // ── 音频设置：导航触发压低 / 音频缓存 / 音视频链路 / 音频流选择 ──
         column.addView(sectionLabel("音频设置"), block(top = dip(16), bottom = dip(4)))
         inputDuck = buildValueRow(column, "导航音频触发音量降低", "${LiteConfig.MIN_DUCK_PERCENT}% - ${LiteConfig.MAX_DUCK_PERCENT}%") { applyDuck(it) }
@@ -422,6 +520,7 @@ class SettingsPage(private val activity: MainActivity) {
             block(top = dip(2), bottom = dip(4)),
         )
         // vc156 媒体预缓冲开关：2026-11-14 有线默认关（不保留抗抖余量，起播更快）。
+        // 开 = 音乐起播/复播水位抬到约 1s，Wi-Fi 短断流不再卡顿；代价是切歌起播稍慢。
         cbPrebuffer = checkbox("音乐预缓冲（默认关，开启会增加起播延迟）")
         column.addView(cbPrebuffer, block(bottom = dip(4)))
         // vc238：A2「视频渲染按 VSYNC 节拍」升为默认开启并删除勾选项（它修的是绿线这类
@@ -494,6 +593,8 @@ class SettingsPage(private val activity: MainActivity) {
             block(top = dip(2), bottom = dip(4)),
         )
 
+        val c0ExperienceStart = System.nanoTime()
+        c0AudioNs = c0ExperienceStart - c0AudioStart
         // 体验优化（1.1.3 UI 调整：主项 +1dp（15f→16f）；改名统一「开机自启X」句式；
         // Siri/语音提示走媒体音量 从音频设置移入本组）
         column.addView(sectionLabel("体验优化"), block(top = dip(12), bottom = dip(4)))
@@ -733,9 +834,14 @@ class SettingsPage(private val activity: MainActivity) {
             },
             block(),
         )
-        // 设备码：明文蓝牙 MAC + ROM 指纹（DeviceCode，VC250-02），供用户报障时报号，可直接与蓝牙清单对账。
+        // vc325：设备码 = ROM 指纹 + 8 位安装实例码（已去蓝牙 MAC），供用户报障时报号；
+        // 同型号不同机器靠 ROM 段区分，实例码只做同一安装的追踪。
         // 点按/长按都复制，避免老车机触摸屏长按判定不稳（不能只做长按）。
+        val c0DeviceStart = System.nanoTime()
+        c0ExperienceNs = c0DeviceStart - c0ExperienceStart
+        c0PreDeviceNs = c0DeviceStart - c0ContentStart
         val deviceCode = DeviceCode.of()
+        c0DeviceNs = System.nanoTime() - c0DeviceStart
         column.addView(
             TextView(activity).apply {
                 text = "设备码：$deviceCode（点按复制）"
@@ -1348,6 +1454,36 @@ class SettingsPage(private val activity: MainActivity) {
         val manualH = inputResH.text.toString().trim().toIntOrNull()
             ?.coerceIn(LiteConfig.MIN_MANUAL_RESOLUTION, LiteConfig.MAX_MANUAL_RESOLUTION)
             ?: current.manualHeight
+        // vc321：任何一次冲突都必须选一项或取消，禁止双选落盘。
+        if (cbBootHotspot.isChecked && cbBootWifi.isChecked) {
+            if (bootConflictDialogVisible) return
+            bootConflictDialogVisible = true
+            val cancelSelection = {
+                setBootNetworkChecks(current.bootAutoHotspot, current.bootAutoWifi && !current.bootAutoHotspot)
+                LiteLog.log("ui", "互斥强制：取消返回")
+            }
+            bootConflictDialog = AppDialog.Builder(activity)
+                .setTitle("自启选项互斥")
+                .setMessage("「开机自启热点」与「开机自启WIFI」会互相干扰，请只保留一项。")
+                .setPositiveButton("保留热点自启") { _, _ ->
+                    setBootNetworkChecks(true, false)
+                    LiteLog.log("ui", "互斥强制：保留热点自启")
+                    persistFromForm()
+                }
+                .setNegativeButton("保留WiFi自启") { _, _ ->
+                    setBootNetworkChecks(false, true)
+                    LiteLog.log("ui", "互斥强制：保留WiFi自启")
+                    persistFromForm()
+                }
+                .setNeutralButton("取消返回") { _, _ -> cancelSelection() }
+                .setOnCancelListener { cancelSelection() }
+                .setOnDismissListener {
+                    bootConflictDialogVisible = false
+                    bootConflictDialog = null
+                }
+                .show()
+            return
+        }
         LiteConfig.save(
             activity,
             current.copy(
@@ -1402,6 +1538,25 @@ class SettingsPage(private val activity: MainActivity) {
                 "内核 NCM 实验已${if (cbWiredKernelNcm.isChecked) "开启" else "关闭"}，断开重连后生效",
                 Toast.LENGTH_SHORT,
             ).show()
+        }
+    }
+
+    /** vc322：自绘覆盖窗不新建 Window，优先消费 Activity 收到的返回键。 */
+    internal fun cancelBootConflict(): Boolean {
+        val dialog = bootConflictDialog ?: return false
+        dialog.cancel()
+        return true
+    }
+
+    /** 批量更新时禁止 checkbox 监听器半途保存或再次弹窗。 */
+    private fun setBootNetworkChecks(hotspot: Boolean, wifi: Boolean) {
+        val wasLoading = isLoading
+        isLoading = true
+        try {
+            cbBootHotspot.isChecked = hotspot
+            cbBootWifi.isChecked = wifi
+        } finally {
+            isLoading = wasLoading
         }
     }
 

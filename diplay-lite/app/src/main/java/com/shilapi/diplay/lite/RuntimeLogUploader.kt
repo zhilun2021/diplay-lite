@@ -782,8 +782,8 @@ object RuntimeLogUploader {
     ): String = buildString {
         append("运行日志（含 dongle 链路）— 最近 ").append(scans.size).append(" 份会话\n\n")
         append("设备：").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
-        // 设备码是明文蓝牙 MAC + ROM 指纹（DeviceCode，VC250-02）：保留型号行之外，同 MAC 的不同车机靠指纹区分归机。
-        // 上传脱敏只放行这一处「设备码」行（见 LogUploadPrivacy.DEVICE_CODE_MARK）。
+        // vc325：设备码 = ROM 指纹 + 8 位安装实例码（已去蓝牙 MAC）；上传脱敏只放行这一处
+        // 「设备码」行（见 LogUploadPrivacy.DEVICE_CODE_MARK，三代格式通吃）。
         append("设备码：").append(deviceCode).append('\n')
         val metrics = Resources.getSystem().displayMetrics
         append("分辨率：").append(metrics.widthPixels).append('x').append(metrics.heightPixels)

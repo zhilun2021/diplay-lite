@@ -286,7 +286,19 @@ class LiteSessionService : Service() {
         registerBtProbe()
         // vc96（FE-6 断链取证）：root 可用则启动内核 USB 事件探针（dmesg 增量进 LiteLog）；
         // 无 root 静默关闭。断链/wedge 时 WiredUsbForensics.snapshot 抓设备树快照。
-        WiredUsbForensics.start()
+        // vc326（C8815/API16 ANR）：探针只服务有线链路——无线各通道跳过（设计决定，非事故现场事实）；
+        // forceUsbProbe 仅为门② 强制启动慢探针的测试钩子，不改变 requestedChannel。
+        // vc326（40b §2.2）：慢 su 注入同样只认测试入口，且 release（BuildConfig.DEBUG=false）强制归零。
+        val forceProbe = intent?.getBooleanExtra(EXTRA_FORCE_USB_PROBE, false) == true
+        val slowSuMillis = if (BuildConfig.DEBUG) {
+            intent?.getIntExtra(EXTRA_FORCE_SLOW_SU, 0)?.toLong() ?: 0L
+        } else {
+            0L
+        }
+        WiredUsbForensics.start(
+            onlyUsb = requestedChannel == "usb" || forceProbe,
+            slowSuMillis = slowSuMillis,
+        )
         // vc102 副屏探测：会话启动时再查一次（捕捉倒车屏/仪表投射屏等动态副屏），写日志无 UI。
         ClusterDisplayProbe.probe(this)
         // vc271（T3-B 无线取证）：root 可用时，连接发起 10s 后抓一轮网络现场
@@ -1347,6 +1359,10 @@ class LiteSessionService : Service() {
         private const val KEY_PUBLIC_KEY = "public_key"
         private const val KEY_PAIRING_ID = "pairing_id"
         const val EXTRA_CHANNEL = "channel"
+        /** vc326：门② 测试钩子——强制启动 USB 取证探针（默认 false，不改变连接通道）。 */
+        const val EXTRA_FORCE_USB_PROBE = "forceUsbProbe"
+        /** vc326：门② 测试钩子——DEBUG 构建下把 `su("id")` 人为延迟 N 毫秒，稳定复现慢 su。 */
+        const val EXTRA_FORCE_SLOW_SU = "forceSlowSu"
         private val MFI_FILES = listOf("identity.pk8", "certificate.p7b")
         private val DEFAULT_SCREEN = 800 to 480 // C8815 屏幕兜底
     }

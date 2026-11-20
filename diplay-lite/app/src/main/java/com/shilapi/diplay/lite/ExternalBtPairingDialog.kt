@@ -712,7 +712,8 @@ object ExternalBtPairingDialog {
         }
 
         private fun switchPowerMode(target: Int) {
-            if (LiteConfig.usbBtPowerModeOf(activity) == target) return
+            val previousMode = LiteConfig.usbBtPowerModeOf(activity)
+            if (previousMode == target) return
             when (target) {
                 LiteConfig.USB_BT_MODE_OFF -> {
                     LiteConfig.setUsbBtPowerMode(activity, LiteConfig.USB_BT_MODE_OFF)
@@ -731,6 +732,9 @@ object ExternalBtPairingDialog {
                         "usbbt",
                         "gate-off 实际状态：Write_Scan_Enable=0x02（inquiry scan 关 / page scan 开，不可被搜索但可回连）",
                     )
+                    if (previousMode == LiteConfig.USB_BT_MODE_OFF) {
+                        activity.ensureUsbBtStandby()
+                    }
                 }
                 LiteConfig.USB_BT_MODE_DISCOVERABLE -> {
                     if (UsbBtStandby.isRunning && !UsbBtStandby.setDiscoverable(true)) {

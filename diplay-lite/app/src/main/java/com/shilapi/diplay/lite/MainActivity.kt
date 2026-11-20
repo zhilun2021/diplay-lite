@@ -95,6 +95,8 @@ class MainActivity : Activity() {
 
     // 子页对象：与 page 一一对应，离开页面时 cleanup()（persist/向导注销/线程池关闭等）。
     private var settingsPage: SettingsPage? = null
+    // vc320：缓存页面对象与根 View，离页清理临时资源，Activity 销毁时释放。
+    private var settingsCachedRoot: FrameLayout? = null
     private var carIconPage: CarIconPage? = null
     private var hotspotPage: HotspotPage? = null
     private var steeringPage: SteeringPage? = null
@@ -164,6 +166,15 @@ class MainActivity : Activity() {
     // vc247（V3）：用户主动「停止外置蓝牙」后抑制回前台/重连自动拉起，重新打开配对页才恢复。
     private var usbBtUserStopped = false
 
+    /**
+     * vc319（BT-318-01 方案B）：「已配对即拉起」每 Activity 实例只做一次。
+     * Activity 每次 onCreate 都是新实例 ⇒ 天然覆盖「冷启」与「销毁重建」
+     * （11-17 21:19 那次 HCI 假报警正发生在重建后的 onResume）；
+     * 而单纯回前台（设置页返回、无重建）不重复拉起，保住省电档（`keepAlive=false` 时不反复启动）。
+     */
+    @Volatile
+    private var usbBtAutoBroughtUp = false
+
     // vc279（ac8317「点下去没反应」取证）：UI 侧最小埋点，只打日志、不改交互逻辑。
     // ① 触摸排队 = uptime - ev.eventTime（主线程被占时输入事件在队列里积压）
     // ② dispatchTouchEvent 分发耗时（含点击回调同步执行）
@@ -174,8 +185,30 @@ class MainActivity : Activity() {
     private val slowTouchDispatchMs = 50L
     private val slowRenderMs = 120L
     private val slowFrameGapMs = 200L
-    private var lastUiFrameNs = 0L
-    private var lastFrameLogNs = 0L
+    // vc320（UI-318-01 修正）：探针改「双基准」——帧回调 + 主线程心跳。
+    // 帧与心跳由主线程写、后台线程读；冷却由后台维护 ⇒ 全部 @Volatile（Kotlin/JVM 对 volatile Long
+    // 的读写是原子的，不需要 AtomicLong）。
+    @Volatile private var lastUiFrameNs = 0L        // 最近一次 Choreographer 帧回调
+    @Volatile private var lastUiHeartbeatNs = 0L    // 最近一次主线程心跳
+    @Volatile private var lastFrameLogNs = 0L       // 3s 冷却
+    @Volatile private var uiProbePaused = true     // onPause 置真：后台阶段一律不采样
+    // vc319 起的采样线程（vc320 补齐销毁时的清理，见 A-4）
+    private val uiStackSampler = android.os.HandlerThread("xcertplay-ui-stack").apply { start() }
+    private val uiStackHandler = android.os.Handler(uiStackSampler.looper)
+    @Volatile private var uiStackSampling = false
+    /**
+     * vc320：帧回调引用。**必须持有**——vc319 用的是匿名对象 + 无条件自我续订，
+     * onPause/onDestroy 都无法移除，等于探针永不停止（后台、息屏后仍在排队）。
+     * 由 [installUiFrameMonitor] 写入、[removeUiFrameMonitor] 清空。
+     * ⚠️ 它属于本块「改后」，vc319 原文没有这一行。
+     */
+    private var uiFrameCallback: Choreographer.FrameCallback? = null
+    /** 后台轮询周期。100ms 对 200ms 阈值足够（最坏多等 100ms 才发现），且空转只读两个 long。 */
+    private val uiStackPollMs = 100L
+    /** 心跳周期。必须 < slowFrameGapMs，否则自己就会触发误判。 */
+    private val uiHeartbeatMs = 100L
+    /** 原始栈保留帧数。24 帧足够覆盖「自家卡点 + 框架调用链」，再长日志无收益。 */
+    private val uiStackDepth = 24
 
     // 1.0.16（方案四②）：开机自启等待弹窗——上电后等勾选的蓝牙/热点就绪并稳定 10s 再自动连接。
     private var autostartWaitActive = false
@@ -275,6 +308,20 @@ class MainActivity : Activity() {
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         render()
         installUsbBtPairConfirmHook()
+        // vc326（40b §2.2 方案1）：门② 测试入口——仅 DEBUG 测试构建。由可导出的 MainActivity
+        // 接收 forceUsbProbe/forceSlowSu，再由 App 自己启动**未导出**的 LiteSessionService
+        // （绝不把 Service 改成 exported）。release 包 BuildConfig.DEBUG=false，整段不生效。
+        if (BuildConfig.DEBUG &&
+            intent?.getBooleanExtra(LiteSessionService.EXTRA_FORCE_USB_PROBE, false) == true
+        ) {
+            val slowSu = intent?.getIntExtra(LiteSessionService.EXTRA_FORCE_SLOW_SU, 0) ?: 0
+            LiteLog.log("ui", "测试入口：forceUsbProbe=true slowSu=${slowSu}ms（仅 DEBUG 构建）")
+            startService(
+                Intent(this, LiteSessionService::class.java)
+                    .putExtra(LiteSessionService.EXTRA_FORCE_USB_PROBE, true)
+                    .putExtra(LiteSessionService.EXTRA_FORCE_SLOW_SU, slowSu),
+            )
+        }
         // 1.0.16（方案四②）：开机自启拉起（BootReceiver 带 EXTRA_AUTOSTART）→ 等待弹窗。
         if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) {
             beginAutostartWait()
@@ -285,6 +332,7 @@ class MainActivity : Activity() {
         }
         LiteLog.log("ui", "主界面就绪（原版式视觉：page 路由 + render 整页重建）")
         installUiFrameMonitor()
+        startUiStackSampler()
         // vc102 副屏探测：仪表/HUD 投射路线判生死，默认日志检测（无按钮），结果写 LiteLog cluster 标签。
         ClusterDisplayProbe.probe(this)
         // vc270：状态栏探针已摘除（VC270-02）——GS1 顶栏压不住已成定论，留它每次进页面都要
@@ -470,9 +518,12 @@ class MainActivity : Activity() {
         // 1.0.29：设置页可能改过分辨率设定 —— 回主页刷新拉伸模式标志。
         videoStretchMode = LiteConfig.load(this).resolutionMode == "stretch"
         handler.post(refreshTask)
-        syncUsbBtStandby()
-        // vc311：回前台重算在场（事件驱动的兜底刷新点，覆盖后台插拔/广播丢失）。
+        // vc319（BT-318-01）：invalidate 必须先于 sync —— 改动 4b 的放行判据要读 isPresent，
+        // 而 isPresent 走「事件驱动缓存」（presenceAnyAt==0 才重查）。若先 sync 后 invalidate，
+        // sync 读到的是上一轮陈旧在场值：dongle 已拔但缓存为 true ⇒ 误拉起 ⇒ open 失败
+        // ⇒ failStreak>0 ⇒ 反而落 NOT_READY 黄字。invalidate 只归零、无副作用，前置安全。
         UsbDongleGuard.invalidatePresence()
+        syncUsbBtStandby()
         usbSixFields("bt", "resume", if (UsbBtStandby.isRunning) "standby-running" else "standby-stopped", "auto-connect")
         maybeAutoConnect()
         // 1.1.4 系统诊断：新装无检测记录时，主界面就绪后延迟 5 秒触发首启快检（可跳过）。
@@ -486,9 +537,19 @@ class MainActivity : Activity() {
             setPanelVisible(true)
             LiteLog.log("ui", "回前台：激活态自动亮面板（汽车键兜底）")
         }
+        // vc320：先重置基线、恢复产生者，再允许后台采样；保留跨前后台冷却。
+        lastUiFrameNs = 0L
+        lastUiHeartbeatNs = System.nanoTime()
+        installUiFrameMonitor()
+        handler.removeCallbacks(uiHeartbeat)
+        handler.post(uiHeartbeat)
+        uiProbePaused = false
     }
 
     override fun onPause() {
+        uiProbePaused = true
+        removeUiFrameMonitor()
+        handler.removeCallbacks(uiHeartbeat)
         super.onPause()
         LiteLog.log("ui", "onPause")
         handler.removeCallbacks(refreshTask)
@@ -547,6 +608,11 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        uiProbePaused = true
+        removeUiFrameMonitor()
+        handler.removeCallbacks(uiHeartbeat)
+        uiStackHandler.removeCallbacksAndMessages(null)
+        uiStackSampler.quit()
         LiteLog.log("ui", "onDestroy（Activity 被销毁，下一次进入会重建 Surface 与解码器）")
         // vc247（V12）：页面被回收/销毁时兜底关配对窗（dismiss 回调不保证一定走）。
         ExternalBtPairingDialog.onHostDestroyed()
@@ -565,6 +631,8 @@ class MainActivity : Activity() {
             LiteLog.log("usbdongle", "Activity 重建：保留常驻广播（g=${UsbBtStandby.generationSnapshot}）")
         }
         detachCurrentPage()
+        settingsPage = null
+        settingsCachedRoot = null
         // vc108：退出时还原车机栏（写回 false），否则车机桌面栏被永久藏住
         setVendorFullScreen(false)
         super.onDestroy()
@@ -647,7 +715,7 @@ class MainActivity : Activity() {
             "hotspot-car", "hotspot-relay" -> hotspotPage?.cleanup()
             "steering" -> steeringPage?.cleanup()
         }
-        settingsPage = null
+        // vc320：离开设置页仍 cleanup，但保留对象供重新进入时回显。
         carIconPage = null
         hotspotPage = null
         steeringPage = null
@@ -718,6 +786,8 @@ class MainActivity : Activity() {
      */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
+        // vc322：先取消设置页互斥覆盖窗，再处理页面层级。
+        if (page == "settings" && settingsPage?.cancelBootConflict() == true) return
         when {
             // vc297：激活态视频铺满整屏、C8815 上悬浮球被视频层吞掉（层级里在、画面上不显示），
             // 用户没有任何"断开"入口。返回键先亮面板，再按一次才走原有层级（含退出确认）。
@@ -754,8 +824,19 @@ class MainActivity : Activity() {
         // 空闲态重建当前页（render() 按 page 分发，天然重建正确）。
         if (page != "home") {
             if (phase == LiteState.Phase.IDLE) {
-                render()
-                LiteLog.log("ui", "旋转：空闲态整页重建（page=$page）")
+                // vc320：设置页走「保留输入」路径 —— 不 render、不重建、不重读配置。
+                // 原 render() 会命中缓存 → attach(REENTER) → loadIntoForm()，
+                // 而这条路径不经过 setPage/cleanup，磁盘配置是旧的 ⇒ 用户刚敲的值会被覆盖。
+                val settings = settingsPage
+                val cachedRoot = settingsCachedRoot
+                if (page == "settings" && settings != null && cachedRoot != null) {
+                    settings.attach(SettingsPage.AttachMode.CONFIG_CHANGE)
+                    cachedRoot.requestLayout()
+                    LiteLog.log("ui", "旋转：设置页保留输入并重排（不重建）")
+                } else {
+                    render()
+                    LiteLog.log("ui", "旋转：空闲态整页重建（page=$page）")
+                }
             } else {
                 LiteLog.log("ui", "旋转：子页保持（page=$page phase=$phase）")
             }
@@ -931,36 +1012,159 @@ class MainActivity : Activity() {
         return handled
     }
 
-    /** vc279：主线程帧间隔监控。超过阈值并已冷却 3 秒以上才记一条，避免日志风暴。 */
+    /**
+     * vc320：主线程心跳。仅用于回答一个问题——**主线程还在不在跑消息**。
+     *
+     * 为什么需要它：只看帧回调无法区分「主线程卡住」和「根本没有重绘」（静止画面、
+     * 息屏、Activity 在后台）。后者 gap 可以无穷大但不是卡顿，必须排除，否则每次
+     * 息屏回来都会误报一条几百秒的掉帧。
+     */
+    private val uiHeartbeat = object : Runnable {
+        override fun run() {
+            // vc320 v4：这里**不判断 uiProbePaused**。
+            // 判断会让「onResume 里先 post 心跳还是先解暂停」互相牵制（先 post 会被
+            // paused=true 挡掉一拍、先解暂停又会让后台立刻读到旧基线）。
+            // 心跳的启停只由 onResume 的 post / onPause 的 removeCallbacks 控制。
+            lastUiHeartbeatNs = System.nanoTime()
+            handler.postDelayed(this, uiHeartbeatMs)
+        }
+    }
+
+    /**
+     * vc320（UI-318-01）：安装帧监听。**幂等** —— 已在监听时直接返回，
+     * 因此 onResume 可以无条件调用而不会重复注册（重复注册会让每个回调续订出一份，
+     * 帧数指数上涨）。
+     */
     private fun installUiFrameMonitor() {
+        if (uiFrameCallback != null) return
         val choreographer = runCatching { Choreographer.getInstance() }.getOrNull() ?: return
-        choreographer.postFrameCallback(object : Choreographer.FrameCallback {
+        val callback = object : Choreographer.FrameCallback {
             override fun doFrame(frameTimeNanos: Long) {
-                val now = System.nanoTime()
-                if (lastUiFrameNs != 0L) {
-                    val gapMs = (now - lastUiFrameNs) / 1_000_000
-                    if (gapMs >= slowFrameGapMs && now - lastFrameLogNs >= 3_000_000_000L) {
-                        lastFrameLogNs = now
-                        LiteLog.log("ui", "主线程掉帧: gap=${gapMs}ms page=$page")
+                // 本回调只写一个时间戳。判断与抓栈全部交给后台 ——
+                // 在 doFrame 里抓栈只能抓到 doFrame 自己，卡点早已返回、不在栈上。
+                lastUiFrameNs = System.nanoTime()
+                // 只有「仍是当前回调」才续订：removeUiFrameMonitor() 会把字段置 null，
+                // 已在管道里的那一帧返回后即自断，不会复活。
+                if (uiFrameCallback === this) {
+                    runCatching { choreographer.postFrameCallback(this) }
+                }
+            }
+        }
+        uiFrameCallback = callback
+        runCatching { choreographer.postFrameCallback(callback) }
+    }
+
+    /**
+     * vc320：移除帧监听。`Choreographer.removeFrameCallback` 是 **API 16+**（minSdk=16 恰好可用）。
+     * 先置 null 再 remove —— 顺序反了会让 doFrame 里的 `=== this` 判断仍为真、再续订一帧。
+     */
+    private fun removeUiFrameMonitor() {
+        val callback = uiFrameCallback ?: return
+        uiFrameCallback = null
+        runCatching { Choreographer.getInstance().removeFrameCallback(callback) }
+    }
+
+    /**
+     * vc320（UI-318-01）：后台轮询起点。**只调一次**，内部自我续订。
+     *
+     * 与 vc319 的关键差别：抓栈发生在「主线程仍卡着」的时刻，而不是「卡完之后」。
+     */
+    private fun startUiStackSampler() {
+        uiStackHandler.post(object : Runnable {
+            override fun run() {
+                if (!uiProbePaused) {
+                    try {
+                        sampleMainThreadIfStuck()
+                    } catch (error: Throwable) {
+                        // 红线：异常必须记类名（NoSuchMethodError 是 Error 不是 Exception，
+                        // 吞掉会被误读成业务结论）。
+                        LiteLog.log("ui", "主线程阻塞采样失败（${error.javaClass.name}）: ${error.message}")
                     }
                 }
-                lastUiFrameNs = now
-                runCatching { choreographer.postFrameCallback(this) }
+                // 暂停期本循环仍会空转（每 100ms 读一次 uiProbePaused），开销可忽略；
+                // 由 onDestroy 的 removeCallbacksAndMessages(null) + quit() 统一终止。
+                uiStackHandler.postDelayed(this, uiStackPollMs)
             }
         })
+    }
+
+    /**
+     * vc320（UI-318-01）：判定 + 抓栈 + 写日志（**先抓栈，再写日志**）。
+     *
+     * 判定用双基准，缺一不可：
+     *  - [lastUiHeartbeatNs] 停 ⇒ 主线程**真的不响应**；
+     *  - [lastUiFrameNs] 停但心跳正常 ⇒ 只是没重绘，**不是卡顿**，直接返回。
+     */
+    private fun sampleMainThreadIfStuck() {
+        val now = System.nanoTime()
+        val heartbeatNs = lastUiHeartbeatNs
+        if (heartbeatNs == 0L) return                              // 心跳未起（onResume 未走完）
+        val heartbeatGapMs = (now - heartbeatNs) / 1_000_000
+        if (heartbeatGapMs < slowFrameGapMs) return                // 主线程活着
+        if (uiStackSampling) return                                // 上一轮还在抓，防重入
+        if (now - lastFrameLogNs < 3_000_000_000L) return           // 3s 冷却（沿用 vc319）
+        uiStackSampling = true
+        try {
+            val frameNs = lastUiFrameNs
+            val frameGapMs = if (frameNs == 0L) heartbeatGapMs else (now - frameNs) / 1_000_000
+            // 完整原始栈：Thread.getStackTrace() 是当前时刻的快照，采样与检测存在调度间隙，
+            // 主线程可能已恢复，需结合调用链判读。
+            val raw = android.os.Looper.getMainLooper().thread.stackTrace
+            // 保留完整 className（**禁止 substringAfterLast**——vc319 就是截短之后再用
+            // startsWith("com.shilapi") 过滤，导致自家帧恒不匹配、全部被丢弃）。
+            val frames = raw.take(uiStackDepth)
+                .map { "${it.className}.${it.methodName}:${it.lineNumber}" }
+            val own = frames.filter { it.startsWith("com.shilapi.") }
+            // vc320 v4：输出前**复核暂停态**。抓栈这几百微秒里可能刚进后台（onPause 已置 true），
+            // 这类样本是「暂停瞬间的快照」，判读价值低且会污染后台回归测试的判据。
+            // 放在这里而不是函数入口：入口已判过一次，但状态可能在抓栈期间变化。
+            if (uiProbePaused) return
+            // 冷却从「真正输出」开始计时 —— 作废的样本不占 3s 窗口。
+            lastFrameLogNs = System.nanoTime()
+            // 先抓栈、后写日志：两条紧邻写出，降低 logd 丢 I 级行时「有头无栈」的概率。
+            LiteLog.log(
+                "ui",
+                "主线程停顿: heartbeat=${heartbeatGapMs}ms gap=${frameGapMs}ms page=$page",
+            )
+            LiteLog.log(
+                "ui",
+                "主线程阻塞采样 gap=${frameGapMs}ms own=${own.size} top=${frames.joinToString(" | ")}",
+            )
+            if (own.isEmpty()) {
+                // 只陈述事实：**打印的前 ${uiStackDepth} 帧里没有应用帧**。
+                // 不能据此断言「问题在系统侧」——卡点可能深于第 N 帧，也可能在 native。
+                // 单独一条便于判读，不污染 top= 的原始栈。
+                LiteLog.log(
+                    "ui",
+                    "主线程阻塞采样：前 ${frames.size} 帧无应用帧（原始栈 ${raw.size} 帧，未覆盖部分需加大 uiStackDepth 再看）",
+                )
+            }
+        } finally {
+            uiStackSampling = false
+        }
     }
 
     /**
      * 根视图：Surface 铺满 → home 面板 → 悬浮球 → errorCard。
      * 面板布局方向用 Display 实际宽高判定（isLandscapeDisplay），勿信 configuration.orientation。
      */
+    // 🔴 可见性保持 internal —— CarIconPage 仍在调 activity.render()（L390 / L465），
+    // 改成 private 会直接编译失败。
     internal fun render() {
         val startedNs = System.nanoTime()
+        // vc320：必须在**入口**捕获。renderPanel 首次进入时会给 settingsCachedRoot 赋值，
+        // 在末尾再读就恒为 true，首次与复用无法区分。
+        val cachedAtEntry = settingsCachedRoot != null
         try {
             renderPanel()
         } finally {
             val costMs = (System.nanoTime() - startedNs) / 1_000_000
+            // 原有：仅 ≥slowRenderMs(120) 才打。**保留不动** —— 历史判据依赖这一行，
+            // 改了口径会让 vc318/vc319 的「整页重建」样本无法对比。
             if (costMs >= slowRenderMs) LiteLog.log("ui", "整页重建: ${costMs}ms page=$page")
+            // vc320 新增：每次 render 无条件记录耗时与缓存命中，用于首次/复用对比。
+            // 慢重建时会与上一行同时出现，属预期（两行用途不同，勿合并）。
+            LiteLog.log("ui", "render 耗时=${costMs}ms page=$page cached=$cachedAtEntry")
         }
     }
 
@@ -976,9 +1180,18 @@ class MainActivity : Activity() {
 
         panel = when (page) {
             "settings" -> {
-                val newPage = SettingsPage(this)
-                settingsPage = newPage
-                newPage.buildRoot()
+                val cachedRoot = settingsCachedRoot
+                val cachedPage = settingsPage
+                if (cachedRoot != null && cachedPage != null) {
+                    // 防御：若该 View 还挂在某个 parent 上（正常不会），先摘下再交给本次 addView。
+                    (cachedRoot.parent as? android.view.ViewGroup)?.removeView(cachedRoot)
+                    cachedPage.attach(SettingsPage.AttachMode.REENTER)
+                    cachedRoot
+                } else {
+                    val newPage = SettingsPage(this)
+                    settingsPage = newPage
+                    newPage.buildRoot().also { settingsCachedRoot = it }
+                }
             }
             "caricon" -> {
                 val newPage = CarIconPage(this)
@@ -2171,8 +2384,16 @@ class MainActivity : Activity() {
             LiteLog.log("usbdongle", "用户已停止外置蓝牙，跳过自动拉起")
             return
         }
-        if (!force && !LiteConfig.usbBtAutoInitOf(this) && !config.autoConnect && !UsbBtStandby.isRunning) {
-            return
+        // vc319（BT-318-01 方案B）：autoInit 语义降级为「是否常驻」。
+        // 原四条件全假就 return ⇒ autoInit（缺省 false）+ autoConnect=false 时 standby 永不启动
+        // ⇒ isUsable=false ⇒ 主页永久误报「未配对」（BT-318-01 症①）
+        // ⇒ startDongleSelfCheck(expectStandby=true) 空等 15s 假报 HCI_NO_RESPONSE（症②）。
+        // 现补一条放行：dongle 在场 且 磁盘有配对记忆 ⇒ 拉起一次（每 Activity 实例一次）。
+        val autoBringUp = !force && !LiteConfig.usbBtAutoInitOf(this) && !config.autoConnect && !UsbBtStandby.isRunning
+        if (autoBringUp) {
+            if (usbBtAutoBroughtUp || !UsbDongleGuard.isPresent(this) || !UsbBtStandby.hasSavedPairing(this)) {
+                return
+            }
         }
         // vc248（VC248-03）：可被发现档 = inquiry + page scan；仅可连接档 = 只开 page scan。
         val discoverable = powerMode == LiteConfig.USB_BT_MODE_DISCOVERABLE
@@ -2182,8 +2403,12 @@ class MainActivity : Activity() {
             config.usbBtDongleName,
             onDiagnostic = { msg -> LiteLog.log("usbbt", msg) },
             onLinkReady = { onUsbBtLinkReady() },
-            keepAlive = discoverable,
+            keepAlive = discoverable || autoBringUp,
         )
+        if (autoBringUp) {
+            usbBtAutoBroughtUp = true
+            LiteLog.log("usbdongle", "自动拉起：dongle 在场且已有配对记忆（autoInit 未开，按 BT-318-01 方案B 拉起一次）")
+        }
     }
 
     /** vc207：配对窗入口 —— 无论「开机自动初始化」开关如何，确保常驻广播已启动。 */

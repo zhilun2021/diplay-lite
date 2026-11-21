@@ -13,10 +13,18 @@ object MediaAudioBuffer {
     const val DEFAULT_MILLIS = 300
     val presets = listOf(DEFAULT_MILLIS, 500, 1000)
 
-    /** 媒体（音乐）缓冲池下限：与起播阈值对齐，不再额外加抗抖动余量（有线链路无需）。 */
-    private const val MEDIA_MIN_CAPACITY_MILLIS = 300
+    // vc331（音频卡顿修复，C8815/API16 实测）：媒体轨此前 start≈capacity≈300ms、HEADROOM=0，
+    // 导致 lowWatermarkMs≈0 使自动重灌(low-watermark)分支被禁用；而 API<24 的 trackUnderruns 恒为 0，
+    // reactive underrun 分支也失效 —— 结果任何断供都变成硬 underrun（可闻卡顿），只能靠手机端
+    // 暂停/续播重新 flush+灌缓冲才能短暂恢复。下面把起播/稳态深度抬到 ≥500ms、缓冲池加厚到 1500ms、
+    // 并留 300ms 余量，使 lowWatermarkMs 恒 >0，触发自动 pause+refill 取代「手动暂停」。
+    /** 媒体起播/稳态深度下限：即使 mediaBufferMillis 设置很小也保证 ≥500ms 的抗抖动深度。 */
+    private const val MEDIA_MIN_START_MILLIS = 500
 
-    private const val HEADROOM_MILLIS = 0 // 有线：不留抗抖动余量
+    /** 媒体（音乐）缓冲池下限：加厚到可吸收 ~1.3s 无线抖动/有线突发（MODE_STREAM 满时 write 阻塞不丢数据）。 */
+    private const val MEDIA_MIN_CAPACITY_MILLIS = 1500
+
+    private const val HEADROOM_MILLIS = 300 // 起播之上留 300ms 余量，保证 lowWatermarkMs>0 触发自动重灌
     private const val MIN_TRACK_BUFFER_BYTES = 16 * 1024
     private const val MIN_START_BUFFER_BYTES = 4 * 1024
     // P0: raise the low-latency start level for non-media streams (speech/Siri/nav).
@@ -45,10 +53,12 @@ object MediaAudioBuffer {
                 startBytes = maxOf(nonMediaStart, lowLatency.startBytes),
             )
         }
-        val start = (bytesPerSecond * sanitize(mediaMillis) / 1000).toInt()
+        // vc331：起播/稳态深度取「用户设置」与「MEDIA_MIN_START_MILLIS」的较大者，保证自动重灌生效。
+        val effectiveStartMillis = maxOf(sanitize(mediaMillis), MEDIA_MIN_START_MILLIS)
+        val start = (bytesPerSecond * effectiveStartMillis / 1000).toInt()
         // 池深取「起播 + 余量」与「实测抖动下限」的较大者：起播阈值可小（切歌快），池子必须够深。
         val capacity = maxOf(
-            (bytesPerSecond * (sanitize(mediaMillis) + HEADROOM_MILLIS) / 1000).toInt(),
+            (bytesPerSecond * (effectiveStartMillis + HEADROOM_MILLIS) / 1000).toInt(),
             (bytesPerSecond * MEDIA_MIN_CAPACITY_MILLIS / 1000).toInt(),
         )
         return Plan(

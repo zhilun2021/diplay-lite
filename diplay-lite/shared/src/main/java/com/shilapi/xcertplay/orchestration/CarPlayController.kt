@@ -4396,6 +4396,35 @@ class CarPlayController(
         if (Build.VERSION.SDK_INT > Build.VERSION_CODES.KITKAT || !LegacyUsbHostNative.available) return
         val fd = runCatching { connection.fileDescriptor }.getOrDefault(-1)
         if (fd < 0) return
+        // vc331（重插卡死修复）：重插后重新枚举期间，内核 USB 配置可能尚未落定；此刻对未收敛设备
+        // 直接 native SET_CONFIGURATION(6) 会触发 KK sunxi 内核死锁（整机卡死）。此处照搬
+        // IphoneUsbHost.openIap2UsbSessionOnce 的收敛等待：GET_CONFIGURATION 连读两次一致且稳定
+        // ≥ CONVERGE_SETTLE 才算落定；已稳定为目标 6 则直接返回、跳过 ioctl。
+        try {
+            val settleMs = 300L
+            val timeoutMs = 5_000L
+            val pollMs = 100L
+            val convergeStart = SystemClock.elapsedRealtime()
+            while (SystemClock.elapsedRealtime() - convergeStart < timeoutMs) {
+                val active = NcmUsbBridge.kernelActiveConfiguration(connection)
+                if (active == 6) {
+                    Thread.sleep(settleMs)
+                    val again = NcmUsbBridge.kernelActiveConfiguration(connection)
+                    if (again == active) {
+                        NcmClaimTrace.trace("vc331 configuration converged to $active; skip setConfiguration(6)")
+                        debugLog("vc331 configuration converged to $active; skip setConfiguration(6)")
+                        return
+                    }
+                }
+                Thread.sleep(pollMs)
+            }
+            NcmClaimTrace.trace("vc331 configuration not converged within ${timeoutMs}ms; proceeding to setConfiguration(6)")
+            debugLog("vc331 configuration not converged within ${timeoutMs}ms; proceeding to setConfiguration(6)")
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (ignored: Throwable) {
+            // 收敛探测失败不阻断主路径：按原逻辑直接强切配置。
+        }
         var errno = runCatching { LegacyUsbHostNative.setConfiguration(fd, 6) }.getOrDefault(-1)
         NcmClaimTrace.trace("vc103q direct setConfiguration(6) fd=$fd errno=$errno")
         debugLog("vc103q direct setConfiguration(6) errno=$errno")
@@ -5244,26 +5273,36 @@ class CarPlayController(
         saved: LockdownPairRecord?,
     ): Pair<BlockingDuplexByteStream, LockdownPairRecord> {
         if (saved != null) {
-            try {
-                return client.open(saved, config.label) to saved
-            } catch (error: Throwable) {
-                val rejection = rejectedPairRecordError(error)
-                if (rejection == null) throw error
-                debugLog("saved Lockdown pair record rejected error=$rejection; retrying same record once")
+            // vc331：重插时 saved 记录常被「瞬时」判失效（重枚举期间 lockdown 尚未就绪）。
+            // 原实现只重试一次就 clear+重配——重配会生成全新 RSA 证书，iPhone 视为新电脑再次弹
+            // 「信任」，且 pair() 在同一连接阻塞至多 PAIR_TIMEOUT（120s），车机端表现为「正在配对」
+            // 卡死。改为对同一 saved 记录做有界退避重试（约 2s，覆盖重枚举落定期），确属真失效
+            // 才 clear+重配。
+            var lastRejection: String? = null
+            for (attempt in 0 until PAIR_RECOVER_SAME_RECORD_ATTEMPTS) {
                 try {
                     return client.open(saved, config.label) to saved
-                } catch (retryError: Throwable) {
-                    val retryRejection = rejectedPairRecordError(retryError)
-                    if (retryRejection == null) throw retryError
+                } catch (error: Throwable) {
+                    val rejection = rejectedPairRecordError(error)
+                    if (rejection == null) throw error
+                    lastRejection = rejection
                     debugLog(
-                        "saved Lockdown pair record rejected again error=$retryRejection; " +
-                            "clearing and pairing again with same hostId",
+                        "saved Lockdown pair record rejected error=$rejection " +
+                            "(attempt ${attempt + 1}/$PAIR_RECOVER_SAME_RECORD_ATTEMPTS); " +
+                            "retrying same record after settle",
                     )
-                    clearPairRecord()
-                    val newRecord = pairNewRecord(pairingClient, saved.hostId, saved.systemBuid)
-                    return client.open(newRecord, config.label) to newRecord
+                    if (attempt < PAIR_RECOVER_SAME_RECORD_ATTEMPTS - 1) {
+                        SystemClock.sleep(PAIR_RECOVER_SAME_RECORD_SETTLE_MILLIS)
+                    }
                 }
             }
+            debugLog(
+                "saved Lockdown pair record still rejected after retries error=$lastRejection; " +
+                    "clearing and pairing again with same hostId",
+            )
+            clearPairRecord()
+            val newRecord = pairNewRecord(pairingClient, saved.hostId, saved.systemBuid)
+            return client.open(newRecord, config.label) to newRecord
         }
         val newRecord = pairNewRecord(pairingClient)
         return client.open(newRecord, config.label) to newRecord
@@ -6008,6 +6047,11 @@ class CarPlayController(
         private const val LOCKDOWN_IDENTITY_PREFS = "diplay_lockdown_identity"
         /** vc318：两次重配之间的最小间隔，防止连环重配叠加多个信任弹窗。 */
         private const val PAIR_RETRY_COOLDOWN_MILLIS = 3_000L
+        // vc331（USB 重插信任弹窗/卡死修复）：重插时 saved 记录常被瞬时判失效（重枚举期间 lockdown
+        // 未就绪）。对同一 saved 记录做有界退避重试，覆盖重枚举落定期，避免误判→clear+重配（新 RSA
+        // 证书→iPhone 再次弹「信任」+ pair() 阻塞至多 PAIR_TIMEOUT→车机「正在配对」卡死）。
+        private const val PAIR_RECOVER_SAME_RECORD_ATTEMPTS = 5
+        private const val PAIR_RECOVER_SAME_RECORD_SETTLE_MILLIS = 500L
         // vc278（有线提速）：500 → 120。权限轮询是纯本地状态查询，授权后应立刻推进建链。
         private const val PERMISSION_POLL_INTERVAL_MILLIS = 120L
         private const val PERMISSION_POLL_TIMEOUT_MILLIS = 120_000L
